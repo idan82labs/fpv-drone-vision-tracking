@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TBD Tube Labeler</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="titleBlock">
+        <h1>Drone Candidate Review</h1>
+        <div id="modeHelp" class="pathText">Label the red candidate. Use the cyan box as the reference drone position.</div>
+      </div>
+      <div class="topStats">
+        <span id="progressText" class="statChip">Loading</span>
+        <span id="saveState" class="saveState">Idle</span>
+      </div>
+      <div class="navButtons">
+        <button id="prevBtn" type="button">Prev</button>
+        <select id="frameSelect" aria-label="Frame selector"></select>
+        <button id="nextBtn" type="button">Next</button>
+        <label class="toggle">
+          <input id="unlabeledOnly" type="checkbox" />
+          <span>Skip done</span>
+        </label>
+      </div>
+    </header>
+
+    <div class="layout">
+      <main class="mainPanel">
+        <section class="checkpointHeader">
+          <div>
+            <div id="checkpointTitle" class="checkpointTitle">Loading</div>
+            <div id="checkpointMeta" class="checkpointMeta"></div>
+          </div>
+          <button id="clearCheckpointBtn" class="dangerGhost" type="button">Clear frame labels</button>
+        </section>
+
+        <section class="mediaGrid">
+          <article class="panel videoPanel">
+            <div class="panelHeader">
+              <strong>Video</strong>
+              <span id="videoMeta"></span>
+            </div>
+            <video id="video" controls muted preload="metadata"></video>
+            <div class="frameControls">
+              <button data-step="-30" type="button">-30f</button>
+              <button data-step="-5" type="button">-5f</button>
+              <button data-step="-1" type="button">-1f</button>
+              <button data-step="0" type="button">Frame</button>
+              <button data-step="1" type="button">+1f</button>
+              <button data-step="5" type="button">+5f</button>
+              <button data-step="30" type="button">+30f</button>
+            </div>
+          </article>
+
+          <article class="panel imagePanel">
+            <div class="panelHeader">
+              <strong>Overview</strong>
+              <span id="overviewLegend">cyan = reference drone, red = selected rank</span>
+            </div>
+            <div id="overviewStage" class="imageStage annotStage">
+              <img id="overviewImage" alt="checkpoint overview" />
+              <div id="targetOverlay" class="targetOverlay" hidden></div>
+              <div id="targetDraft" class="targetOverlay targetDraft" hidden></div>
+            </div>
+            <div class="targetTools">
+              <div>
+                <strong>Actual drone</strong>
+                <span id="targetStatus">not marked</span>
+              </div>
+              <div class="targetButtons">
+                <button id="markTargetBtn" type="button">Mark box</button>
+                <button id="targetVisibleBtn" type="button">Visible, no box</button>
+                <button id="targetNotVisibleBtn" type="button">Not visible</button>
+                <button id="clearTargetBtn" class="dangerGhost" type="button">Clear</button>
+              </div>
+            </div>
+          </article>
+
+          <article class="panel imagePanel cropPanel">
+            <div class="panelHeader">
+              <strong>Selected Crop</strong>
+              <span id="cropMeta">red box = candidate to label</span>
+            </div>
+            <div class="imageStage">
+              <img id="cropImage" alt="selected candidate crop" />
+            </div>
+          </article>
+        </section>
+
+        <section class="candidateSection">
+          <div class="candidateTop">
+            <div>
+              <strong>Candidate Review</strong>
+              <span id="candidateProgress"></span>
+            </div>
+            <div id="activeCandidate" class="activeCandidate"></div>
+          </div>
+          <div id="candidateStrip" class="candidateStrip"></div>
+          <div id="candidateReview" class="candidateReview"></div>
+        </section>
+      </main>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

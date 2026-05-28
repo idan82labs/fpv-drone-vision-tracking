@@ -1,0 +1,4 @@
+model,all_frames,all_oracle_recall,all_strict_hit,all_strict_recall,all_loose_hit,all_loose_recall,all_wrong,high_frames,high_oracle_recall,high_strict_hit,high_strict_recall,high_loose_hit,high_loose_recall,high_wrong
+baseline_verified_score,89,0.629,10,0.112,26,0.292,79,49,0.327,0,0.0,0,0.0,49
+logistic,89,0.629,27,0.303,45,0.506,62,49,0.327,4,0.082,7,0.143,45
+extra_trees,89,0.629,28,0.315,43,0.483,61,49,0.327,3,0.061,4,0.082,46

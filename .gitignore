@@ -1,0 +1,30 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+.venv/
+venv/
+env/
+
+.playwright-mcp/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local credentials and deployment state
+.fly-app-name
+.fly-basic-auth-password
+.env
+*.local
+
+# Generated experiment outputs. Commit curated artifacts under artifacts/.
+results/
+tmp/
+scratch/
+*.log
+
+# Raw source footage is not part of normal commits unless explicitly curated.
+raw_videos/
+downloads/
+
