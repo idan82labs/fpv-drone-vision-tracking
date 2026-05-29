@@ -79,6 +79,26 @@ From the first GPT vision surface-label expansion:
 
 Interpretation: the new labels improve coverage, but they do not justify a global learned selector. A state-conditioned selector is more promising: learned ranking helps true surface-backed frames and hurts skyline-adjacent sky frames.
 
+From the multiclip surface v4 fallback sweep:
+
+- Added `artifacts/surface_training_v4_multiclip/` with high/medium-high
+  textured/non-sky rows from `1c`, `529`, `59e`, `7bd`, `aaf1`, `b96`, `d129`,
+  and `e271`.
+- Direct LOCO models still do not justify global replacement:
+  - baseline `verified_score`: 80.0% strict, 85.7% loose.
+  - ExtraTrees: 80.4% strict, 87.7% loose.
+- A conservative fallback policy is materially better:
+  - use ExtraTrees only when learned score >= 0.76, otherwise baseline.
+  - result: 83.3% strict, 90.1% loose over 1,030 evaluated frames.
+  - learned model used on 71.4% of frames.
+- Per-clip read: the gain is mostly e271-like surface frames; aaf1 and d129 stay
+  at baseline under the confidence gate.
+
+Interpretation: this is the first multiclip surface policy that improves without
+blindly replacing the baseline. It supports the state-machine/fallback direction.
+It is not a final surface tracker; the next data need is still true
+tree/grass/terrain labels from additional clips.
+
 From the first complete-video non-sky benchmark:
 
 - Built a full-video d129 vision-label set: 250 total frames, 38 visible target frames, 212 invisible/no-target frames.

@@ -1,0 +1,9 @@
+model,frames,oracle_recall,strict_hit,strict_recall,loose_hit,loose_recall,high_frames,high_strict_recall,high_loose_recall,clip
+fallback_extra_trees_thr0.76,309,0.9838,269,0.8706,288,0.932,254,0.9173,0.9724,1c1258a1-d0f6-433e-9466-dbc1705fa263
+fallback_extra_trees_thr0.76,55,1.0,52,0.9455,55,1.0,55,0.9455,1.0,529a6584-8974-4cf9-b7f7-f66d49cd3845
+fallback_extra_trees_thr0.76,5,1.0,5,1.0,5,1.0,5,1.0,1.0,59e41a0c-f704-4589-96db-d7c283d33717
+fallback_extra_trees_thr0.76,88,1.0,76,0.8636,86,0.9773,86,0.8605,0.9767,7bd296cd-c800-4be9-ab0f-07e8d68cb648
+fallback_extra_trees_thr0.76,60,1.0,50,0.8333,50,0.8333,60,0.8333,0.8333,aaf1eafd-36d7-43e4-a539-fd79029ddf90
+fallback_extra_trees_thr0.76,18,1.0,18,1.0,18,1.0,18,1.0,1.0,b96cec7a-3912-46b7-9014-dc3c632ffa12
+fallback_extra_trees_thr0.76,38,1.0,26,0.6842,26,0.6842,34,0.7647,0.7647,d129cd72-3228-426d-9252-4e0b3e14927b
+fallback_extra_trees_thr0.76,457,1.0,362,0.7921,400,0.8753,323,0.7307,0.8359,e2711620-6d4e-4f9c-8922-b1b2d1fb74f2

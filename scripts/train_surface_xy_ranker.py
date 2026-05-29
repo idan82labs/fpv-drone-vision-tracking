@@ -42,6 +42,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--negative_min_dist_px", type=float, default=24.0)
     p.add_argument("--confidence", nargs="*", default=["high", "medium_high"])
     p.add_argument("--models", nargs="+", choices=("logistic", "hist_gbdt", "extra_trees"), default=["logistic", "hist_gbdt", "extra_trees"])
+    p.add_argument("--fallback_thresholds", default="0:1:0.02", help="Threshold sweep for learned-score fallback rules: start:end:step or comma list.")
     p.add_argument("--random_state", type=int, default=17)
     return p.parse_args()
 
@@ -211,6 +212,65 @@ def summarize(rows: list[dict[str, Any]], model: str) -> dict[str, Any]:
     }
 
 
+def parse_thresholds(raw: str) -> list[float]:
+    if ":" in raw:
+        start_s, end_s, step_s = raw.split(":", 2)
+        start = float(start_s)
+        end = float(end_s)
+        step = float(step_s)
+        if step <= 0:
+            raise SystemExit("--fallback_thresholds step must be positive")
+        vals: list[float] = []
+        value = start
+        while value <= end + 1e-9:
+            vals.append(round(value, 6))
+            value += step
+        return vals
+    return [float(x) for x in raw.split(",") if x.strip()]
+
+
+def fallback_rows(
+    predictions: list[dict[str, Any]],
+    model_name: str,
+    threshold: float,
+) -> list[dict[str, Any]]:
+    by_key: dict[tuple[str, int], dict[str, dict[str, Any]]] = defaultdict(dict)
+    for row in predictions:
+        key = (str(row.get("clip", "")), int(row.get("frame", 0) or 0))
+        by_key[key][str(row.get("model", ""))] = row
+
+    rows: list[dict[str, Any]] = []
+    for key in sorted(by_key):
+        pair = by_key[key]
+        baseline = pair.get("baseline_verified_score")
+        learned = pair.get(model_name)
+        if baseline is None or learned is None:
+            continue
+        score_value = safe_float(learned.get("score"), -1e9)
+        score = -1e9 if score_value is None else score_value
+        chosen = learned if score >= threshold else baseline
+        rec = dict(chosen)
+        rec["model"] = f"fallback_{model_name}_thr{threshold:.2f}"
+        rec["fallback_model"] = model_name
+        rec["fallback_threshold"] = round(threshold, 6)
+        rec["fallback_used_learned"] = chosen is learned
+        rec["learned_score"] = round(score, 6)
+        rows.append(rec)
+    return rows
+
+
+def summarize_by_clip(rows: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    by_clip: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        by_clip[str(row.get("clip", ""))].append(row)
+    out: list[dict[str, Any]] = []
+    for clip, group in sorted(by_clip.items()):
+        rec = summarize(group, model)
+        rec["clip"] = clip
+        out.append(rec)
+    return out
+
+
 def evaluate_by_score(
     labels: list[dict[str, str]],
     top_by_clip: dict[str, dict[int, list[dict[str, str]]]],
@@ -290,6 +350,8 @@ def main() -> None:
     summary.append(summarize(baseline, "baseline_verified_score"))
 
     models = make_models(args.random_state)
+    fallback_summaries: list[dict[str, Any]] = []
+    fallback_predictions_by_name: dict[str, list[dict[str, Any]]] = {}
     for model_name in args.models:
         model_rows: list[dict[str, Any]] = []
         for held_clip in clips:
@@ -324,7 +386,22 @@ def main() -> None:
                 predictions.append(rec)
         summary.append(summarize(model_rows, model_name))
 
-    best_name = max(summary[1:], key=lambda r: (r["strict_recall"], r["high_strict_recall"]))["model"]
+    for model_name in args.models:
+        for threshold in parse_thresholds(args.fallback_thresholds):
+            rows = fallback_rows(predictions, model_name, threshold)
+            if not rows:
+                continue
+            rec = summarize(rows, f"fallback_{model_name}_thr{threshold:.2f}")
+            rec["fallback_model"] = model_name
+            rec["fallback_threshold"] = round(threshold, 6)
+            rec["used_learned_frames"] = sum(bool(r.get("fallback_used_learned")) for r in rows)
+            rec["used_learned_rate"] = round(rec["used_learned_frames"] / max(1, len(rows)), 4)
+            fallback_summaries.append(rec)
+            fallback_predictions_by_name[str(rec["model"])] = rows
+
+    best_direct = max(summary[1:], key=lambda r: (r["strict_recall"], r["high_strict_recall"]))["model"]
+    best_fallback = max(fallback_summaries, key=lambda r: (r["strict_recall"], r["loose_recall"], r["high_strict_recall"]), default=None)
+    best_name = best_direct
     final_model = make_models(args.random_state)[best_name]
     final_model.fit(x, y)
     model_path = out_dir / f"{best_name}_surface_xy_ranker.joblib"
@@ -338,12 +415,20 @@ def main() -> None:
             "loose_tol_px": args.loose_tol_px,
             "negative_min_dist_px": args.negative_min_dist_px,
             "best_model_loco": best_name,
+            "best_direct_model_loco": best_direct,
+            "best_fallback_loco": best_fallback,
         },
         model_path,
     )
 
     write_csv(out_dir / "loco_predictions.csv", predictions)
     write_csv(out_dir / "loco_summary.csv", summary)
+    write_csv(out_dir / "fallback_sweep.csv", fallback_summaries)
+    if best_fallback:
+        best_fallback_name = str(best_fallback["model"])
+        best_fallback_rows = fallback_predictions_by_name.get(best_fallback_name, [])
+        write_csv(out_dir / "best_fallback_predictions.csv", best_fallback_rows)
+        write_csv(out_dir / "best_fallback_by_clip.csv", summarize_by_clip(best_fallback_rows, best_fallback_name))
     write_csv(
         out_dir / "training_examples.csv",
         [
@@ -372,14 +457,18 @@ def main() -> None:
         "numeric_features": numeric,
         "source_features": sources,
         "best_model_loco": best_name,
+        "best_direct_model_loco": best_direct,
+        "best_fallback_loco": best_fallback,
         "model_path": str(model_path),
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     (out_dir / "README.md").write_text(
         "# Surface XY Tube Ranker\n\n"
         "Leave-one-clip-out evaluation for textured/non-sky labels.\n\n"
-        f"Best LOCO model: `{best_name}`\n\n"
-        "See `loco_summary.csv`, `loco_predictions.csv`, and `metadata.json`.\n"
+        f"Best direct LOCO model: `{best_direct}`\n\n"
+        f"Best confidence fallback: `{best_fallback['model'] if best_fallback else ''}`\n\n"
+        "See `loco_summary.csv`, `fallback_sweep.csv`, "
+        "`best_fallback_by_clip.csv`, `loco_predictions.csv`, and `metadata.json`.\n"
     )
     print(out_dir / "loco_summary.csv")
     print(model_path)
