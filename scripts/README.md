@@ -36,6 +36,10 @@ bundle.
 
 - `train_surface_xy_ranker.py` - train/check surface candidate rankers.
 - `train_acquisition_null_ranker.py` - train/check acquisition/null filtering.
+- `augment_top_tubes_alignment_features.py` - add offline candidate-local
+  background-alignment (`clba_*`) columns to exported top tubes.
+- `augment_top_tubes_competition_features.py` - add frame-local competitor
+  normalization (`comp_*`) columns on top of CLBA/top-tube rows.
 - `make_tracking_miss_review_packet.py` - generate review packets for misses
   and hard negatives.
 

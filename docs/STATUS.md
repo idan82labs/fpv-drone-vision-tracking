@@ -1033,3 +1033,31 @@ is an important negative result: the missing ingredient is not the state names
 alone. We still need a better `O_T/O_S/O_E/O_N` observation, likely with
 same-router local controls and/or crop-stack target-vs-background evidence. Do
 not move `joint_hmm` into runtime or make it the default selector.
+
+Frame-local competition feature probe:
+
+- Added `scripts/augment_top_tubes_competition_features.py` as a desktop-lab
+  augmenter. It adds `comp_*` columns comparing each top-tube candidate against
+  same-frame controls, same-context controls, and nearby controls.
+- First version included proposal-score competition features. This was rejected
+  as too close to re-amplifying the old learned/rank bias:
+  - `hist_gbdt` strict dropped from the prior CLBA-null `73.97%` to `71.99%`.
+- CLBA-only competition features were then tested:
+  - direct `hist_gbdt`: `73.08%` strict / `82.12%` loose;
+  - prior CLBA-null direct `hist_gbdt`: `73.97%` strict / `82.05%` loose.
+- Selector-level check with the CLBA-only competition model:
+  - `viterbi_w9`: `73.81%` strict / `80.23%` loose / `3.29%` invisible
+    no-box;
+  - prior joint-HMM probe `viterbi_w9`: `73.75%` strict / `80.23%` loose /
+    `3.29%` invisible no-box;
+  - `hmm_conservative`: `64.61%` strict / `72.76%` loose / `97.7%`
+    invisible no-box;
+  - prior `hmm_conservative`: `64.30%` strict / `72.51%` loose / `97.7%`
+    invisible no-box.
+
+Interpretation: this closes the simple same-frame/same-context competition
+feature branch for now. It is not harmful enough to delete as a diagnostic, but
+it is not a meaningful algorithmic jump and should not be promoted into the
+runtime or production ranker. The remaining observation gap is likely deeper:
+either actual crop-stack target/background comparison with better labels, or a
+learned observation model trained specifically on top-tube hard alternatives.
