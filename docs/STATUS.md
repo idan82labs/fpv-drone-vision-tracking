@@ -946,3 +946,49 @@ Interpretation: the current scalar top-tube features are not enough for a
 reliable frame-local HMM/Viterbi router. The disagreement rows are now the best
 next mining set: they should drive either additional visual labels/crop-stack
 features or a true joint state model, not another threshold sweep.
+
+Offline mode-supervisor execution:
+
+- Added `scripts/evaluate_mode_supervisor.py`, a leave-one-clip-out lab harness
+  that trains a selector-family classifier from Viterbi/HMM disagreement rows:
+  `Viterbi false / HMM suppressed` means choose HMM/null, and
+  `Viterbi visible hit / HMM miss` means choose Viterbi/continuous.
+- The first implementation also evaluates every labeled frame in the held-out
+  clip and includes label-only clips that have no disagreement examples. This
+  fixed an early accounting issue where one labeled clip was not included in
+  the routed totals.
+- Logistic disagreement model:
+  - 515 usable disagreement examples;
+  - OOF AUC `0.693`;
+  - OOF balanced accuracy at 0.5 `0.696`.
+- Frame-level routed result without guardrails:
+  - threshold `0.2`: 73.1% strict / 82.0% loose / 84.5% invisible no-box;
+  - threshold `0.8`: 74.4% strict / 83.2% loose / 64.1% invisible no-box.
+- Shallow HGBDT was rejected for now:
+  - OOF AUC `0.252`;
+  - it inverted badly on held-out clips, especially d129/e271.
+- Continuous-Viterbi protection was tested by forcing Viterbi after long
+  selected-track streaks:
+  - streak `120`, threshold `0.2`: 78.1% strict / 85.6% loose / 60.9%
+    invisible no-box;
+  - streak `180`, threshold `0.0`: 73.9% strict / 82.1% loose / 87.2%
+    invisible no-box;
+  - adding a CLBA background-risk cap preserved null frames but lost too much
+    visible recall.
+- Stateful HMM entry/exit was also tested:
+  - enter `3`, exit `3`, threshold `0.2`: 73.6% strict / 82.8% loose / 89.5%
+    invisible no-box;
+  - enter `5`, exit `3`, threshold `0.2`: 74.6% strict / 83.8% loose / 83.2%
+    invisible no-box;
+  - enter `5` plus streak-120 Viterbi protection recovered recall to about
+    78.5% strict / 86.0% loose, but invisible no-box fell to about 56.9%.
+
+Interpretation: the supervisor harness is useful, but this implementation is
+not a production router. It still does not beat the earlier clip-level CLBA
+diagnostic route (`79.4% strict / 87.4% loose / 79.6% invisible no-box`), and
+it cannot yet protect continuous-visible e271 without giving back too many
+d129-style null hallucinations. The mitigated production plan remains: HMM/null
+behavior must require sustained background-lock evidence, but continuous Viterbi
+protection needs a stronger target-vs-background observation than the current
+scalar CLBA/top-tube features. Do not promote this router into
+`apply_surface_sequence_selector.py` default behavior.

@@ -24,6 +24,10 @@ bundle.
 - `analyze_selector_disagreements.py` - extract frame-level disagreements
   between two selector outputs for router training, failure review, and hard
   example mining.
+- `evaluate_mode_supervisor.py` - leave-one-clip-out offline supervisor probe
+  that learns when to choose Viterbi vs HMM from disagreement examples, with
+  optional sustained-HMM and continuous-Viterbi guardrail sweeps. This is a lab
+  harness, not a promoted runtime router.
 - `evaluate_lock_state_machine.py` - lock/acquisition/null state-machine
   evaluation.
 - `evaluate_xy_sequence_ranker.py` - sequence-ranking utilities.
