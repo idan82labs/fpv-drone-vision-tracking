@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--max_jump_px", default="10,12,16,20,24,32")
     p.add_argument("--transition_weight", default="0.05,0.1,0.2,0.35,0.5,0.75,1.0")
+    p.add_argument("--size_jump_weight", default="0", help="Optional comma-separated box-size allowance added to max_jump_px.")
     p.add_argument("--cv_accel_weight", default="", help="Optional comma-separated acceleration weights for second-order CV Viterbi.")
     p.add_argument("--sequence_beam", type=int, default=50)
     p.add_argument("--state_beam", type=int, default=512)
@@ -214,6 +215,7 @@ def viterbi_select(
     by_frame: dict[int, list[dict[str, Any]]],
     max_jump_px: float,
     transition_weight: float,
+    size_jump_weight: float = 0.0,
 ) -> dict[int, dict[str, Any]]:
     frames = sorted(by_frame)
     if not frames:
@@ -234,12 +236,14 @@ def viterbi_select(
         else:
             prev_rows = layers[fi - 1]
             gap = max(1, frame - frames[fi - 1])
-            allowed = max_jump_px * gap
             for row in rows:
                 best_score = -1e18
                 best_idx: int | None = None
                 rb = bbox(row)
                 for pi, prev in enumerate(prev_rows):
+                    pb = bbox(prev)
+                    size_allowance = size_jump_weight * max(rb[2], rb[3], pb[2], pb[3])
+                    allowed = max_jump_px * gap + size_allowance
                     jump = center_dist(rb, bbox(prev))
                     if jump > allowed:
                         continue
@@ -287,6 +291,7 @@ def viterbi_select_constant_velocity(
     by_frame: dict[int, list[dict[str, Any]]],
     max_jump_px: float,
     transition_weight: float,
+    size_jump_weight: float,
     accel_weight: float,
     state_beam: int,
 ) -> dict[int, dict[str, Any]]:
@@ -300,34 +305,38 @@ def viterbi_select_constant_velocity(
 
     frames = sorted(by_frame)
     if len(frames) <= 2:
-        return viterbi_select(by_frame, max_jump_px, transition_weight)
+        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
 
     layers = [by_frame[frame] for frame in frames]
     if any(not layer for layer in layers):
-        return viterbi_select(by_frame, max_jump_px, transition_weight)
+        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
 
     def frame_gap(fi: int) -> int:
         if fi <= 0:
             return 1
         return max(1, frames[fi] - frames[fi - 1])
 
-    def transition_cost(prev: dict[str, Any], cur: dict[str, Any], allowed: float) -> float | None:
+    def transition_cost(prev: dict[str, Any], cur: dict[str, Any], base_allowed: float) -> tuple[float, float] | None:
+        pb = bbox(prev)
+        cb = bbox(cur)
+        allowed = base_allowed + size_jump_weight * max(pb[2], pb[3], cb[2], cb[3])
         jump = center_dist(bbox(prev), bbox(cur))
         if jump > allowed:
             return None
-        return transition_weight * (jump / max(1e-6, allowed)) ** 2
+        return transition_weight * (jump / max(1e-6, allowed)) ** 2, allowed
 
     # State at frame index 1 is (idx_at_0, idx_at_1).
     states: dict[tuple[int, int], float] = {}
     first_allowed = max_jump_px * frame_gap(1)
     for i, prev in enumerate(layers[0]):
         for j, cur in enumerate(layers[1]):
-            cost = transition_cost(prev, cur, first_allowed)
-            if cost is None:
+            transition = transition_cost(prev, cur, first_allowed)
+            if transition is None:
                 continue
+            cost, _allowed = transition
             states[(i, j)] = row_score(prev) + row_score(cur) - cost
     if not states:
-        return viterbi_select(by_frame, max_jump_px, transition_weight)
+        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
     if state_beam > 0 and len(states) > state_beam:
         states = dict(sorted(states.items(), key=lambda item: item[1], reverse=True)[:state_beam])
 
@@ -346,19 +355,20 @@ def viterbi_select_constant_velocity(
             px, py = center(bbox(prev_rows[i]))
             pred = (px + (px - ppx) * (cur_gap / prev_gap), py + (py - ppy) * (cur_gap / prev_gap))
             for j, cur in enumerate(cur_rows):
-                jump_cost = transition_cost(prev_rows[i], cur, allowed)
-                if jump_cost is None:
+                transition = transition_cost(prev_rows[i], cur, allowed)
+                if transition is None:
                     continue
+                jump_cost, allowed_with_size = transition
                 cx, cy = center(bbox(cur))
                 accel = math.hypot(cx - pred[0], cy - pred[1])
-                accel_cost = accel_weight * (accel / max(1e-6, allowed)) ** 2
+                accel_cost = accel_weight * (accel / max(1e-6, allowed_with_size)) ** 2
                 score = prev_score + row_score(cur) - jump_cost - accel_cost
                 state = (i, j)
                 if state not in new_states or score > new_states[state]:
                     new_states[state] = score
                     new_backptrs[state] = (h, i)
         if not new_states:
-            return viterbi_select(by_frame, max_jump_px, transition_weight)
+            return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
         if state_beam > 0 and len(new_states) > state_beam:
             keep = {
                 state
@@ -380,7 +390,7 @@ def viterbi_select_constant_velocity(
         state = prev_state
 
     if any(idx is None for idx in selected_idx):
-        return viterbi_select(by_frame, max_jump_px, transition_weight)
+        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
     return {frame: layers[fi][int(idx)] for fi, (frame, idx) in enumerate(zip(frames, selected_idx))}
 
 
@@ -444,44 +454,18 @@ def main() -> None:
     best_summary = base
     for max_jump in parse_float_list(args.max_jump_px):
         for weight in parse_float_list(args.transition_weight):
-            selected = viterbi_select(by_frame, max_jump, weight)
-            summary = summarize_selection(
-                labels,
-                selected,
-                args.center_tol_px,
-                args.loose_tol_px,
-                f"viterbi_jump{max_jump:g}_w{weight:g}",
-            )
-            summary["max_jump_px"] = max_jump
-            summary["transition_weight"] = weight
-            summaries.append(summary)
-            if (summary["strict_recall"], summary["loose_recall"]) > (
-                best_summary["strict_recall"],
-                best_summary["loose_recall"],
-            ):
-                best_summary = summary
-                best_rows = prediction_rows(labels, selected, args.center_tol_px, args.loose_tol_px)
-            cv_by_frame = prune_frame_rows(by_frame, args.sequence_beam)
-            for accel_weight in parse_float_list(args.cv_accel_weight):
-                selected = viterbi_select_constant_velocity(
-                    cv_by_frame,
-                    max_jump,
-                    weight,
-                    accel_weight,
-                    args.state_beam,
-                )
+            for size_weight in parse_float_list(args.size_jump_weight):
+                selected = viterbi_select(by_frame, max_jump, weight, size_weight)
                 summary = summarize_selection(
                     labels,
                     selected,
                     args.center_tol_px,
                     args.loose_tol_px,
-                    f"cv_viterbi_jump{max_jump:g}_w{weight:g}_a{accel_weight:g}",
+                    f"viterbi_jump{max_jump:g}_w{weight:g}_sz{size_weight:g}",
                 )
                 summary["max_jump_px"] = max_jump
                 summary["transition_weight"] = weight
-                summary["accel_weight"] = accel_weight
-                summary["sequence_beam"] = args.sequence_beam
-                summary["state_beam"] = args.state_beam
+                summary["size_jump_weight"] = size_weight
                 summaries.append(summary)
                 if (summary["strict_recall"], summary["loose_recall"]) > (
                     best_summary["strict_recall"],
@@ -489,6 +473,36 @@ def main() -> None:
                 ):
                     best_summary = summary
                     best_rows = prediction_rows(labels, selected, args.center_tol_px, args.loose_tol_px)
+                cv_by_frame = prune_frame_rows(by_frame, args.sequence_beam)
+                for accel_weight in parse_float_list(args.cv_accel_weight):
+                    selected = viterbi_select_constant_velocity(
+                        cv_by_frame,
+                        max_jump,
+                        weight,
+                        size_weight,
+                        accel_weight,
+                        args.state_beam,
+                    )
+                    summary = summarize_selection(
+                        labels,
+                        selected,
+                        args.center_tol_px,
+                        args.loose_tol_px,
+                        f"cv_viterbi_jump{max_jump:g}_w{weight:g}_sz{size_weight:g}_a{accel_weight:g}",
+                    )
+                    summary["max_jump_px"] = max_jump
+                    summary["transition_weight"] = weight
+                    summary["size_jump_weight"] = size_weight
+                    summary["accel_weight"] = accel_weight
+                    summary["sequence_beam"] = args.sequence_beam
+                    summary["state_beam"] = args.state_beam
+                    summaries.append(summary)
+                    if (summary["strict_recall"], summary["loose_recall"]) > (
+                        best_summary["strict_recall"],
+                        best_summary["loose_recall"],
+                    ):
+                        best_summary = summary
+                        best_rows = prediction_rows(labels, selected, args.center_tol_px, args.loose_tol_px)
 
     summaries.sort(key=lambda r: (r["strict_recall"], r["loose_recall"]), reverse=True)
     write_csv(out_dir / "sequence_summary.csv", summaries)

@@ -55,11 +55,28 @@ class XYSequenceRankerTests(unittest.TestCase):
             by_frame,
             max_jump_px=20.0,
             transition_weight=0.0,
+            size_jump_weight=0.0,
             accel_weight=10.0,
             state_beam=32,
         )
 
         self.assertEqual(selected[3]["x"], "20")
+
+    def test_size_scaled_jump_allows_larger_close_candidate_motion(self):
+        by_frame = {
+            1: [{"frame": "1", "x": "10", "y": "10", "w": "20", "h": "20", "learned_score": 0.9}],
+            2: [
+                {"frame": "2", "x": "23", "y": "10", "w": "20", "h": "20", "learned_score": 0.9},
+                {"frame": "2", "x": "18", "y": "18", "w": "4", "h": "4", "learned_score": 0.85},
+            ],
+        }
+
+        strict = seq.viterbi_select(by_frame, max_jump_px=4.0, transition_weight=0.0, size_jump_weight=0.0)
+        scaled = seq.viterbi_select(by_frame, max_jump_px=4.0, transition_weight=0.0, size_jump_weight=0.5)
+
+        self.assertEqual(strict[2]["x"], "18")
+        self.assertEqual(scaled[1]["x"], "10")
+        self.assertEqual(scaled[2]["x"], "23")
 
 
 if __name__ == "__main__":

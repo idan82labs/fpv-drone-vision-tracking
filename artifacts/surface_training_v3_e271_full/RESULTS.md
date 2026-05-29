@@ -59,3 +59,33 @@ Held-out e271 remains weak because the other labeled clips do not yet cover enou
 ## Current Recommendation
 
 Keep the hybrid surface proposal path as a proposal source for surface-backed candidates, but do not make it the final decision layer globally. The next highest-ROI work is more complete surface-backed labels from additional clips, plus feature work aimed at the specific wrong branch pattern: target-vs-background aligned crop stacks and hard-negative branch competitors.
+
+## Follow-Up: Visual Stack Features
+
+I tested `scripts/augment_top_tubes_visual_features.py` on the e271 hybrid surface top-tubes. This adds offline `vis_*` features comparing target-aligned dark evidence against background-aligned dark evidence over short temporal offsets.
+
+| Model / selector | Strict recall | Loose recall | Read |
+| --- | ---: | ---: | --- |
+| Previous best: hybrid + HGBDT sequence | 78.3% | 92.7% | Best before visual stack features. |
+| Visual features + HGBDT framewise | 66.5% | 84.8% | Slight strict gain framewise, no loose gain. |
+| Visual features + HGBDT sequence | 75.0% | 90.0% | Worse than previous best. |
+| Visual features + logistic sequence | 80.3% | 94.0% | New best e271 full-visible result. |
+| Visual features + logistic + size-scaled jump | 80.3% | 94.0% | No gain; size allowance worsened larger values. |
+
+The visual features help only with a simple/regularized scorer. The tree model appears to overfit them. The best run is:
+
+- `artifacts/e271_full_video_hybrid_surface_visual_aug_sequence_ranker_logistic_v1`
+- selector: `viterbi_jump4_w0.75`
+- strict: `561/699`
+- loose: `657/699`
+
+Remaining loose miss runs are now:
+
+- `0`
+- `60`
+- `400`
+- `417..418`
+- `432..436`
+- `667..698`
+
+The late `667..698` run is still the main unresolved failure. The correct branch is present earlier, but the selector remains vulnerable to a smooth wrong branch when the drone transitions onto textured terrain. The next technical target should be branch-level competition features, not broader proposal thresholds.
