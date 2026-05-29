@@ -152,15 +152,35 @@ for selection. The next integration should support two modes: strict search/null
 before lock and continuity-backed tracking after lock, driven by learned or
 out-of-fold candidate scores rather than native `verified_score` alone.
 
+From the first full-video OOF state-ranker harness:
+
+- Added `scripts/train_full_video_state_ranker.py`.
+- It labels top-tube candidates from full-video frame labels: visible target
+  candidates are positives, far visible candidates and no-target-frame
+  candidates are negatives.
+- On d129, the OOF best-candidate strict rate improved from baseline
+  `verified_score` 26/38 = 68.4% to:
+  - logistic: 38/38 = 100.0%
+  - HistGBDT: 37/38 = 97.4%
+  - ExtraTrees: 38/38 = 100.0%
+- ExtraTrees OOF scores plus the state machine reached 249/250 = 99.6%
+  all-frame correctness, 38/38 visible strict, and 211/212 invisible no-box.
+- This is a one-clip stratified OOF result, not leave-one-clip-out proof. It is
+  strong evidence that null-aware candidate scores are the right selector input,
+  but it should not become a default until reproduced on another complete clip.
+
 ## Next Meaningful Work
 
-1. Integrate the acquisition/null selector behind explicit flags in
-   `tbd_motion_detector.py`, then evaluate it on complete videos.
-2. Improve the frame router so it does not over-classify e271/aaf1-like ridge
+1. Reproduce the full-video OOF state-ranker harness on at least one more
+   complete clip, then integrate only if the null/visible tradeoff survives.
+2. Integrate the acquisition/null selector behind explicit flags in
+   `tbd_motion_detector.py`, driven by learned/OOF scores rather than native
+   detector scores.
+3. Improve the frame router so it does not over-classify e271/aaf1-like ridge
    or horizon clips as surface.
-3. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
+4. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
    d129-like frames to human review.
-4. Keep the state-machine selector path: learned ranker only in states where
+5. Keep the state-machine selector path: learned ranker only in states where
    LOCO shows benefit.
-5. Train null-aware tube rankers with explicit no-target/hallucination
+6. Train null-aware tube rankers with explicit no-target/hallucination
    negatives.
