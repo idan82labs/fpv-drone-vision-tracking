@@ -66,10 +66,21 @@ From the hybrid proposal/coast experiment:
 
 Interpretation: keep hybrid as an explicit surface-mode experiment only. It is not ready as a global default.
 
+From the first GPT vision surface-label expansion:
+
+- Added `scripts/make_surface_continuity_packet.py` to build continuous non-sky review packets with full-frame and crop sheets.
+- Visually reviewed aaf1/e6/1c/7bd/529/b96/59e/d129 packets.
+- Important correction: the automatic `textured_non_sky` split is over-broad. Many "textured" labels are still sky/cloud/horizon-backed, not true tree/grass/terrain-backed.
+- Promoted 23 high-confidence b96/59e horizon-surface labels.
+- Held out d129 tree-line candidates for human review because visual confidence was below 0.8.
+- Apples-to-apples LOCO against `surface_ranker_top_tubes_v1`: baseline strict = 80.4%, best learned strict = 79.4%.
+
+Interpretation: the new labels improve coverage, but they do not justify integrating the learned surface selector. The dataset gap is still real: we need more true target-over-tree/grass/terrain labels, not broader horizon/skyline labels.
+
 ## Next Meaningful Work
 
-1. Train a tube-level ranker on hard top-tube alternatives.
-2. Add target-aligned versus background-aligned crop-stack features.
-3. Keep mining hard negatives from terrain, cloud, skyline, poles, and static hot spots.
-4. Calibrate thresholds from null-window max-score distributions.
-5. Only after the ranking problem improves, revisit heavier proposal generation.
+1. Collect or generate true target-over-tree/grass/terrain labels; route ambiguous d129-like frames to human review.
+2. Tighten the background router so `textured_non_sky` does not mix clean sky, skyline, cloud, and true surface cases.
+3. Train a tube-level ranker on hard top-tube alternatives after the surface-positive dataset is less biased.
+4. Add target-aligned versus background-aligned crop-stack features.
+5. Calibrate thresholds from null-window max-score distributions.
