@@ -1061,3 +1061,39 @@ it is not a meaningful algorithmic jump and should not be promoted into the
 runtime or production ranker. The remaining observation gap is likely deeper:
 either actual crop-stack target/background comparison with better labels, or a
 learned observation model trained specifically on top-tube hard alternatives.
+
+Crop-stack verifier probe:
+
+- Added `scripts/train_crop_stack_verifier.py` as a desktop-lab hard-alternative
+  verifier. It builds or consumes candidate-level `hard_label` rows, extracts
+  causal target-aligned and background-aligned crop stacks, trains small
+  logistic/HGBDT models, and reports leave-one-clip-out hard-example AUC plus
+  same-frame true-vs-false pairwise win rate.
+- Existing e6+aaf1 hard-example set:
+  - logistic crop-stack verifier: AUC `0.790`, pairwise win rate `0.800`;
+  - held-out aaf1 pairwise `0.797`;
+  - held-out e6 pairwise `0.833`.
+- Full nine-clip hard-alternative set generated from
+  `labels_plus_codex_aaf1_teacher_v1.csv` and CLBA top-tubes:
+  - examples: `6,353` rows, `1,368` positives, `4,985` negatives;
+  - HGBDT crop-stack verifier: AUC `0.900`, pairwise win rate `0.920`;
+  - logistic crop-stack verifier: AUC `0.806`, pairwise win rate `0.810`.
+- Per-clip HGBDT read:
+  - strong transfer: `1c1258a1` `0.980`, `529a6584` `1.000`,
+    `59e41a0c` `1.000`, `7bd296cd` `0.991`, `b96cec7a` `1.000`,
+    `e271` `0.904`, `e6` `1.000`;
+  - weak transfer: `aaf1` `0.492`, `d129` `0.578`.
+- Distributed aaf1 in-clip check using saved scalar crop/CLBA fields:
+  - even-to-odd pairwise `0.984`;
+  - odd-to-even pairwise `0.976`;
+  - first-half-to-second-half `0.857`;
+  - second-half-to-first-half `0.964`.
+
+Interpretation: this is the first strong evidence that a learned crop-stack
+observation is worth pursuing. It is not production-ready because held-out aaf1
+and d129 still fail, but the in-clip distributed split says the feature family
+can learn those hard-surface domains when representative labels exist. The next
+data step should target the exported `hist_gbdt_pair_failures.csv` frames,
+especially aaf1/d129 false competitors. The next algorithm step is to score
+top-tube alternatives with this crop-stack verifier and test it as an
+observation/ranker input, still offline before any runtime integration.
