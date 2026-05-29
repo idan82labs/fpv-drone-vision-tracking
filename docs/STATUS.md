@@ -1385,3 +1385,28 @@ the professor's state-model recommendation more literally: explicit
 target/null/background-lock/attached-lock observations with
 target-aligned-vs-background-aligned evidence, not another scalar global
 ranker.
+
+Explicit-state quarantine check:
+
+- Fixed and tested an implementation issue in
+  `scripts/evaluate_explicit_state_selector.py`: `S/E` lock quarantine can now
+  be applied across the whole beam instead of only the path that created the
+  lock.
+- Kept that behavior behind `--global_quarantine` because the first sweep shows
+  it is not a safe default with the current observations.
+- Previous sidecar explicit-state baseline:
+  - aaf1 OOF ExtraTrees/CLBA: `53/75` strict and `21/28` invisible no-box;
+  - e6 OOF ExtraTrees/CLBA: `23/72` strict and `21/27` invisible no-box.
+- Hard global quarantine:
+  - aaf1: `33/75` strict and `27/28` invisible no-box;
+  - e6: `18/72` strict and `22/27` invisible no-box.
+- Soft global quarantine with target-evidence override margin `1.0`:
+  - aaf1: `46/75` strict and `23/28` invisible no-box;
+  - e6: `23/72` strict and `21/27` invisible no-box.
+
+Interpretation: the professor's quarantine rule is architecturally correct, but
+the current observation model cannot decide when a quarantined area contains the
+real target again. Hard quarantine suppresses too much target evidence; soft
+quarantine recovers some recall but still does not beat the sidecar baseline.
+This reinforces the current read: the missing piece is better
+target-vs-background observation calibration, not another lock-state rule.

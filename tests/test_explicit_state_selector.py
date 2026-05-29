@@ -35,6 +35,8 @@ class ExplicitStateSelectorTests(unittest.TestCase):
             loose_tol_px=16.0,
             quarantine_px=10.0,
             quarantine_frames=5,
+            global_quarantine=False,
+            quarantine_override_margin=1.0,
             motion_weight=0.2,
             beam_width=24,
             state_beam=6,
@@ -70,6 +72,8 @@ class ExplicitStateSelectorTests(unittest.TestCase):
             loose_tol_px=16.0,
             quarantine_px=12.0,
             quarantine_frames=5,
+            global_quarantine=True,
+            quarantine_override_margin=1.0,
             motion_weight=0.2,
             beam_width=32,
             state_beam=8,
@@ -95,6 +99,8 @@ class ExplicitStateSelectorTests(unittest.TestCase):
             clutter_margin=0.4,
             quarantine_px=10.0,
             quarantine_frames=5,
+            global_quarantine=False,
+            quarantine_override_margin=1.0,
             motion_weight=0.2,
             beam_width=16,
             state_beam=8,
@@ -103,6 +109,38 @@ class ExplicitStateSelectorTests(unittest.TestCase):
         absent = max(h.score for h in out if h.state == "A")
         clutter = max(h.score for h in out if h.state == "E")
         self.assertLessEqual(clutter, absent)
+
+    def test_quarantine_applies_across_beam_not_only_same_path(self):
+        hyps = [
+            explicit.Hypothesis("A", 10.0),
+            explicit.Hypothesis("E", 1.0, quarantine_bbox=(0.0, 0.0, 3.0, 3.0), lock_age=3),
+        ]
+        cands = [
+            self.cand(2, 0, 0, target=5.0),
+            self.cand(2, 40, 0, target=2.0),
+        ]
+
+        out = explicit.step_hypotheses(
+            hyps,
+            cands,
+            acquire_threshold=0.5,
+            track_threshold=0.4,
+            acquire_hits=1,
+            max_misses=0,
+            max_jump_px=60.0,
+            clutter_margin=0.4,
+            quarantine_px=12.0,
+            quarantine_frames=5,
+            global_quarantine=True,
+            quarantine_override_margin=99.0,
+            motion_weight=0.2,
+            beam_width=32,
+            state_beam=8,
+        )
+
+        tracked = [hyp for hyp in out if hyp.selected is not None]
+        self.assertTrue(tracked)
+        self.assertTrue(all(hyp.selected is None or hyp.selected.bbox[0] != 0.0 for hyp in tracked))
 
     def test_candidate_observations_include_static_and_attached_alternatives(self):
         row = {

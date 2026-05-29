@@ -75,6 +75,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clutter_margin", default="0.1,0.3,0.6,1.0")
     p.add_argument("--quarantine_px", type=float, default=14.0)
     p.add_argument("--quarantine_frames", type=int, default=18)
+    p.add_argument(
+        "--global_quarantine",
+        action="store_true",
+        help="Apply S/E lock quarantine across the whole beam instead of only the lock path.",
+    )
     p.add_argument("--score_weight", type=float, default=0.75)
     p.add_argument("--clba_weight", type=float, default=0.55)
     p.add_argument("--path_weight", type=float, default=0.25)
@@ -82,6 +87,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--attached_weight", type=float, default=0.7)
     p.add_argument("--rank_weight", type=float, default=0.12)
     p.add_argument("--motion_weight", type=float, default=0.8)
+    p.add_argument(
+        "--quarantine_override_margin",
+        type=float,
+        default=1.0,
+        help="Allow a quarantined candidate only when target evidence beats clutter/null by this margin.",
+    )
     return p.parse_args()
 
 
@@ -292,6 +303,30 @@ def in_quarantine(hyp: Hypothesis, cand: Candidate, radius: float) -> bool:
     return center_dist(hyp.quarantine_bbox, cand.bbox) <= radius
 
 
+def active_quarantines(hyps: list[Hypothesis]) -> list[tuple[tuple[float, float, float, float], int]]:
+    """Collect active S/E clutter anchors across the whole beam.
+
+    Quarantine is a tracker-level memory, not a single path-local preference.
+    If one plausible hypothesis identifies a branch/static lock, the next frame
+    should not let the independent absent path immediately birth the same
+    candidate again.
+    """
+
+    anchors: list[tuple[tuple[float, float, float, float], int]] = []
+    for hyp in hyps:
+        if hyp.quarantine_bbox is not None and hyp.lock_age > 0:
+            anchors.append((hyp.quarantine_bbox, hyp.lock_age))
+    return anchors
+
+
+def candidate_in_quarantine(
+    cand: Candidate,
+    quarantines: list[tuple[tuple[float, float, float, float], int]],
+    radius: float,
+) -> bool:
+    return any(age > 0 and center_dist(anchor, cand.bbox) <= radius for anchor, age in quarantines)
+
+
 def add_pruned(pool: list[Hypothesis], hyp: Hypothesis, beam_width: int) -> None:
     pool.append(hyp)
     if len(pool) > beam_width * 3:
@@ -325,11 +360,14 @@ def step_hypotheses(
     clutter_margin: float,
     quarantine_px: float,
     quarantine_frames: int,
+    global_quarantine: bool,
+    quarantine_override_margin: float,
     motion_weight: float,
     beam_width: int,
     state_beam: int,
 ) -> list[Hypothesis]:
     pool: list[Hypothesis] = []
+    beam_quarantines = active_quarantines(hyps) if global_quarantine else []
     for hyp in hyps:
         q_age = max(0, hyp.lock_age - 1)
         q_bbox = hyp.quarantine_bbox if q_age > 0 else None
@@ -357,12 +395,17 @@ def step_hypotheses(
             )
 
         for cand in cands:
-            if in_quarantine(hyp, cand, quarantine_px):
-                continue
             clutter_obs = max(cand.static_obs, cand.attached_obs)
             clutter_state = "E" if cand.attached_obs >= cand.static_obs else "S"
             clutter_edge = clutter_obs - cand.target_obs
             target_llr = cand.target_obs - logsumexp([cand.static_obs, cand.attached_obs, 0.0])
+            if in_quarantine(hyp, cand, quarantine_px) or candidate_in_quarantine(cand, beam_quarantines, quarantine_px):
+                target_margin = cand.target_obs - clutter_obs
+                if (
+                    target_margin < quarantine_override_margin
+                    or target_llr < acquire_threshold + quarantine_override_margin
+                ):
+                    continue
             mcost = motion_cost(hyp, cand, max_jump_px, motion_weight) if hyp.state in {"P", "T", "C"} else 0.0
             if mcost >= 1e5:
                 continue
@@ -457,6 +500,8 @@ def evaluate_selector(
     loose_tol_px: float,
     quarantine_px: float,
     quarantine_frames: int,
+    global_quarantine: bool,
+    quarantine_override_margin: float,
     motion_weight: float,
     beam_width: int,
     state_beam: int,
@@ -478,6 +523,8 @@ def evaluate_selector(
             clutter_margin,
             quarantine_px,
             quarantine_frames,
+            global_quarantine,
+            quarantine_override_margin,
             motion_weight,
             beam_width,
             state_beam,
@@ -582,6 +629,8 @@ def main() -> None:
                                 args.loose_tol_px,
                                 args.quarantine_px,
                                 args.quarantine_frames,
+                                args.global_quarantine,
+                                args.quarantine_override_margin,
                                 args.motion_weight,
                                 args.beam_width,
                                 args.state_beam,
@@ -614,6 +663,8 @@ def main() -> None:
         "clip": args.clip,
         "score_column": args.score_column,
         "max_rank": args.max_rank,
+        "global_quarantine": args.global_quarantine,
+        "quarantine_override_margin": args.quarantine_override_margin,
         "states": STATES,
         "candidate_frames": len(candidates),
         "label_frames": len(labels),

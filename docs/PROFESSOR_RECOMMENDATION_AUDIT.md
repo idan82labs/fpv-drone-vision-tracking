@@ -3,6 +3,15 @@
 Date: 2026-05-29
 Commit audited: `98b3fde`
 
+Update after later implementation passes: the repo now includes an offline
+`A/P/T/S/E/C` explicit-state selector harness in
+`scripts/evaluate_explicit_state_selector.py`, plus an experimental
+`--global_quarantine` option for beam-wide `S/E` lock suppression. The harness
+is still not validated as a default: hard global quarantine improves null
+suppression but loses too much visible target recall, while soft quarantine does
+not beat the sidecar baseline. The main open issue remains observation
+calibration, not state bookkeeping.
+
 This checks the project against the professor's CLBA-1 recommendation:
 
 > candidate-local target-aligned minus background-aligned tube likelihood,
@@ -157,4 +166,3 @@ The next professor question should be narrower:
 - How should `S/E` quarantine work in stabilized coordinates when the camera
   registration is imperfect and the target may pass close to tree/terrain
   clutter?
-
