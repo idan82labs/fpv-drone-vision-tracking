@@ -553,21 +553,51 @@ top of OOF candidate scores. Strong hand-designed clutter penalties are still
 not validated; the winning weights are small and clip/model-specific. Keep this
 as an offline calibration harness and feature source, not a runtime default yet.
 
+CLBA sequence-selector check:
+
+- Added `scripts/sweep_clba_sequence_selector.py`.
+- This evaluates OOF candidate scores with optional CLBA score modifiers under
+  framewise, rolling-window, and full-window Viterbi selection.
+- Added sequence-path acquisition/keep hysteresis because plain sequence
+  continuity improved visible recall while hallucinating through null frames.
+- Best aaf1 ExtraTrees OOF result:
+  - 69/75 visible strict = 92.0%.
+  - 28/28 invisible no-box = 100%.
+  - 97/103 all-frame correctness = 94.2%.
+  - config: full-window Viterbi, jump 10 px, acquire 0.90, keep 0.30,
+    attached penalty 0.10, no lost patience.
+- Best aaf1 zero-CLBA result in the same harness:
+  - 56/75 visible strict = 74.7%.
+  - 27/28 invisible no-box = 96.4%.
+  - 83/103 all-frame correctness = 80.6%.
+- Best e6 HistGBDT OOF result:
+  - 67/72 visible strict = 93.1%.
+  - 26/27 invisible no-box = 96.3%.
+  - 93/99 all-frame correctness = 93.9%.
+  - best e6 config is effectively framewise/no-CLBA; sequence/CLBA do not add
+    useful signal there.
+
+Interpretation: on aaf1-like hard surface/background labels, the combination
+of continuity + acquisition/keep hysteresis + a small CLBA attached penalty is
+the first offline selector result that improves visible recall and null
+suppression together. On e6, the learned per-frame score is already sufficient
+and sequence/CLBA should not be forced. This supports a router/state-machine
+direction: sequence mode should be applied only when the local background state
+needs it, not globally.
+
 ## Next Meaningful Work
 
 1. Implement the sequence selector inside `tbd_motion_detector.py` behind an
    explicit non-default delayed-window flag, then benchmark runtime and accuracy.
-2. Fold CLBA score-modifier evaluation into the sequence-selector comparison so
-   delayed selection is tested with and without target/background alignment.
-3. Reproduce the held-out sequence result on at least one more true
+2. Reproduce the CLBA+hysteresis sequence result on at least one more true
    tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
    unless visually verified.
-4. Keep improving the frame/candidate router so delayed sequence selection only
+3. Keep improving the frame/candidate router so delayed sequence selection only
    pays the extra cost in surface-backed states.
-5. Reproduce the full-video OOF state-ranker harness on at least one more
+4. Reproduce the full-video OOF state-ranker harness on at least one more
    complete clip, then integrate null handling only if the null/visible tradeoff
    survives.
-6. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
+5. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
    d129-like frames to human review.
-7. Train null-aware tube rankers with explicit no-target/hallucination
+6. Train null-aware tube rankers with explicit no-target/hallucination
    negatives.
