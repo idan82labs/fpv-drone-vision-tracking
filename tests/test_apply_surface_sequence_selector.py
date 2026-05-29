@@ -75,6 +75,31 @@ class ApplySurfaceSequenceSelectorTests(unittest.TestCase):
         self.assertNotIn(3, gated)
         self.assertIn(4, gated)
 
+    def test_clba_adjustment_rewrites_learned_score_and_preserves_base(self):
+        rows = [
+            {
+                "learned_score": 0.8,
+                "clba_bg_q": "5",
+                "clba_bg_static_likelihood": "5",
+            },
+            {
+                "learned_score": 0.75,
+                "clba_gain_norm": "2",
+                "clba_path_bg_dist_mean": "12",
+                "clba_target_q": "2",
+            },
+        ]
+
+        adjusted = selector.apply_clba_adjustment(
+            rows,
+            selector.clba_adjust.Weights(gain=0.3, path=0.1, target_q=0.05, bg=0.3),
+        )
+
+        self.assertEqual(adjusted[0]["base_learned_score"], 0.8)
+        self.assertEqual(adjusted[1]["base_learned_score"], 0.75)
+        self.assertLess(adjusted[0]["learned_score"], adjusted[1]["learned_score"])
+        self.assertIn("clba_adjusted_score", adjusted[1])
+
 
 if __name__ == "__main__":
     unittest.main()

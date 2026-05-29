@@ -18,9 +18,11 @@ import joblib
 
 try:
     import evaluate_xy_sequence_ranker as seq
+    import sweep_clba_score_adjustment as clba_adjust
     import train_surface_xy_ranker as surface
 except ModuleNotFoundError:  # pragma: no cover - used when imported as scripts.*
     from scripts import evaluate_xy_sequence_ranker as seq
+    from scripts import sweep_clba_score_adjustment as clba_adjust
     from scripts import train_surface_xy_ranker as surface
 
 
@@ -69,6 +71,17 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Consecutive failed keep frames allowed before returning to acquisition.",
     )
+    p.add_argument(
+        "--clba_adjustment",
+        action="store_true",
+        help="Adjust learned_score with CLBA target/background terms before sequence selection.",
+    )
+    p.add_argument("--clba_gain_weight", type=float, default=0.0)
+    p.add_argument("--clba_path_weight", type=float, default=0.0)
+    p.add_argument("--clba_target_q_weight", type=float, default=0.0)
+    p.add_argument("--clba_bg_weight", type=float, default=0.0)
+    p.add_argument("--clba_attached_weight", type=float, default=0.0)
+    p.add_argument("--clba_density_weight", type=float, default=0.0)
     return p.parse_args()
 
 
@@ -128,6 +141,20 @@ def score_rows(rows: list[dict[str, str]], model_path: Path) -> tuple[list[dict[
         "final_exclude_clip": bundle.get("final_exclude_clip", ""),
     }
     return scored, meta
+
+
+def apply_clba_adjustment(rows: list[dict[str, Any]], weights: clba_adjust.Weights) -> list[dict[str, Any]]:
+    adjusted: list[dict[str, Any]] = []
+    for row in rows:
+        out = dict(row)
+        old_score = float(out.get("learned_score", 0.0) or 0.0)
+        out["base_learned_score"] = old_score
+        # The shared adjustment utility is tolerant of numeric values even
+        # though it is usually fed CSV string rows.
+        out["learned_score"] = clba_adjust.adjusted_score(out, weights, "learned_score")
+        out["clba_adjusted_score"] = out["learned_score"]
+        adjusted.append(out)
+    return adjusted
 
 
 def group_by_frame(rows: list[dict[str, Any]]) -> dict[int, list[dict[str, Any]]]:
@@ -246,6 +273,16 @@ def main() -> None:
     if not rows:
         raise SystemExit("no top-tube rows loaded")
     scored, meta = score_rows(rows, Path(args.model))
+    clba_weights = clba_adjust.Weights(
+        gain=args.clba_gain_weight,
+        path=args.clba_path_weight,
+        target_q=args.clba_target_q_weight,
+        bg=args.clba_bg_weight,
+        attached=args.clba_attached_weight,
+        density=args.clba_density_weight,
+    )
+    if args.clba_adjustment:
+        scored = apply_clba_adjustment(scored, clba_weights)
     by_frame = group_by_frame(scored)
     if args.sequence_window > 0:
         selected = seq.rolling_viterbi_select(
@@ -292,6 +329,8 @@ def main() -> None:
         "keep_threshold": args.keep_threshold,
         "hysteresis_max_jump_px": args.hysteresis_max_jump_px,
         "lost_patience": args.lost_patience,
+        "clba_adjustment": int(args.clba_adjustment),
+        "clba_weights": clba_weights.__dict__,
         **meta,
     }
     (out_path.parent / "sequence_selector_summary.json").write_text(json.dumps(summary, indent=2))

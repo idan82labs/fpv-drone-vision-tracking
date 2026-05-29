@@ -528,6 +528,10 @@ CLBA score-modifier check:
 - Added `scripts/sweep_clba_score_adjustment.py`.
 - This keeps the proven acquire/track state machine and only sweeps direct
   score modifiers from candidate-local background alignment features.
+- Added an optional CLBA adjustment path to
+  `scripts/apply_surface_sequence_selector.py`, so the offline delayed
+  sequence selector can now be compared with and without CLBA-adjusted candidate
+  probabilities when augmented top-tube rows are available.
 - It is a narrower test than the explicit A/P/T/S/E/C selector, which is still
   not validated.
 - Best aaf1 ExtraTrees CLBA-adjusted run:
