@@ -1844,6 +1844,12 @@ class BeamTBD:
         n = max(1, self.args.window)
         return contribs[-n:], hits[-n:]
 
+    def _append_score(self, prev_contribs: list[float], contrib: float) -> float:
+        keep_prev = max(0, self.args.window - 1)
+        if keep_prev == 0:
+            return float(contrib)
+        return float(sum(prev_contribs[-keep_prev:]) + contrib)
+
     def _transition_cost(
         self,
         st: PathState,
@@ -1993,6 +1999,9 @@ class BeamTBD:
                     pair_bg_local = 0.0
                     align_gain = 0.0
                 contrib = obs + self.args.pair_weight * pair - cost
+                score = self._append_score(st.contribs, contrib)
+                if score <= best_score:
+                    continue
                 contribs, hits = self._trim(st.contribs + [contrib], st.hit_flags + [True])
                 ns = PathState(
                     st.sid,
@@ -2020,9 +2029,8 @@ class BeamTBD:
                     speed_history=(st.speed_history + [speed])[-self.args.window :],
                     accel_history=(st.accel_history + [accel])[-self.args.window :],
                 )
-                if ns.score() > best_score:
-                    best_score = ns.score()
-                    best_state = ns
+                best_score = score
+                best_state = ns
             new_states.append(best_state)
 
         for st in self.states[: self.args.beam_width]:
@@ -2569,7 +2577,10 @@ def run(args: argparse.Namespace) -> None:
     if not report:
         raise SystemExit("no usable frame pairs")
 
-    avg_ms = float(np.mean([r["process_ms"] for r in report]))
+    process_times = [r["process_ms"] for r in report]
+    avg_ms = float(np.mean(process_times))
+    p90_ms = float(np.percentile(process_times, 90))
+    p95_ms = float(np.percentile(process_times, 95))
     avg_inlier = float(np.mean([r["inlier_ratio"] for r in report]))
     avg_candidates = float(np.mean([r["n_candidates"] for r in report]))
     med_candidates = float(np.median([r["n_candidates"] for r in report]))
@@ -2590,6 +2601,10 @@ def run(args: argparse.Namespace) -> None:
         key: round(float(np.percentile([r.get("timing_ms", {}).get(key, 0.0) for r in report], 90)), 3)
         for key in timing_keys
     }
+    p95_timing_ms = {
+        key: round(float(np.percentile([r.get("timing_ms", {}).get(key, 0.0) for r in report], 95)), 3)
+        for key in timing_keys
+    }
 
     result = {
         "video": args.video,
@@ -2600,6 +2615,8 @@ def run(args: argparse.Namespace) -> None:
         "summary": {
             "n_processed": len(report),
             "avg_ms_per_frame": round(avg_ms, 3),
+            "p90_ms_per_frame": round(p90_ms, 3),
+            "p95_ms_per_frame": round(p95_ms, 3),
             "fits_30hz": avg_ms <= 33.3,
             "fits_60hz_on_this_machine": avg_ms <= 16.7,
             "avg_inlier_ratio": round(avg_inlier, 3),
@@ -2617,6 +2634,7 @@ def run(args: argparse.Namespace) -> None:
             "candidate_router_counts": candidate_router_counts_total,
             "avg_timing_ms": avg_timing_ms,
             "p90_timing_ms": p90_timing_ms,
+            "p95_timing_ms": p95_timing_ms,
         },
         "frames": report,
     }

@@ -134,12 +134,16 @@ def main() -> None:
             subprocess.run(cmd, check=True)
             summary = read_summary(run_dir / "report.json")
             timing = summary.get("avg_timing_ms", {})
+            p90_timing = summary.get("p90_timing_ms", {})
+            p95_timing = summary.get("p95_timing_ms", {})
             row: dict[str, Any] = {
                 "clip": clip_name(video),
                 "mode": mode,
                 "profile": args.profile,
                 "frames": summary.get("n_processed", 0),
                 "avg_ms": summary.get("avg_ms_per_frame", 0),
+                "p90_ms": summary.get("p90_ms_per_frame", 0),
+                "p95_ms": summary.get("p95_ms_per_frame", 0),
                 "fits_30hz_mac": summary.get("fits_30hz", False),
                 "fits_60hz_mac": summary.get("fits_60hz_on_this_machine", False),
                 "avg_candidates": summary.get("avg_candidates_per_frame", 0),
@@ -150,6 +154,10 @@ def main() -> None:
             }
             for key, value in timing.items():
                 row[f"timing_{key}_avg_ms"] = value
+            for key, value in p90_timing.items():
+                row[f"timing_{key}_p90_ms"] = value
+            for key, value in p95_timing.items():
+                row[f"timing_{key}_p95_ms"] = value
             rows.append(row)
 
     fields: list[str] = []

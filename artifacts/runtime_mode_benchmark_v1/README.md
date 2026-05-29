@@ -15,17 +15,18 @@ Each run processed 89 frame pairs.
 
 ## Main Result
 
-The candidate-local router is cheap enough to keep testing, and the first beam
-hot-path pass substantially reduced runtime. The latest detector now precomputes
-state warp/prediction references once per frame and skips extra diagnostic pair
-features unless they are needed.
+The candidate-local router is cheap enough to keep testing, and the beam
+hot-path passes reduced runtime without changing selected rates. The latest
+detector now precomputes state warp/prediction references once per frame, skips
+extra diagnostic pair features unless they are needed, and avoids materializing
+candidate-transition states that cannot beat the current per-candidate winner.
 
 The current Python beam update is the runtime bottleneck when candidate count is
 high:
 
-- d129 baseline: TBD update avg about 7.8 ms.
-- aaf1 baseline: TBD update avg about 10.5 ms.
-- e271 baseline: TBD update avg about 5.3 ms.
+- d129 baseline: TBD update avg about 8.6 ms, p90 about 14.2 ms.
+- aaf1 baseline: TBD update avg about 10.8 ms, p90 about 15.7 ms.
+- e271 baseline: TBD update avg about 5.1 ms, p90 about 9.5 ms.
 
 That confirms the embedded plan: Rust should wait until behavior is stable, but
 candidate scoring, NMS, and tube update are likely hot-path candidates later.
@@ -36,9 +37,17 @@ Pair-rescue profile, avg ms/frame:
 
 | Clip | baseline | auto_log | auto_apply | clean_sky | boundary | surface |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| d129 | 28.72 | - | 29.12 | 27.83 | - | - |
-| aaf1 | 34.41 | - | 37.49 | 33.09 | - | - |
-| e271 | 16.39 | - | 17.78 | 17.53 | - | - |
+| d129 | 28.20 | - | 28.75 | 27.10 | - | - |
+| aaf1 | 33.88 | - | 36.74 | 32.77 | - | - |
+| e271 | 14.93 | - | 15.98 | 15.54 | - | - |
+
+Pair-rescue profile, p90 ms/frame:
+
+| Clip | baseline | auto_apply | clean_sky |
+| --- | ---: | ---: | ---: |
+| d129 | 41.10 | 45.24 | 37.97 |
+| aaf1 | 46.17 | 51.11 | 43.66 |
+| e271 | 22.29 | 24.07 | 21.78 |
 
 Interpretation:
 
@@ -48,9 +57,9 @@ Interpretation:
 
 ## Concern
 
-Mac-side 30 Hz is now plausible for d129/e271 and borderline for aaf1. This is
-still not a Pi 5 claim: capture/decode, p90/p99 timing, and thermal behavior are
-not included here.
+Average Mac-side 30 Hz is plausible for d129/e271 and borderline for aaf1, but
+p90 timing is not yet 30 Hz on the harder clips. This is still not a Pi 5 claim:
+capture/decode, p99 timing, and thermal behavior are not included here.
 
 ## Artifacts
 

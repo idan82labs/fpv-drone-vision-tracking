@@ -12,14 +12,23 @@ Heavy surface extras are still too slow as a general live path in Python:
 
 | Clip | auto_log | auto_apply | clean_sky | surface |
 | --- | ---: | ---: | ---: | ---: |
-| d129 | - | 60.46 ms | 37.10 ms | 90.28 ms |
-| e271 | - | 21.47 ms | 19.23 ms | 54.56 ms |
+| d129 | - | 57.84 ms | 35.61 ms | 86.87 ms |
+| e271 | - | 19.89 ms | 18.71 ms | 53.27 ms |
+
+p90 ms/frame:
+
+| Clip | auto_apply | clean_sky | surface |
+| --- | ---: | ---: | ---: |
+| d129 | 91.85 ms | 46.27 ms | 100.65 ms |
+| e271 | 27.67 ms | 25.43 ms | 63.33 ms |
 
 Interpretation:
 
 - `auto_apply` keeps temporal-stack acquisition off by default unless explicitly
   requested, but allows lock-local coast proposals from mature tracks.
 - Forced `surface` remains too slow for live Python deployment.
+- Heavy temporal-stack proposal generation, not just beam update, is the main
+  reason surface mode misses the live budget.
 - This supports the plan: use surface extras only after router behavior is
   stable, and do not make them global.
 

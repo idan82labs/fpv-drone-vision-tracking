@@ -240,11 +240,13 @@ Current status:
 - `auto` is still a logging/experiment path, not a default control path;
 - candidate-local routing is cheap enough for continued testing after the
   integral-image rewrite;
-- first Python beam hot-path pass is complete: state warp/prediction references
-  are precomputed once per frame and diagnostic pair features are skipped unless
-  needed;
-- normal pair-rescue mode now reaches Mac-side 30 Hz on d129/e271 slices and is
-  borderline on aaf1, but Pi 5 capture/decode/p90/p99 timing is still untested;
+- Python beam hot-path passes are complete for the current prototype: state
+  warp/prediction references are precomputed once per frame, diagnostic
+  pair/background/alignment features are skipped unless needed, and losing
+  candidate-transition states are not materialized;
+- normal pair-rescue mode now averages near Mac-side 30 Hz on d129/e271 slices
+  and is borderline on aaf1, but p90 timing still misses 30 Hz on the harder
+  clips and Pi 5 capture/decode/p99/thermal behavior is untested;
 - explicit surface mode is still too slow for live Python deployment.
 
 Benchmark artifacts:

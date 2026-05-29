@@ -108,13 +108,22 @@ From the embedded runtime candidate-router implementation:
 - Beam hot-path pass:
   - precomputes state warp/prediction references once per frame;
   - skips diagnostic pair/background/alignment features unless needed.
+  - skips materializing candidate-transition states that cannot beat the
+    current per-candidate winner.
 - Pair-rescue profile, 89-frame slices:
-  - d129 baseline 28.72 ms/frame, auto_apply 29.12 ms/frame, clean_sky 27.83 ms/frame.
-  - aaf1 baseline 34.41 ms/frame, clean_sky 33.09 ms/frame.
-  - e271 baseline 16.39 ms/frame, clean_sky 17.53 ms/frame.
-- Heavy surface extras remain too slow as explicit `surface` mode: d129 90.28 ms/frame, e271 54.56 ms/frame on 45-frame slices.
+  - d129 baseline 28.20 ms/frame, auto_apply 28.75 ms/frame, clean_sky 27.10 ms/frame.
+  - aaf1 baseline 33.88 ms/frame, auto_apply 36.74 ms/frame, clean_sky 32.77 ms/frame.
+  - e271 baseline 14.93 ms/frame, auto_apply 15.98 ms/frame, clean_sky 15.54 ms/frame.
+  - p90 timing still misses 30 Hz on d129/aaf1 slices, so average timing alone
+    is not enough for deployment confidence.
+- Heavy surface extras remain too slow as explicit `surface` mode: d129 86.87 ms/frame, e271 53.27 ms/frame on 45-frame slices.
 
-Interpretation: the router infrastructure is now cleaner and the Python beam update is no longer the only dominant cost in normal pair-rescue mode. Mac-side 30 Hz is plausible for d129/e271 and borderline for aaf1, but this is still not a Pi 5 claim. Surface acquisition remains a separate, explicit experiment because disabling it improves runtime but risks missing hard surface targets.
+Interpretation: the router infrastructure is now cleaner and the Python beam
+update is no longer the only dominant cost in normal pair-rescue mode. Mac-side
+average 30 Hz is plausible for d129/e271 and borderline for aaf1, but this is
+still not a Pi 5 claim. Surface acquisition remains a separate, explicit
+experiment because disabling it improves runtime but risks missing hard surface
+targets.
 
 ## Next Meaningful Work
 
