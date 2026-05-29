@@ -1433,6 +1433,13 @@ Router max-null calibration probe:
   - aaf1 no-box remains bad at low quantiles (`1/28`) because false specks get
     low clean/boundary thresholds;
   - d129 no-box improves at high quantiles, but e271 visible recall collapses.
+- Repeated the same calibration probe on broader top-70 OOF scores:
+  - no floor, `hist_gbdt`, null quantile `0.50`: `57.57%` strict /
+    `57.57%` loose / `10.53%` invisible no-box;
+  - no floor, `extra_trees`, null quantile `0.99`: `42.19%` strict /
+    `42.19%` loose / `86.18%` invisible no-box.
+  - The broader candidate pool does not fix calibration; it adds clutter and
+    makes recall/no-box tradeoffs worse.
 
 Interpretation: per-router max-null calibration is the right calibration shape,
 but not with the current candidate score. It cannot recover production behavior
