@@ -11,6 +11,7 @@ This is not a solved autonomous tracker yet.
 - Best current operating direction: high-recall cheap proposals plus tube-level ranking/verifier.
 - Most useful recent progress: the e271 reel gap was traced to missing early/mid labels plus weak close-drone proposals; the new `large_dark` proposal source raises e271 gap oracle@100 from 49.0% to 92.8% on the dense gap labels.
 - Main blocker: ranking the real drone tube above cloud, terrain, skyline, and static-hotspot clutter.
+- Newest evaluation focus: textured/non-sky target frames, where clean-sky metrics are no longer representative.
 - Recent vision-assisted videos show what the target track should look like, but they are not autonomous detector performance.
 
 ## Repository Layout
@@ -64,6 +65,14 @@ artifacts/e271_gapfix_v1/
 ```
 
 It contains the dense gap labels, a fixed reel render, proposal/ranker audit summaries, and contact sheets for the reel seconds 25-36 failure. Low-confidence rows marked `low_review_required` should be human-reviewed before being treated as strict ground truth.
+
+The latest surface-background harness summary is:
+
+```text
+artifacts/surface_xy_ranker_v2/
+```
+
+It contains split summaries and the first leave-one-clip-out surface-ranker result. Current read: the harness is useful, but the v2 model should not replace the selector yet because it does not generalize cleanly to aaf1 when held out.
 
 ## Fly.io Deployment
 

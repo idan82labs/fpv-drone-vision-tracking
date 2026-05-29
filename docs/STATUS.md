@@ -15,6 +15,7 @@ Current blocker:
 
 - The autonomous ranker still picks plausible clutter too often.
 - More candidate count alone is not a reliable improvement.
+- Surface backgrounds need their own benchmark; clean-sky numbers hide the tree/grass/terrain failure mode.
 
 ## Recent Numbers
 
@@ -46,6 +47,14 @@ From the e271 reel-gap investigation:
 - ExtraTrees diagnostic ranker on `large_dark` top-tubes: 77.4% strict / 79.6% loose on all labels, 83.3% strict / 85.1% loose on high-confidence labels.
 
 Interpretation: the immediate failure was partly data coverage and partly proposal coverage. `large_dark` is the correct short-term recovery primitive for close, clear dark silhouettes, but it still needs leave-one-clip-out validation and review of low-confidence gap labels.
+
+From the surface-background harness:
+
+- Pair-rescue/gapfix split audit: clean sky strict = 40/40, textured/non-sky strict = 679/1135 = 59.8%.
+- In that same textured/non-sky split, oracle@80 = 1008/1135 = 88.8%, so many failures are ranking failures rather than pure proposal failures.
+- A first surface ranker improves the next-batch/e271-like distribution, but the combined v2 model with aaf1 does not beat baseline under leave-one-clip-out.
+
+Interpretation: do not blindly replace the selector with the surface ranker yet. Keep the harness, collect more true tree/grass labels, and use a background-conditioned selector.
 
 ## Next Meaningful Work
 

@@ -1,0 +1,389 @@
+#!/usr/bin/env python3
+"""Train/evaluate a multi-clip XY tube ranker for hard surface backgrounds."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import math
+from collections import defaultdict
+from pathlib import Path
+from typing import Any
+
+import joblib
+import numpy as np
+from sklearn.ensemble import ExtraTreesClassifier, HistGradientBoostingClassifier
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
+
+
+EXCLUDE_COLUMNS = {
+    "frame",
+    "track_id",
+    "x",
+    "y",
+    "selected",
+    "eligible",
+    "passes_floor",
+}
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--labels", required=True)
+    p.add_argument("--results_dir", required=True)
+    p.add_argument("--out_dir", required=True)
+    p.add_argument("--max_rank", type=int, default=80)
+    p.add_argument("--center_tol_px", type=float, default=8.0)
+    p.add_argument("--loose_tol_px", type=float, default=16.0)
+    p.add_argument("--negative_min_dist_px", type=float, default=24.0)
+    p.add_argument("--confidence", nargs="*", default=["high", "medium_high"])
+    p.add_argument("--models", nargs="+", choices=("logistic", "hist_gbdt", "extra_trees"), default=["logistic", "hist_gbdt", "extra_trees"])
+    p.add_argument("--random_state", type=int, default=17)
+    return p.parse_args()
+
+
+def read_csv(path: Path) -> list[dict[str, str]]:
+    with path.open(newline="") as f:
+        return list(csv.DictReader(f))
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        path.write_text("")
+        return
+    fields: list[str] = []
+    for row in rows:
+        for key in row:
+            if key not in fields:
+                fields.append(key)
+    with path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def safe_float(value: Any, default: float | None = None) -> float | None:
+    if value in (None, ""):
+        return default
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    return out if math.isfinite(out) else default
+
+
+def clip_matches(a: str, b: str) -> bool:
+    return a == b or a.startswith(b) or b.startswith(a)
+
+
+def top_tubes_path(results_dir: Path, clip: str) -> Path | None:
+    direct = results_dir / clip / "top_tubes.csv"
+    if direct.exists():
+        return direct
+    for path in results_dir.glob("*/top_tubes.csv"):
+        if clip_matches(clip, path.parent.name):
+            return path
+    return None
+
+
+def load_top_tubes(results_dir: Path, clip: str, max_rank: int) -> dict[int, list[dict[str, str]]]:
+    path = top_tubes_path(results_dir, clip)
+    by_frame: dict[int, list[dict[str, str]]] = defaultdict(list)
+    if path is None:
+        return by_frame
+    for row in read_csv(path):
+        rank = int(safe_float(row.get("rank"), 999) or 999)
+        if rank > max_rank:
+            continue
+        frame = int(safe_float(row.get("frame"), -1) or -1)
+        if frame >= 0:
+            by_frame[frame].append(row)
+    return by_frame
+
+
+def row_bbox(row: dict[str, str]) -> tuple[float, float, float, float]:
+    return (
+        safe_float(row.get("x"), 0.0) or 0.0,
+        safe_float(row.get("y"), 0.0) or 0.0,
+        safe_float(row.get("w"), 1.0) or 1.0,
+        safe_float(row.get("h"), 1.0) or 1.0,
+    )
+
+
+def label_bbox(row: dict[str, str]) -> tuple[float, float, float, float]:
+    return (
+        safe_float(row.get("det_x", row.get("x")), 0.0) or 0.0,
+        safe_float(row.get("det_y", row.get("y")), 0.0) or 0.0,
+        safe_float(row.get("det_w", row.get("w")), 1.0) or 1.0,
+        safe_float(row.get("det_h", row.get("h")), 1.0) or 1.0,
+    )
+
+
+def center_dist(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> float:
+    ax, ay = a[0] + 0.5 * a[2], a[1] + 0.5 * a[3]
+    bx, by = b[0] + 0.5 * b[2], b[1] + 0.5 * b[3]
+    return float(math.hypot(ax - bx, ay - by))
+
+
+def dist_to_label(row: dict[str, str], lab: dict[str, str]) -> float:
+    return center_dist(row_bbox(row), label_bbox(lab))
+
+
+def infer_features(rows: list[dict[str, str]]) -> tuple[list[str], list[str]]:
+    numeric: list[str] = []
+    sources: set[str] = set()
+    for row in rows:
+        source = row.get("cand_source", "")
+        if source:
+            sources.add(source)
+        for key, value in row.items():
+            if key in EXCLUDE_COLUMNS or key == "cand_source":
+                continue
+            if safe_float(value) is not None and key not in numeric:
+                numeric.append(key)
+    return numeric, [f"src_{src}" for src in sorted(sources)]
+
+
+def vectorize(rows: list[dict[str, str]], numeric: list[str], sources: list[str]) -> np.ndarray:
+    data: list[list[float]] = []
+    for row in rows:
+        vals: list[float] = []
+        for name in numeric:
+            val = safe_float(row.get(name))
+            vals.append(np.nan if val is None else val)
+        src = row.get("cand_source", "")
+        vals.extend(1.0 if name == f"src_{src}" else 0.0 for name in sources)
+        data.append(vals)
+    return np.asarray(data, dtype=np.float64)
+
+
+def make_models(seed: int) -> dict[str, Pipeline]:
+    return {
+        "logistic": Pipeline(
+            [
+                ("impute", SimpleImputer(strategy="median")),
+                ("scale", StandardScaler()),
+                ("model", LogisticRegression(C=0.32, class_weight="balanced", max_iter=2500, solver="liblinear", random_state=seed)),
+            ]
+        ),
+        "hist_gbdt": Pipeline(
+            [
+                ("impute", SimpleImputer(strategy="median")),
+                ("model", HistGradientBoostingClassifier(max_iter=100, learning_rate=0.035, max_leaf_nodes=6, min_samples_leaf=14, l2_regularization=1.0, random_state=seed)),
+            ]
+        ),
+        "extra_trees": Pipeline(
+            [
+                ("impute", SimpleImputer(strategy="median")),
+                ("model", ExtraTreesClassifier(n_estimators=350, max_depth=5, min_samples_leaf=5, class_weight="balanced", random_state=seed)),
+            ]
+        ),
+    }
+
+
+def predict_score(model: Pipeline, x: np.ndarray) -> np.ndarray:
+    if hasattr(model, "predict_proba"):
+        return model.predict_proba(x)[:, 1]
+    return model.decision_function(x)
+
+
+def summarize(rows: list[dict[str, Any]], model: str) -> dict[str, Any]:
+    total = len(rows)
+    oracle = sum(bool(r["oracle_hit"]) for r in rows)
+    strict = sum(bool(r["strict_hit"]) for r in rows)
+    loose = sum(bool(r["loose_hit"]) for r in rows)
+    high = [r for r in rows if r.get("confidence") == "high"]
+    return {
+        "model": model,
+        "frames": total,
+        "oracle_recall": round(oracle / max(1, total), 4),
+        "strict_hit": strict,
+        "strict_recall": round(strict / max(1, total), 4),
+        "loose_hit": loose,
+        "loose_recall": round(loose / max(1, total), 4),
+        "high_frames": len(high),
+        "high_strict_recall": round(sum(bool(r["strict_hit"]) for r in high) / max(1, len(high)), 4),
+        "high_loose_recall": round(sum(bool(r["loose_hit"]) for r in high) / max(1, len(high)), 4),
+    }
+
+
+def evaluate_by_score(
+    labels: list[dict[str, str]],
+    top_by_clip: dict[str, dict[int, list[dict[str, str]]]],
+    score_name: str,
+    center_tol: float,
+    loose_tol: float,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for lab in labels:
+        rows = top_by_clip.get(lab["clip"], {}).get(int(lab["frame"]), [])
+        if not rows:
+            continue
+        best = max(rows, key=lambda r: safe_float(r.get(score_name), -1e9) or -1e9)
+        d = dist_to_label(best, lab)
+        oracle_d = min((dist_to_label(r, lab) for r in rows), default=float("inf"))
+        out.append(
+            {
+                "model": f"baseline_{score_name}",
+                "clip": lab["clip"],
+                "frame": int(lab["frame"]),
+                "confidence": lab.get("confidence", ""),
+                "rank": best.get("rank", ""),
+                "score": safe_float(best.get(score_name), ""),
+                "source": best.get("cand_source", ""),
+                "dist_px": round(d, 3),
+                "strict_hit": d <= center_tol,
+                "loose_hit": d <= loose_tol,
+                "oracle_hit": oracle_d <= center_tol,
+            }
+        )
+    return out
+
+
+def main() -> None:
+    args = parse_args()
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    labels = [r for r in read_csv(Path(args.labels)) if r.get("visible", "1") != "0"]
+    if args.confidence:
+        labels = [r for r in labels if r.get("confidence") in set(args.confidence)]
+    labels.sort(key=lambda r: (r.get("clip", ""), int(r.get("frame", "0") or 0)))
+    clips = sorted({r["clip"] for r in labels})
+    top_by_clip = {clip: load_top_tubes(Path(args.results_dir), clip, args.max_rank) for clip in clips}
+
+    examples: list[dict[str, Any]] = []
+    all_rows_for_features: list[dict[str, str]] = []
+    ignored_near = 0
+    missing_frames = 0
+    for lab in labels:
+        rows = top_by_clip.get(lab["clip"], {}).get(int(lab["frame"]), [])
+        if not rows:
+            missing_frames += 1
+            continue
+        for row in rows:
+            all_rows_for_features.append(row)
+            d = dist_to_label(row, lab)
+            if d <= args.center_tol_px:
+                y = 1
+            elif d >= args.negative_min_dist_px:
+                y = 0
+            else:
+                ignored_near += 1
+                continue
+            examples.append({"clip": lab["clip"], "frame": int(lab["frame"]), "label": lab, "row": row, "dist_px": d, "y": y})
+    if not examples:
+        raise SystemExit("no examples")
+
+    numeric, sources = infer_features(all_rows_for_features)
+    x = vectorize([e["row"] for e in examples], numeric, sources)
+    y = np.asarray([int(e["y"]) for e in examples], dtype=np.int32)
+    ex_clips = np.asarray([e["clip"] for e in examples], dtype=object)
+
+    predictions: list[dict[str, Any]] = []
+    summary: list[dict[str, Any]] = []
+    baseline = evaluate_by_score(labels, top_by_clip, "verified_score", args.center_tol_px, args.loose_tol_px)
+    predictions.extend(baseline)
+    summary.append(summarize(baseline, "baseline_verified_score"))
+
+    models = make_models(args.random_state)
+    for model_name in args.models:
+        model_rows: list[dict[str, Any]] = []
+        for held_clip in clips:
+            train_idx = np.asarray([i for i, clip in enumerate(ex_clips) if clip != held_clip], dtype=int)
+            if len(train_idx) == 0 or len(set(y[train_idx])) < 2:
+                continue
+            model = Pipeline(models[model_name].steps)
+            model.fit(x[train_idx], y[train_idx])
+            for lab in [r for r in labels if r["clip"] == held_clip]:
+                rows = top_by_clip.get(held_clip, {}).get(int(lab["frame"]), [])
+                if not rows:
+                    continue
+                scores = predict_score(model, vectorize(rows, numeric, sources))
+                best_i = int(np.argmax(scores))
+                best = rows[best_i]
+                d = dist_to_label(best, lab)
+                oracle_d = min((dist_to_label(r, lab) for r in rows), default=float("inf"))
+                rec = {
+                    "model": model_name,
+                    "clip": held_clip,
+                    "frame": int(lab["frame"]),
+                    "confidence": lab.get("confidence", ""),
+                    "rank": best.get("rank", ""),
+                    "score": round(float(scores[best_i]), 6),
+                    "source": best.get("cand_source", ""),
+                    "dist_px": round(d, 3),
+                    "strict_hit": d <= args.center_tol_px,
+                    "loose_hit": d <= args.loose_tol_px,
+                    "oracle_hit": oracle_d <= args.center_tol_px,
+                }
+                model_rows.append(rec)
+                predictions.append(rec)
+        summary.append(summarize(model_rows, model_name))
+
+    best_name = max(summary[1:], key=lambda r: (r["strict_recall"], r["high_strict_recall"]))["model"]
+    final_model = make_models(args.random_state)[best_name]
+    final_model.fit(x, y)
+    model_path = out_dir / f"{best_name}_surface_xy_ranker.joblib"
+    joblib.dump(
+        {
+            "model": final_model,
+            "numeric_features": numeric,
+            "source_features": sources,
+            "max_rank": args.max_rank,
+            "center_tol_px": args.center_tol_px,
+            "loose_tol_px": args.loose_tol_px,
+            "negative_min_dist_px": args.negative_min_dist_px,
+            "best_model_loco": best_name,
+        },
+        model_path,
+    )
+
+    write_csv(out_dir / "loco_predictions.csv", predictions)
+    write_csv(out_dir / "loco_summary.csv", summary)
+    write_csv(
+        out_dir / "training_examples.csv",
+        [
+            {
+                "clip": ex["clip"],
+                "frame": ex["frame"],
+                "y": ex["y"],
+                "dist_px": round(ex["dist_px"], 3),
+                "rank": ex["row"].get("rank", ""),
+                "source": ex["row"].get("cand_source", ""),
+                "confidence": ex["label"].get("confidence", ""),
+            }
+            for ex in examples
+        ],
+    )
+    metadata = {
+        "labels": str(args.labels),
+        "results_dir": str(args.results_dir),
+        "clips": clips,
+        "frames": len(labels),
+        "missing_frames": missing_frames,
+        "examples": len(examples),
+        "positive_examples": int(np.sum(y == 1)),
+        "negative_examples": int(np.sum(y == 0)),
+        "ignored_near_examples": ignored_near,
+        "numeric_features": numeric,
+        "source_features": sources,
+        "best_model_loco": best_name,
+        "model_path": str(model_path),
+    }
+    (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
+    (out_dir / "README.md").write_text(
+        "# Surface XY Tube Ranker\n\n"
+        "Leave-one-clip-out evaluation for textured/non-sky labels.\n\n"
+        f"Best LOCO model: `{best_name}`\n\n"
+        "See `loco_summary.csv`, `loco_predictions.csv`, and `metadata.json`.\n"
+    )
+    print(out_dir / "loco_summary.csv")
+    print(model_path)
+
+
+if __name__ == "__main__":
+    main()
