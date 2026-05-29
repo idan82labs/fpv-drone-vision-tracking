@@ -110,6 +110,102 @@ class ApplySurfaceSequenceSelectorTests(unittest.TestCase):
         self.assertAlmostEqual(selector.candidate_evidence(row, "centered", 2.0, 0.5, 0.0), 0.5)
         self.assertAlmostEqual(selector.candidate_evidence(row, "raw", 2.0, 0.5, 0.0), 1.5)
 
+    def test_joint_candidate_terms_compete_with_static_explanation(self):
+        target = {
+            "rank": "1",
+            "learned_score": 0.9,
+            "clba_target_likelihood": "4",
+            "clba_gain_norm": "3",
+            "clba_bg_static_likelihood": "0",
+            "clba_attached_likelihood": "0",
+        }
+        static = {
+            "rank": "1",
+            "learned_score": 0.9,
+            "clba_target_likelihood": "0",
+            "clba_gain_norm": "0",
+            "clba_bg_static_likelihood": "6",
+            "clba_attached_likelihood": "0",
+        }
+
+        target_terms = selector.joint_candidate_terms(
+            target, "logit", 1.0, 0.5, 0.35, 0.55, 0.03, 0.75, 0.7, 0.08, 0.0, 0.15, 0.1
+        )
+        static_terms = selector.joint_candidate_terms(
+            static, "logit", 1.0, 0.5, 0.35, 0.55, 0.03, 0.75, 0.7, 0.08, 0.0, 0.15, 0.1
+        )
+
+        self.assertGreater(target_terms["target_llr"], target_terms["static_llr"])
+        self.assertGreater(static_terms["static_llr"], static_terms["target_llr"])
+
+    def test_joint_hmm_static_lock_can_release_to_fresh_target(self):
+        static = {
+            "frame": "0",
+            "rank": "1",
+            "x": "0",
+            "y": "0",
+            "w": "4",
+            "h": "4",
+            "learned_score": 0.95,
+            "clba_target_likelihood": "0",
+            "clba_gain_norm": "0",
+            "clba_bg_static_likelihood": "7",
+            "clba_attached_likelihood": "0",
+        }
+        target1 = {
+            "frame": "1",
+            "rank": "1",
+            "x": "80",
+            "y": "0",
+            "w": "4",
+            "h": "4",
+            "learned_score": 0.95,
+            "clba_target_likelihood": "5",
+            "clba_gain_norm": "3",
+            "clba_path_bg_dist_mean": "8",
+            "clba_bg_static_likelihood": "0",
+            "clba_attached_likelihood": "0",
+        }
+        target2 = dict(target1, frame="2", x="82")
+        by_frame = {0: [static], 1: [target1], 2: [target2]}
+
+        selected = selector.select_with_joint_hmm(
+            by_frame,
+            max_jump_px=8,
+            transition_weight=0.2,
+            size_jump_weight=0.0,
+            beam=32,
+            score_mode="logit",
+            score_scale=1.0,
+            score_center=0.5,
+            birth_penalty=0.3,
+            track_bonus=0.2,
+            miss_penalty=0.4,
+            coast_penalty=0.1,
+            reacquire_penalty=0.2,
+            max_coast=1,
+            acquire_hits=2,
+            target_weight=0.35,
+            gain_weight=0.55,
+            path_weight=0.03,
+            static_weight=0.75,
+            attached_weight=0.7,
+            rank_weight=0.08,
+            null_bias=0.0,
+            static_bias=0.15,
+            attached_bias=0.1,
+            lock_margin=0.1,
+            lock_penalty=0.25,
+            release_penalty=0.1,
+            quarantine_px=12.0,
+            quarantine_frames=10,
+            quarantine_penalty=2.5,
+        )
+
+        self.assertNotIn(0, selected)
+        self.assertIn(2, selected)
+        self.assertEqual(selected[2]["x"], "82")
+
     def test_static_lock_risk_uses_rank_limited_clba_median(self):
         rows = [
             {"rank": "1", "clba_bg_static_likelihood": "3", "clba_target_likelihood": "1"},

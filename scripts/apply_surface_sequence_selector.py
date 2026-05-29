@@ -40,10 +40,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--size_jump_weight", type=float, default=0.0)
     p.add_argument(
         "--selector",
-        choices=("viterbi", "hmm", "adaptive_hmm"),
+        choices=("viterbi", "hmm", "adaptive_hmm", "joint_hmm"),
         default="viterbi",
         help=(
             "Selection model. hmm adds explicit absent/coast/null states. "
+            "joint_hmm adds present/static/attached lock states. "
             "adaptive_hmm routes each frame between Viterbi and HMM by recent "
             "CLBA static-lock risk."
         ),
@@ -104,6 +105,22 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hmm_reacquire_penalty", type=float, default=0.35)
     p.add_argument("--hmm_max_coast", type=int, default=3)
     p.add_argument("--hmm_clutter_weight", type=float, default=0.0)
+    p.add_argument("--joint_acquire_hits", type=int, default=2)
+    p.add_argument("--joint_target_weight", type=float, default=0.35)
+    p.add_argument("--joint_gain_weight", type=float, default=0.55)
+    p.add_argument("--joint_path_weight", type=float, default=0.03)
+    p.add_argument("--joint_static_weight", type=float, default=0.75)
+    p.add_argument("--joint_attached_weight", type=float, default=0.7)
+    p.add_argument("--joint_rank_weight", type=float, default=0.08)
+    p.add_argument("--joint_null_bias", type=float, default=0.0)
+    p.add_argument("--joint_static_bias", type=float, default=0.15)
+    p.add_argument("--joint_attached_bias", type=float, default=0.1)
+    p.add_argument("--joint_lock_margin", type=float, default=0.1)
+    p.add_argument("--joint_lock_penalty", type=float, default=0.25)
+    p.add_argument("--joint_release_penalty", type=float, default=0.15)
+    p.add_argument("--joint_quarantine_px", type=float, default=12.0)
+    p.add_argument("--joint_quarantine_frames", type=int, default=18)
+    p.add_argument("--joint_quarantine_penalty", type=float, default=2.5)
     p.add_argument("--adaptive_risk_threshold", type=float, default=0.5)
     p.add_argument("--adaptive_risk_acquire_threshold", type=float, default=None)
     p.add_argument("--adaptive_risk_keep_threshold", type=float, default=None)
@@ -230,6 +247,15 @@ def logit_score(value: float) -> float:
     return math.log(p / (1.0 - p))
 
 
+def logsumexp(values: list[float]) -> float:
+    if not values:
+        return -1.0e9
+    m = max(values)
+    if not math.isfinite(m):
+        return m
+    return m + math.log(sum(math.exp(v - m) for v in values))
+
+
 def candidate_evidence(
     row: dict[str, Any],
     score_mode: str,
@@ -259,6 +285,63 @@ def candidate_evidence(
         attached = safe_float(row.get("clba_attached_likelihood"))
         evidence -= clutter_weight * max(0.0, static - target, attached - target)
     return evidence
+
+
+def joint_candidate_terms(
+    row: dict[str, Any],
+    score_mode: str,
+    score_scale: float,
+    score_center: float,
+    target_weight: float,
+    gain_weight: float,
+    path_weight: float,
+    static_weight: float,
+    attached_weight: float,
+    rank_weight: float,
+    null_bias: float,
+    static_bias: float,
+    attached_bias: float,
+) -> dict[str, float]:
+    """Return target/static/attached/null observation terms for one candidate."""
+
+    proposal = candidate_evidence(row, score_mode, score_scale, score_center, 0.0)
+    rank = max(1, surface.int_or_default(row.get("rank"), 999999))
+    proposal -= rank_weight * math.log1p(rank)
+    target_ll = safe_float(row.get("clba_target_likelihood"))
+    static_ll = safe_float(row.get("clba_bg_static_likelihood"))
+    attached_ll = safe_float(row.get("clba_attached_likelihood"))
+    gain = safe_float(row.get("clba_gain_norm"))
+    bg_dist = min(12.0, max(0.0, safe_float(row.get("clba_path_bg_dist_mean"))))
+    line = max(
+        safe_float(row.get("cand_line_context")),
+        safe_float(row.get("tube_mean_line_context")),
+        safe_float(row.get("tube_max_line_context")),
+    )
+    support = max(
+        safe_float(row.get("cand_attached_support")),
+        safe_float(row.get("tube_mean_attached_support")),
+        safe_float(row.get("tube_max_attached_support")),
+    )
+    density = max(
+        safe_float(row.get("tube_log_cand_density")),
+        math.log1p(max(0.0, safe_float(row.get("tube_mean_cand_density")))),
+    )
+    target = proposal + target_weight * target_ll + gain_weight * gain + path_weight * bg_dist
+    static = static_bias + static_weight * static_ll + 0.08 * max(0.0, density) - 0.2 * max(0.0, gain)
+    attached = attached_bias + attached_weight * attached_ll + 0.18 * line + 0.01 * support
+    null = null_bias + 0.04 * density
+    clutter = logsumexp([static, attached, null])
+    return {
+        "proposal": proposal,
+        "target": target,
+        "static": static,
+        "attached": attached,
+        "null": null,
+        "clutter": clutter,
+        "target_llr": target - clutter,
+        "static_llr": static - logsumexp([target, attached, null]),
+        "attached_llr": attached - logsumexp([target, static, null]),
+    }
 
 
 def apply_hysteresis_gate(
@@ -479,6 +562,373 @@ def select_with_null_hmm(
                 if key in seen_track_keys:
                     continue
                 seen_track_keys.add(key)
+            deduped.append(st)
+            if len(deduped) >= beam:
+                break
+        states = deduped
+
+    best = max(states, key=lambda s: float(s["score"]))
+    return dict(best.get("selected", {}))
+
+
+def select_with_joint_hmm(
+    by_frame: dict[int, list[dict[str, Any]]],
+    max_jump_px: float,
+    transition_weight: float,
+    size_jump_weight: float,
+    beam: int,
+    score_mode: str,
+    score_scale: float,
+    score_center: float,
+    birth_penalty: float,
+    track_bonus: float,
+    miss_penalty: float,
+    coast_penalty: float,
+    reacquire_penalty: float,
+    max_coast: int,
+    acquire_hits: int,
+    target_weight: float,
+    gain_weight: float,
+    path_weight: float,
+    static_weight: float,
+    attached_weight: float,
+    rank_weight: float,
+    null_bias: float,
+    static_bias: float,
+    attached_bias: float,
+    lock_margin: float,
+    lock_penalty: float,
+    release_penalty: float,
+    quarantine_px: float,
+    quarantine_frames: int,
+    quarantine_penalty: float,
+) -> dict[int, dict[str, Any]]:
+    """Candidate HMM with explicit present/static/attached lock states.
+
+    States:
+      A: absent/no target, emits no box.
+      P: present candidate accumulating evidence, emits no box.
+      T: acquired target, emits a candidate box.
+      C: lost/coast from a prior target, emits no box.
+      S: static/background lock explanation, emits no box.
+      E: attached edge/tree/terrain lock explanation, emits no box.
+
+    This is still an offline selector over exported top-tube rows. It is the
+    first direct test of the professor's "target vs background/null
+    explanations in one state model" recommendation.
+    """
+
+    frames = sorted(by_frame)
+    if not frames:
+        return {}
+    beam = max(1, int(beam))
+    acquire_hits = max(1, int(acquire_hits))
+    quarantine_frames = max(0, int(quarantine_frames))
+    quarantine_px = max(0.0, quarantine_px)
+
+    def motion_cost(prev_row: dict[str, Any], row: dict[str, Any], gap: int) -> float | None:
+        pb = bbox(prev_row)
+        rb = bbox(row)
+        size_allowance = size_jump_weight * max(pb[2], pb[3], rb[2], rb[3])
+        allowed = max_jump_px * max(1, gap) + size_allowance
+        jump = center_dist(pb, rb)
+        if jump > allowed:
+            return None
+        return transition_weight * (jump / max(1e-6, allowed)) ** 2
+
+    def anchor_from(row: dict[str, Any], frame: int, kind: str) -> dict[str, Any]:
+        x, y, w, h = bbox(row)
+        return {
+            "x": x + 0.5 * w,
+            "y": y + 0.5 * h,
+            "frame": frame,
+            "kind": kind,
+        }
+
+    def fresh_anchors(anchors: list[dict[str, Any]], frame: int) -> list[dict[str, Any]]:
+        if quarantine_frames <= 0:
+            return []
+        return [a for a in anchors if frame - int(a.get("frame", frame)) <= quarantine_frames]
+
+    def quarantine_cost(row: dict[str, Any], anchors: list[dict[str, Any]], frame: int) -> float:
+        if not anchors or quarantine_px <= 0.0:
+            return 0.0
+        x, y, w, h = bbox(row)
+        cx = x + 0.5 * w
+        cy = y + 0.5 * h
+        cost = 0.0
+        for anchor in fresh_anchors(anchors, frame):
+            dist = math.hypot(cx - float(anchor["x"]), cy - float(anchor["y"]))
+            if dist <= quarantine_px:
+                cost = max(cost, quarantine_penalty * (1.0 - dist / max(1e-6, quarantine_px)))
+        return cost
+
+    def obs(row: dict[str, Any]) -> dict[str, float]:
+        return joint_candidate_terms(
+            row,
+            score_mode=score_mode,
+            score_scale=score_scale,
+            score_center=score_center,
+            target_weight=target_weight,
+            gain_weight=gain_weight,
+            path_weight=path_weight,
+            static_weight=static_weight,
+            attached_weight=attached_weight,
+            rank_weight=rank_weight,
+            null_bias=null_bias,
+            static_bias=static_bias,
+            attached_bias=attached_bias,
+        )
+
+    states: list[dict[str, Any]] = [
+        {
+            "state": "A",
+            "score": 0.0,
+            "row": None,
+            "last_frame": None,
+            "hits": 0,
+            "misses": 0,
+            "anchors": [],
+            "selected": {},
+        }
+    ]
+
+    for frame in frames:
+        rows = by_frame.get(frame, [])
+        next_states: list[dict[str, Any]] = []
+        for st in states:
+            state_name = str(st["state"])
+            base_score = float(st["score"])
+            last_row = st.get("row")
+            last_frame = st.get("last_frame")
+            hits = int(st.get("hits", 0))
+            misses = int(st.get("misses", 0))
+            anchors = fresh_anchors(list(st.get("anchors", [])), frame)
+            selected = dict(st.get("selected", {}))
+
+            # Null/MISS update.
+            if state_name == "A":
+                next_states.append({**st, "anchors": anchors})
+            elif state_name == "P":
+                next_states.append(
+                    {
+                        "state": "A",
+                        "score": base_score - 0.25,
+                        "row": None,
+                        "last_frame": None,
+                        "hits": 0,
+                        "misses": 0,
+                        "anchors": anchors,
+                        "selected": selected,
+                    }
+                )
+            elif state_name == "T":
+                next_states.append(
+                    {
+                        "state": "C",
+                        "score": base_score - miss_penalty,
+                        "row": last_row,
+                        "last_frame": last_frame,
+                        "hits": hits,
+                        "misses": 1,
+                        "anchors": anchors,
+                        "selected": selected,
+                    }
+                )
+            elif state_name == "C":
+                new_misses = misses + 1
+                if new_misses <= max_coast:
+                    next_states.append(
+                        {
+                            "state": "C",
+                            "score": base_score - coast_penalty,
+                            "row": last_row,
+                            "last_frame": last_frame,
+                            "hits": hits,
+                            "misses": new_misses,
+                            "anchors": anchors,
+                            "selected": selected,
+                        }
+                    )
+                next_states.append(
+                    {
+                        "state": "A",
+                        "score": base_score - release_penalty,
+                        "row": None,
+                        "last_frame": None,
+                        "hits": 0,
+                        "misses": 0,
+                        "anchors": anchors,
+                        "selected": selected,
+                    }
+                )
+            elif state_name in {"S", "E"}:
+                next_states.append(
+                    {
+                        "state": "A",
+                        "score": base_score - release_penalty,
+                        "row": None,
+                        "last_frame": None,
+                        "hits": 0,
+                        "misses": 0,
+                        "anchors": anchors,
+                        "selected": selected,
+                    }
+                )
+                next_states.append(
+                    {
+                        "state": state_name,
+                        "score": base_score - 0.05,
+                        "row": last_row,
+                        "last_frame": last_frame,
+                        "hits": 0,
+                        "misses": misses + 1,
+                        "anchors": anchors,
+                        "selected": selected,
+                    }
+                )
+
+            for row in rows:
+                terms = obs(row)
+                qcost = quarantine_cost(row, anchors, frame)
+                target_obs = terms["target_llr"] - qcost
+                static_obs = terms["static_llr"]
+                attached_obs = terms["attached_llr"]
+                new_selected = dict(selected)
+
+                if state_name == "A":
+                    if acquire_hits <= 1:
+                        new_selected[frame] = row
+                        next_states.append(
+                            {
+                                "state": "T",
+                                "score": base_score + target_obs - birth_penalty,
+                                "row": row,
+                                "last_frame": frame,
+                                "hits": 1,
+                                "misses": 0,
+                                "anchors": anchors,
+                                "selected": new_selected,
+                            }
+                        )
+                    else:
+                        next_states.append(
+                            {
+                                "state": "P",
+                                "score": base_score + target_obs - birth_penalty,
+                                "row": row,
+                                "last_frame": frame,
+                                "hits": 1,
+                                "misses": 0,
+                                "anchors": anchors,
+                                "selected": selected,
+                            }
+                        )
+                elif state_name in {"P", "T", "C"}:
+                    if last_row is None or last_frame is None:
+                        continue
+                    gap = max(1, frame - int(last_frame))
+                    cost = motion_cost(last_row, row, gap)
+                    if cost is None:
+                        continue
+                    new_hits = hits + 1
+                    track_penalty = reacquire_penalty if state_name == "C" else 0.0
+                    if state_name == "P" and new_hits < acquire_hits:
+                        next_states.append(
+                            {
+                                "state": "P",
+                                "score": base_score + target_obs - cost,
+                                "row": row,
+                                "last_frame": frame,
+                                "hits": new_hits,
+                                "misses": 0,
+                                "anchors": anchors,
+                                "selected": selected,
+                            }
+                        )
+                    else:
+                        new_selected[frame] = row
+                        next_states.append(
+                            {
+                                "state": "T",
+                                "score": base_score + target_obs + track_bonus - cost - track_penalty,
+                                "row": row,
+                                "last_frame": frame,
+                                "hits": new_hits,
+                                "misses": 0,
+                                "anchors": anchors,
+                                "selected": new_selected,
+                            }
+                        )
+                elif state_name in {"S", "E"}:
+                    # A lock state cannot turn directly into an emitting target.
+                    # It may start a fresh present hypothesis elsewhere, with
+                    # quarantine suppressing same-anchor births.
+                    next_states.append(
+                        {
+                            "state": "P",
+                            "score": base_score + target_obs - birth_penalty - release_penalty,
+                            "row": row,
+                            "last_frame": frame,
+                            "hits": 1,
+                            "misses": 0,
+                            "anchors": anchors,
+                            "selected": selected,
+                        }
+                    )
+
+                if static_obs > target_obs + lock_margin:
+                    next_states.append(
+                        {
+                            "state": "S",
+                            "score": base_score + static_obs - lock_penalty,
+                            "row": row,
+                            "last_frame": frame,
+                            "hits": 0,
+                            "misses": 0,
+                            "anchors": anchors + [anchor_from(row, frame, "S")],
+                            "selected": selected,
+                        }
+                    )
+                if attached_obs > target_obs + lock_margin:
+                    next_states.append(
+                        {
+                            "state": "E",
+                            "score": base_score + attached_obs - lock_penalty,
+                            "row": row,
+                            "last_frame": frame,
+                            "hits": 0,
+                            "misses": 0,
+                            "anchors": anchors + [anchor_from(row, frame, "E")],
+                            "selected": selected,
+                        }
+                    )
+
+        next_states.sort(key=lambda s: float(s["score"]), reverse=True)
+        deduped: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for st in next_states:
+            row = st.get("row") or {}
+            state_name = str(st.get("state"))
+            if state_name == "A":
+                key = ("A", len(st.get("anchors", [])))
+            elif state_name in {"S", "E"}:
+                x, y, w, h = bbox(row)
+                key = (
+                    state_name,
+                    round((x + 0.5 * w) / 4.0),
+                    round((y + 0.5 * h) / 4.0),
+                    len(st.get("anchors", [])),
+                )
+            else:
+                key = (
+                    state_name,
+                    int(st.get("last_frame") or -1),
+                    str(row.get("track_id", row.get("rank", ""))),
+                )
+            if key in seen:
+                continue
+            seen.add(key)
             deduped.append(st)
             if len(deduped) >= beam:
                 break
@@ -718,6 +1168,39 @@ def main() -> None:
             max_coast=args.hmm_max_coast,
             clutter_weight=args.hmm_clutter_weight,
         )
+    elif args.selector == "joint_hmm":
+        selected = select_with_joint_hmm(
+            by_frame,
+            max_jump_px=args.max_jump_px,
+            transition_weight=args.transition_weight,
+            size_jump_weight=args.size_jump_weight,
+            beam=args.hmm_beam,
+            score_mode=args.hmm_score_mode,
+            score_scale=args.hmm_score_scale,
+            score_center=args.hmm_score_center,
+            birth_penalty=args.hmm_birth_penalty,
+            track_bonus=args.hmm_track_bonus,
+            miss_penalty=args.hmm_miss_penalty,
+            coast_penalty=args.hmm_coast_penalty,
+            reacquire_penalty=args.hmm_reacquire_penalty,
+            max_coast=args.hmm_max_coast,
+            acquire_hits=args.joint_acquire_hits,
+            target_weight=args.joint_target_weight,
+            gain_weight=args.joint_gain_weight,
+            path_weight=args.joint_path_weight,
+            static_weight=args.joint_static_weight,
+            attached_weight=args.joint_attached_weight,
+            rank_weight=args.joint_rank_weight,
+            null_bias=args.joint_null_bias,
+            static_bias=args.joint_static_bias,
+            attached_bias=args.joint_attached_bias,
+            lock_margin=args.joint_lock_margin,
+            lock_penalty=args.joint_lock_penalty,
+            release_penalty=args.joint_release_penalty,
+            quarantine_px=args.joint_quarantine_px,
+            quarantine_frames=args.joint_quarantine_frames,
+            quarantine_penalty=args.joint_quarantine_penalty,
+        )
     elif args.selector == "adaptive_hmm":
         selected = select_with_adaptive_hmm(
             by_frame,
@@ -804,6 +1287,24 @@ def main() -> None:
             "reacquire_penalty": args.hmm_reacquire_penalty,
             "max_coast": args.hmm_max_coast,
             "clutter_weight": args.hmm_clutter_weight,
+        },
+        "joint_hmm": {
+            "acquire_hits": args.joint_acquire_hits,
+            "target_weight": args.joint_target_weight,
+            "gain_weight": args.joint_gain_weight,
+            "path_weight": args.joint_path_weight,
+            "static_weight": args.joint_static_weight,
+            "attached_weight": args.joint_attached_weight,
+            "rank_weight": args.joint_rank_weight,
+            "null_bias": args.joint_null_bias,
+            "static_bias": args.joint_static_bias,
+            "attached_bias": args.joint_attached_bias,
+            "lock_margin": args.joint_lock_margin,
+            "lock_penalty": args.joint_lock_penalty,
+            "release_penalty": args.joint_release_penalty,
+            "quarantine_px": args.joint_quarantine_px,
+            "quarantine_frames": args.joint_quarantine_frames,
+            "quarantine_penalty": args.joint_quarantine_penalty,
         },
         "adaptive": {
             "risk_threshold": args.adaptive_risk_threshold,

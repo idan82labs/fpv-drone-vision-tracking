@@ -992,3 +992,44 @@ behavior must require sustained background-lock evidence, but continuous Viterbi
 protection needs a stronger target-vs-background observation than the current
 scalar CLBA/top-tube features. Do not promote this router into
 `apply_surface_sequence_selector.py` default behavior.
+
+Joint-state HMM probe:
+
+- Added non-default `--selector joint_hmm` to
+  `scripts/apply_surface_sequence_selector.py`.
+- The probe adds explicit offline states:
+  - `A`: absent/no target;
+  - `P`: present but not yet acquired, no emitted box;
+  - `T`: acquired target, emits a box;
+  - `C`: lost/coast, no emitted box;
+  - `S`: static/background-lock explanation, no emitted box;
+  - `E`: attached edge/tree/terrain explanation, no emitted box.
+- `S/E` paths can add short-lived local quarantine anchors, and cannot directly
+  become emitting `T` tracks. They must release to a fresh `P` hypothesis first.
+- Added batch-evaluation support for `selector=joint_hmm` in
+  `scripts/evaluate_surface_selector_modes.py`.
+- Sanity tests cover:
+  - target-vs-static observation competition;
+  - a static false lock releasing to a fresh target;
+  - existing selector/router behavior.
+- First dense-label probe is negative:
+  - `joint_default`: 38.2% strict / 53.6% loose / 88.5% invisible no-box;
+  - `joint_permissive`: 51.3% strict / 69.0% loose / 74.7% invisible no-box;
+  - `joint_static_light`: 43.4% strict / 61.9% loose / 86.2% invisible
+    no-box;
+  - comparison `viterbi_w9`: 73.8% strict / 80.2% loose / 3.3% invisible
+    no-box;
+  - comparison `hmm_conservative`: 64.3% strict / 72.5% loose / 97.7%
+    invisible no-box.
+- Per-clip read:
+  - the joint model suppresses nulls, but loses too many visible frames on
+    e271, d129, and aaf1;
+  - simply lowering the null prior or using immediate acquisition does not fix
+    the state/observation mismatch.
+
+Interpretation: the professor's full state topology is now represented in an
+offline harness, but the first observation parameterization is not useful. This
+is an important negative result: the missing ingredient is not the state names
+alone. We still need a better `O_T/O_S/O_E/O_N` observation, likely with
+same-router local controls and/or crop-stack target-vs-background evidence. Do
+not move `joint_hmm` into runtime or make it the default selector.

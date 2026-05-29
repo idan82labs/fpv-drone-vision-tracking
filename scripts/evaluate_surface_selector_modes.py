@@ -89,8 +89,10 @@ def parse_modes(raw: str) -> list[dict[str, Any]]:
             key, value = part.split("=", 1)
             key = key.strip()
             value = value.strip()
-            if key in {"window", "lost"}:
+            if key in {"window", "lost", "hmm_beam", "max_coast", "acquire_hits"}:
                 opts[key] = int(float(value))
+            elif key in {"selector", "score_mode"}:
+                opts[key] = value
             else:
                 opts[key] = float(value)
         modes.append(opts)
@@ -126,6 +128,59 @@ def select_mode(
     transition_weight: float,
     size_jump_weight: float,
 ) -> dict[int, dict[str, Any]]:
+    selector_name = str(mode.get("selector", "viterbi"))
+    if selector_name == "hmm":
+        return selector.select_with_null_hmm(
+            by_frame,
+            max_jump_px=float(mode.get("jump", max_jump_px)),
+            transition_weight=float(mode.get("transition", transition_weight)),
+            size_jump_weight=float(mode.get("size_jump", size_jump_weight)),
+            beam=int(mode.get("hmm_beam", 128)),
+            score_mode=str(mode.get("score_mode", "logit")),
+            score_scale=float(mode.get("score_scale", 1.0)),
+            score_center=float(mode.get("score_center", 0.5)),
+            birth_penalty=float(mode.get("birth", 1.2)),
+            track_bonus=float(mode.get("track_bonus", 0.05)),
+            miss_penalty=float(mode.get("miss", 0.65)),
+            coast_penalty=float(mode.get("coast", 0.15)),
+            reacquire_penalty=float(mode.get("reacquire", 0.35)),
+            max_coast=int(mode.get("max_coast", 3)),
+            clutter_weight=float(mode.get("clutter", 0.0)),
+        )
+    if selector_name == "joint_hmm":
+        return selector.select_with_joint_hmm(
+            by_frame,
+            max_jump_px=float(mode.get("jump", max_jump_px)),
+            transition_weight=float(mode.get("transition", transition_weight)),
+            size_jump_weight=float(mode.get("size_jump", size_jump_weight)),
+            beam=int(mode.get("hmm_beam", 96)),
+            score_mode=str(mode.get("score_mode", "logit")),
+            score_scale=float(mode.get("score_scale", 1.0)),
+            score_center=float(mode.get("score_center", 0.5)),
+            birth_penalty=float(mode.get("birth", 0.3)),
+            track_bonus=float(mode.get("track_bonus", 0.15)),
+            miss_penalty=float(mode.get("miss", 0.4)),
+            coast_penalty=float(mode.get("coast", 0.1)),
+            reacquire_penalty=float(mode.get("reacquire", 0.2)),
+            max_coast=int(mode.get("max_coast", 1)),
+            acquire_hits=int(mode.get("acquire_hits", 2)),
+            target_weight=float(mode.get("target_w", 0.35)),
+            gain_weight=float(mode.get("gain_w", 0.55)),
+            path_weight=float(mode.get("path_w", 0.03)),
+            static_weight=float(mode.get("static_w", 0.75)),
+            attached_weight=float(mode.get("attached_w", 0.7)),
+            rank_weight=float(mode.get("rank_w", 0.08)),
+            null_bias=float(mode.get("null_bias", 0.0)),
+            static_bias=float(mode.get("static_bias", 0.15)),
+            attached_bias=float(mode.get("attached_bias", 0.1)),
+            lock_margin=float(mode.get("lock_margin", 0.1)),
+            lock_penalty=float(mode.get("lock_penalty", 0.25)),
+            release_penalty=float(mode.get("release", 0.1)),
+            quarantine_px=float(mode.get("quarantine_px", 12.0)),
+            quarantine_frames=int(mode.get("quarantine_frames", 18)),
+            quarantine_penalty=float(mode.get("quarantine_penalty", 2.5)),
+        )
+
     window = int(mode.get("window", 1))
     if window > 0:
         selected = seq.rolling_viterbi_select(
