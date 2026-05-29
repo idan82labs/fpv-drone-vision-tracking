@@ -16,6 +16,8 @@ This repository includes only curated data.
   - Selected demo videos and contact sheets.
 - `artifacts/diagnostics/`
   - A few diagnostic sheets used to justify vision-assisted gap filling.
+- `artifacts/state_machine_selector_d129_v1/`
+  - Complete-video d129 acquisition/null selector sweep and its input CSVs.
 
 ## Excluded
 
@@ -35,4 +37,3 @@ Use label sources carefully:
 ## Current Demo Caveat
 
 `artifacts/current_demo/e271_vision_assisted_clean_9p0-12p8s_v2.mp4` is intended for explaining the desired target track. It is not a claim that the autonomous detector currently holds that lock.
-

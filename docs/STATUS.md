@@ -125,10 +125,34 @@ still not a Pi 5 claim. Surface acquisition remains a separate, explicit
 experiment because disabling it improves runtime but risks missing hard surface
 targets.
 
+From the first acquisition/null state-machine sweep:
+
+- Added `scripts/evaluate_lock_state_machine.py`.
+- Evaluated the existing d129 complete-video labels against the learned
+  HistGBDT per-frame best candidate table.
+- Best all-frame state config: 225/250 = 90.0% all-frame correctness, 26/38 =
+  68.4% visible strict, 199/212 = 93.9% invisible no-box.
+- Recall-preserving state config: 84.8% all-frame correctness while keeping the
+  current 29/38 = 76.3% visible strict recall and improving invisible no-box to
+  86.3%.
+- Probe `--mask_selected_for_motion_model`: d129 visible strict improved
+  29/38 -> 30/38, but all-frame correctness fell 160/250 -> 152/250 because
+  hallucinations increased. Keep it as an explicit experiment, not a default.
+
+Interpretation: acquisition/null state is a better no-new-label path than more
+threshold tuning. It can materially suppress hallucinations, but the
+high-accuracy config acquires late. The next integration should support two
+modes: strict search/null before lock and continuity-backed tracking after lock.
+
 ## Next Meaningful Work
 
-1. Evaluate acquisition versus tracking state on complete videos: high threshold before lock, lower continuity-backed threshold after lock.
-2. Improve the frame router so it does not over-classify e271/aaf1-like ridge or horizon clips as surface.
-3. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous d129-like frames to human review.
-4. Keep the state-machine selector path: learned ranker only in states where LOCO shows benefit.
-5. Train null-aware tube rankers with explicit no-target/hallucination negatives.
+1. Integrate the acquisition/null selector behind explicit flags in
+   `tbd_motion_detector.py`, then evaluate it on complete videos.
+2. Improve the frame router so it does not over-classify e271/aaf1-like ridge
+   or horizon clips as surface.
+3. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
+   d129-like frames to human review.
+4. Keep the state-machine selector path: learned ranker only in states where
+   LOCO shows benefit.
+5. Train null-aware tube rankers with explicit no-target/hallucination
+   negatives.

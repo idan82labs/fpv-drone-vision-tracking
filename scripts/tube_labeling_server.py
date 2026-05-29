@@ -7,6 +7,7 @@ import argparse
 import ast
 import base64
 import csv
+import hashlib
 import hmac
 import json
 import mimetypes
@@ -28,6 +29,7 @@ DEFAULT_CSV = REPO_ROOT / "results/tube_alternative_review_packet_top16/tube_alt
 DEFAULT_APP_DIR = REPO_ROOT / "web/tube_labeler"
 DEFAULT_VIDEO_DIR = Path("/Users/idant/Downloads")
 LABEL_FIELDS = [
+    "candidate_id",
     "human_label",
     "human_notes",
     "frame_target_bbox",
@@ -121,6 +123,21 @@ def _is_relative_to(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _candidate_id(row: dict) -> str:
+    parts = [
+        row.get("clip", ""),
+        str(row.get("frame", "")),
+        str(row.get("rank", "")),
+        str(row.get("x", "")),
+        str(row.get("y", "")),
+        str(row.get("w", "")),
+        str(row.get("h", "")),
+        row.get("cand_source", row.get("source", "")),
+    ]
+    raw = "|".join(parts).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
 
 
 def _video_metadata(path: Path) -> dict:
@@ -222,6 +239,8 @@ class TubeLabelStore:
                 for row in reader:
                     for field in LABEL_FIELDS:
                         row.setdefault(field, "")
+                    if not row.get("candidate_id"):
+                        row["candidate_id"] = _candidate_id(row)
                     self.rows.append(row)
             self._refresh_video_meta()
 
@@ -582,10 +601,12 @@ class LabelingHandler(BaseHTTPRequestHandler):
         return json.loads(body.decode("utf-8") or "{}")
 
     def _authorized(self) -> bool:
-        username = os.environ.get("BASIC_AUTH_USER", "")
+        username = os.environ.get("BASIC_AUTH_USERNAME") or os.environ.get("BASIC_AUTH_USER", "")
         password = os.environ.get("BASIC_AUTH_PASSWORD", "")
         if not username and not password:
             return True
+        if password and not username:
+            username = "review"
         header = self.headers.get("Authorization", "")
         expected_raw = f"{username}:{password}".encode("utf-8")
         expected = "Basic " + base64.b64encode(expected_raw).decode("ascii")
@@ -695,6 +716,14 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
+
+    public_host = args.host in {"0.0.0.0", "::"} or args.host.startswith("0.")
+    unauth_ok = os.environ.get("ALLOW_UNAUTHENTICATED", "").lower() in {"1", "true", "yes"}
+    if public_host and not os.environ.get("BASIC_AUTH_PASSWORD") and not unauth_ok:
+        raise SystemExit(
+            "Refusing to serve a public labeler without BASIC_AUTH_PASSWORD. "
+            "Set ALLOW_UNAUTHENTICATED=1 only for a trusted private network."
+        )
 
     store = TubeLabelStore(args.csv, args.video_dir)
     server = ThreadingHTTPServer((args.host, args.port), LabelingHandler)

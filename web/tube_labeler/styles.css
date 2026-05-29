@@ -114,6 +114,11 @@ h1 {
   color: var(--muted);
 }
 
+.exportLink {
+  color: var(--ink);
+  text-decoration: none;
+}
+
 .saveState.saving {
   color: #9b610c;
 }

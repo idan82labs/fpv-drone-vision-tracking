@@ -55,6 +55,7 @@ let selectedRowId = null;
 let noteTimer = null;
 let targetMarking = false;
 let targetDrag = null;
+let labelSaveInFlight = false;
 
 function htmlEscape(value) {
   return String(value ?? "")
@@ -280,8 +281,9 @@ function renderCandidateReview() {
   `;
   els.candidateReview.querySelectorAll("[data-label]").forEach((btn) => {
     btn.addEventListener("click", async () => {
-      await saveRow(row.id, btn.dataset.label, undefined);
-      selectNextUnlabeledCandidate();
+      if (await saveRow(row.id, btn.dataset.label, undefined)) {
+        selectNextUnlabeledCandidate();
+      }
     });
   });
   els.candidateReview.querySelector("#candidateNotes").addEventListener("input", (event) => {
@@ -482,8 +484,10 @@ async function saveRow(rowId, label, notes, { quiet = false } = {}) {
     renderCandidateStrip(checkpoint());
     renderCandidateReview();
     setSaveState("Saved", "saved");
+    return true;
   } catch (error) {
     setSaveState(error.message, "error");
+    return false;
   }
 }
 
@@ -576,11 +580,19 @@ function selectCandidateOffset(delta) {
   renderCandidateReview();
 }
 
-function applyKeyboardLabel(key) {
+async function applyKeyboardLabel(key) {
   const row = selectedRow();
   const label = labels.find((item) => item.key === key);
   if (!row || !label) return false;
-  saveRow(row.id, label.id, undefined);
+  if (labelSaveInFlight) return true;
+  labelSaveInFlight = true;
+  try {
+    if (await saveRow(row.id, label.id, undefined)) {
+      selectNextUnlabeledCandidate();
+    }
+  } finally {
+    labelSaveInFlight = false;
+  }
   return true;
 }
 
@@ -614,7 +626,7 @@ function wireEvents() {
   document.querySelectorAll(".frameControls button").forEach((btn) => {
     btn.addEventListener("click", () => seekFrame(Number(btn.dataset.step)));
   });
-  window.addEventListener("keydown", (event) => {
+  window.addEventListener("keydown", async (event) => {
     const active = document.activeElement;
     const inText = active && ["TEXTAREA", "INPUT"].includes(active.tagName);
     if (inText || event.altKey || event.metaKey || event.ctrlKey) return;
@@ -630,7 +642,7 @@ function wireEvents() {
     } else if (event.key === "]") {
       event.preventDefault();
       selectCandidateOffset(1);
-    } else if (applyKeyboardLabel(event.key)) {
+    } else if (await applyKeyboardLabel(event.key)) {
       event.preventDefault();
     }
   });

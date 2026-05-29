@@ -26,6 +26,8 @@ EXCLUDE_COLUMNS = {
     "track_id",
     "x",
     "y",
+    "verified_score",
+    "tube_verifier_score",
     "eligible",
     "passes_floor",
     "selected",

@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quality", type=float, default=0.008)
     p.add_argument("--min_distance", type=int, default=7)
     p.add_argument("--ransac_px", type=float, default=2.0)
+    p.add_argument(
+        "--mask_selected_for_motion_model",
+        action="store_true",
+        help="Mask the previous selected box out of LK/RANSAC ego-motion estimation.",
+    )
 
     p.add_argument("--threshold_sigma", type=float, default=5.5)
     p.add_argument("--threshold_percentile", type=float, default=96.5)
@@ -2271,6 +2276,7 @@ def run(args: argparse.Namespace) -> None:
     fno = 1
     frame_mode_counts: dict[str, int] = {}
     candidate_router_counts_total: dict[str, int] = {}
+    motion_model_mask_boxes: list[tuple[int, int, int, int]] = []
 
     while True:
         if args.max_frames is not None and fno >= args.max_frames:
@@ -2291,12 +2297,16 @@ def run(args: argparse.Namespace) -> None:
         )
         t_frame_router = time.perf_counter()
 
-        feature_mask = base.make_feature_mask(prev_g.shape[:2], [])
+        feature_mask = base.make_feature_mask(
+            prev_g.shape[:2],
+            motion_model_mask_boxes if args.mask_selected_for_motion_model else [],
+        )
         g0, g1 = base.lk_tracks(prev_g, cur_g, feature_mask, args)
         if g0 is None:
             prev_g = cur_g
             prev_full = cur_full.copy()
             temporal_history = []
+            motion_model_mask_boxes = []
             fno += 1
             continue
 
@@ -2305,6 +2315,7 @@ def run(args: argparse.Namespace) -> None:
             prev_g = cur_g
             prev_full = cur_full.copy()
             temporal_history = []
+            motion_model_mask_boxes = []
             fno += 1
             continue
         model_counts[chosen["name"]] = model_counts.get(chosen["name"], 0) + 1
@@ -2493,6 +2504,9 @@ def run(args: argparse.Namespace) -> None:
             for key, value in selected_tube_features.items():
                 row[f"tube_{key}"] = round(float(value), 6)
             selected_feature_rows.append(row)
+            motion_model_mask_boxes = [selected.bbox] if selected.misses == 0 else []
+        else:
+            motion_model_mask_boxes = []
 
         top_tubes_json: list[dict] = []
         if args.export_top_tubes > 0:
@@ -2547,6 +2561,7 @@ def run(args: argparse.Namespace) -> None:
             "candidate_router_counts": candidate_router_counts,
             "n_tracks": len(states),
             "selected": selected_json,
+            "n_motion_model_mask_boxes": len(motion_model_mask_boxes),
             "kinematic_reject": None,
             "process_ms": round(dt_ms, 3),
             "timing_ms": timing_ms,

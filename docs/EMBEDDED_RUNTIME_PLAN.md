@@ -253,10 +253,16 @@ Benchmark artifacts:
 
 - `artifacts/runtime_mode_benchmark_v1/`
 - `artifacts/runtime_mode_benchmark_surface_extras_v1/`
+- `artifacts/state_machine_selector_d129_v1/`
 
 ## Default Policy
 
 Current default should remain the conservative baseline/pair-rescue path.
+
+The first offline state-machine result supports adding an explicit
+acquire/lock/null selector before more data collection. Do not make it default
+until it is tested on more complete clips: the best d129 all-frame setting
+suppresses hallucinations well, but acquires the visible target late.
 
 Experimental onboard modes should be explicit:
 
