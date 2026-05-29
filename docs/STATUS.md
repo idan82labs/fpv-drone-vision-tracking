@@ -919,3 +919,30 @@ but it still sacrifices too much continuous visible tracking. Do not promote
 `adaptive_hmm` to default. The useful next direction is not more thresholding;
 it is a single state model that scores target, null, and background-lock states
 together instead of switching between two separately optimized selectors.
+
+Selector-disagreement mining:
+
+- Added `scripts/analyze_selector_disagreements.py` to compare two selector
+  output directories against frame labels.
+- Viterbi vs conservative HMM on the 1,923-frame merged label set:
+  - both visible hit: 1,200 frames;
+  - Viterbi visible hit while HMM missed: 228 frames;
+  - HMM visible hit while Viterbi missed: 1 frame;
+  - Viterbi false box while HMM suppressed null: 287 frames;
+  - both null suppressed: 10 frames;
+  - both null false box: 7 frames;
+  - both visible wrong/miss: 190 frames.
+- Main split:
+  - e271 contributes 190 of the `Viterbi hit / HMM miss` frames;
+  - d129 contributes 211 of the `Viterbi false / HMM suppressed` frames;
+  - aaf1 is mixed: 21 `Viterbi false / HMM suppressed`, 9
+    `Viterbi hit / HMM miss`, and 6 frames where both false-box.
+- A quick leave-one-clip-out router classifier on rank-1 top-tube scalar/CLBA
+  features was weak:
+  - logistic AUC about 0.61;
+  - shallow GBDT overfit and failed badly on e271.
+
+Interpretation: the current scalar top-tube features are not enough for a
+reliable frame-local HMM/Viterbi router. The disagreement rows are now the best
+next mining set: they should drive either additional visual labels/crop-stack
+features or a true joint state model, not another threshold sweep.

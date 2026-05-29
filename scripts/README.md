@@ -21,6 +21,9 @@ bundle.
 - `evaluate_surface_selector_modes.py` - batch selector-mode evaluation.
 - `evaluate_selector_router_policy.py` - offline diagnostic for routing between
   permissive Viterbi and conservative HMM/null selector outputs.
+- `analyze_selector_disagreements.py` - extract frame-level disagreements
+  between two selector outputs for router training, failure review, and hard
+  example mining.
 - `evaluate_lock_state_machine.py` - lock/acquisition/null state-machine
   evaluation.
 - `evaluate_xy_sequence_ranker.py` - sequence-ranking utilities.
