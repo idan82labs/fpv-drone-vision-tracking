@@ -12,6 +12,7 @@ This is not a solved autonomous tracker yet.
 - Most useful recent progress: the e271 reel gap was traced to missing early/mid labels plus weak close-drone proposals; the new `large_dark` proposal source raises e271 gap oracle@100 from 49.0% to 92.8% on the dense gap labels.
 - Main blocker: ranking the real drone tube above cloud, terrain, skyline, and static-hotspot clutter.
 - Newest evaluation focus: textured/non-sky target frames, where clean-sky metrics are no longer representative.
+- Embedded direction: state-conditioned runtime for Raspberry Pi 5; do not run heavy hybrid proposal modes globally.
 - Recent vision-assisted videos show what the target track should look like, but they are not autonomous detector performance.
 
 ## Repository Layout
@@ -81,6 +82,14 @@ artifacts/hybrid_surface_v1/
 ```
 
 It adds experimental `--hybrid_coast_proposals` and `--scenario_balance` flags. The current result is mixed: it improves aaf1 textured/non-sky frames but hurts clean-sky and e271, so it is not a default pipeline.
+
+The embedded runtime plan is:
+
+```text
+docs/EMBEDDED_RUNTIME_PLAN.md
+```
+
+Current direction: cheap frame router, cheap baseline proposals, candidate-local router, then specialized surface proposal/ranker branches only when the router says they are useful. Rust is a deployment option for stable hot paths later, not the next algorithm step.
 
 ## Fly.io Deployment
 
