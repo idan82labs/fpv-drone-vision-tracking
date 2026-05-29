@@ -110,6 +110,30 @@ class ApplySurfaceSequenceSelectorTests(unittest.TestCase):
         self.assertAlmostEqual(selector.candidate_evidence(row, "centered", 2.0, 0.5, 0.0), 0.5)
         self.assertAlmostEqual(selector.candidate_evidence(row, "raw", 2.0, 0.5, 0.0), 1.5)
 
+    def test_static_lock_risk_uses_rank_limited_clba_median(self):
+        rows = [
+            {"rank": "1", "clba_bg_static_likelihood": "3", "clba_target_likelihood": "1"},
+            {"rank": "2", "clba_bg_static_likelihood": "-5", "clba_target_likelihood": "1"},
+            {"rank": "9", "clba_bg_static_likelihood": "100", "clba_target_likelihood": "0"},
+            {"rank": "1", "clba_bg_static_likelihood": "", "clba_target_likelihood": "0"},
+        ]
+
+        self.assertEqual(selector.frame_static_lock_risk(rows, max_rank=1), 2.0)
+        self.assertEqual(selector.frame_static_lock_risk(rows, max_rank=2), 2.0)
+
+    def test_rolling_static_lock_risk_is_causal(self):
+        by_frame = {
+            10: [{"rank": "1", "clba_bg_static_likelihood": "2", "clba_target_likelihood": "0"}],
+            11: [{"rank": "1", "clba_bg_static_likelihood": "-2", "clba_target_likelihood": "0"}],
+            12: [{"rank": "1", "clba_bg_static_likelihood": "4", "clba_target_likelihood": "0"}],
+        }
+
+        risks = selector.rolling_static_lock_risk(by_frame, window=2, max_rank=1)
+
+        self.assertEqual(risks[10], 2.0)
+        self.assertEqual(risks[11], 2.0)
+        self.assertEqual(risks[12], 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()

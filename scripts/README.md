@@ -16,6 +16,8 @@ bundle.
 
 - `evaluate_tracking_run.py` - compare selected boxes against frame labels.
 - `apply_surface_sequence_selector.py` - offline/deferred continuity selector.
+  Supports experimental `adaptive_hmm` routing, but that mode is not a default
+  runtime path.
 - `evaluate_surface_selector_modes.py` - batch selector-mode evaluation.
 - `evaluate_selector_router_policy.py` - offline diagnostic for routing between
   permissive Viterbi and conservative HMM/null selector outputs.

@@ -40,9 +40,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--size_jump_weight", type=float, default=0.0)
     p.add_argument(
         "--selector",
-        choices=("viterbi", "hmm"),
+        choices=("viterbi", "hmm", "adaptive_hmm"),
         default="viterbi",
-        help="Selection model. hmm adds explicit absent/coast/null states.",
+        help=(
+            "Selection model. hmm adds explicit absent/coast/null states. "
+            "adaptive_hmm routes each frame between Viterbi and HMM by recent "
+            "CLBA static-lock risk."
+        ),
     )
     p.add_argument(
         "--sequence_window",
@@ -100,6 +104,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hmm_reacquire_penalty", type=float, default=0.35)
     p.add_argument("--hmm_max_coast", type=int, default=3)
     p.add_argument("--hmm_clutter_weight", type=float, default=0.0)
+    p.add_argument("--adaptive_risk_threshold", type=float, default=0.5)
+    p.add_argument("--adaptive_risk_window", type=int, default=9)
+    p.add_argument("--adaptive_risk_max_rank", type=int, default=1)
     return p.parse_args()
 
 
@@ -477,6 +484,118 @@ def select_with_null_hmm(
     return dict(best.get("selected", {}))
 
 
+def frame_static_lock_risk(rows: list[dict[str, Any]], max_rank: int = 1) -> float | None:
+    values: list[float] = []
+    for row in rows:
+        rank = surface.int_or_default(row.get("rank"), 999999)
+        if rank > max_rank:
+            continue
+        if row.get("clba_target_likelihood") in (None, "") or row.get("clba_bg_static_likelihood") in (None, ""):
+            continue
+        target = safe_float(row.get("clba_target_likelihood"))
+        static = safe_float(row.get("clba_bg_static_likelihood"))
+        values.append(static - target)
+    if not values:
+        return None
+    values.sort()
+    return values[len(values) // 2]
+
+
+def rolling_static_lock_risk(
+    by_frame: dict[int, list[dict[str, Any]]],
+    window: int,
+    max_rank: int,
+) -> dict[int, float]:
+    """Return causal rolling median of rank-limited CLBA static-lock risk."""
+
+    window = max(1, int(window))
+    history: list[float] = []
+    out: dict[int, float] = {}
+    for frame in sorted(by_frame):
+        value = frame_static_lock_risk(by_frame[frame], max_rank=max_rank)
+        if value is not None:
+            history.append(value)
+            if len(history) > window:
+                history = history[-window:]
+        if history:
+            ordered = sorted(history)
+            out[frame] = ordered[len(ordered) // 2]
+        else:
+            out[frame] = -1e9
+    return out
+
+
+def select_with_adaptive_hmm(
+    by_frame: dict[int, list[dict[str, Any]]],
+    max_jump_px: float,
+    transition_weight: float,
+    size_jump_weight: float,
+    sequence_window: int,
+    hmm_beam: int,
+    hmm_score_mode: str,
+    hmm_score_scale: float,
+    hmm_score_center: float,
+    hmm_birth_penalty: float,
+    hmm_track_bonus: float,
+    hmm_miss_penalty: float,
+    hmm_coast_penalty: float,
+    hmm_reacquire_penalty: float,
+    hmm_max_coast: int,
+    hmm_clutter_weight: float,
+    risk_threshold: float,
+    risk_window: int,
+    risk_max_rank: int,
+) -> dict[int, dict[str, Any]]:
+    """Route frames between permissive Viterbi and conservative HMM.
+
+    This is still an offline probe. It uses the same candidate stream and keeps
+    the two existing selector families intact, then chooses the conservative
+    HMM output only in windows where recent top candidates look more static than
+    target-like under CLBA.
+    """
+
+    if sequence_window > 0:
+        permissive = seq.rolling_viterbi_select(
+            by_frame,
+            max_jump_px=max_jump_px,
+            transition_weight=transition_weight,
+            size_jump_weight=size_jump_weight,
+            sequence_window=sequence_window,
+        )
+    else:
+        permissive = seq.viterbi_select(
+            by_frame,
+            max_jump_px=max_jump_px,
+            transition_weight=transition_weight,
+            size_jump_weight=size_jump_weight,
+        )
+    conservative = select_with_null_hmm(
+        by_frame,
+        max_jump_px=max_jump_px,
+        transition_weight=transition_weight,
+        size_jump_weight=size_jump_weight,
+        beam=hmm_beam,
+        score_mode=hmm_score_mode,
+        score_scale=hmm_score_scale,
+        score_center=hmm_score_center,
+        birth_penalty=hmm_birth_penalty,
+        track_bonus=hmm_track_bonus,
+        miss_penalty=hmm_miss_penalty,
+        coast_penalty=hmm_coast_penalty,
+        reacquire_penalty=hmm_reacquire_penalty,
+        max_coast=hmm_max_coast,
+        clutter_weight=hmm_clutter_weight,
+    )
+    risks = rolling_static_lock_risk(by_frame, window=risk_window, max_rank=risk_max_rank)
+    selected: dict[int, dict[str, Any]] = {}
+    for frame in sorted(by_frame):
+        use_hmm = risks.get(frame, -1e9) > risk_threshold
+        row = conservative.get(frame) if use_hmm else permissive.get(frame)
+        if row is not None:
+            selected[frame] = row
+    return selected
+
+
 def output_rows(
     clip: str,
     scored_rows: list[dict[str, Any]],
@@ -544,6 +663,28 @@ def main() -> None:
             max_coast=args.hmm_max_coast,
             clutter_weight=args.hmm_clutter_weight,
         )
+    elif args.selector == "adaptive_hmm":
+        selected = select_with_adaptive_hmm(
+            by_frame,
+            max_jump_px=args.max_jump_px,
+            transition_weight=args.transition_weight,
+            size_jump_weight=args.size_jump_weight,
+            sequence_window=args.sequence_window,
+            hmm_beam=args.hmm_beam,
+            hmm_score_mode=args.hmm_score_mode,
+            hmm_score_scale=args.hmm_score_scale,
+            hmm_score_center=args.hmm_score_center,
+            hmm_birth_penalty=args.hmm_birth_penalty,
+            hmm_track_bonus=args.hmm_track_bonus,
+            hmm_miss_penalty=args.hmm_miss_penalty,
+            hmm_coast_penalty=args.hmm_coast_penalty,
+            hmm_reacquire_penalty=args.hmm_reacquire_penalty,
+            hmm_max_coast=args.hmm_max_coast,
+            hmm_clutter_weight=args.hmm_clutter_weight,
+            risk_threshold=args.adaptive_risk_threshold,
+            risk_window=args.adaptive_risk_window,
+            risk_max_rank=args.adaptive_risk_max_rank,
+        )
     elif args.sequence_window > 0:
         selected = seq.rolling_viterbi_select(
             by_frame,
@@ -604,6 +745,11 @@ def main() -> None:
             "reacquire_penalty": args.hmm_reacquire_penalty,
             "max_coast": args.hmm_max_coast,
             "clutter_weight": args.hmm_clutter_weight,
+        },
+        "adaptive": {
+            "risk_threshold": args.adaptive_risk_threshold,
+            "risk_window": args.adaptive_risk_window,
+            "risk_max_rank": args.adaptive_risk_max_rank,
         },
         **meta,
     }

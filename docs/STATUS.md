@@ -877,3 +877,27 @@ median risk from exported top tubes. The next implementation should make the
 same decision candidate/window-local: use HMM/null behavior only when the recent
 candidate stream looks background-locked, otherwise keep the permissive
 continuity selector.
+
+Adaptive window-router test:
+
+- Added explicit offline `--selector adaptive_hmm` to
+  `scripts/apply_surface_sequence_selector.py`. It computes a causal rolling
+  median of rank-limited CLBA static-lock risk, then chooses between rolling
+  Viterbi and conservative HMM per frame.
+- This first local router is not good enough:
+  - risk threshold `0.50`: 72.3% strict / 82.5% loose / 65.1% invisible
+    no-box;
+  - threshold `0.75`: 73.1% strict / 83.3% loose / 60.5% invisible no-box;
+  - threshold `1.00`: 73.5% strict / 83.8% loose / 56.6% invisible no-box;
+  - threshold `1.50`: 74.2% strict / 84.7% loose / 46.4% invisible no-box;
+  - threshold `2.00`: 74.8% strict / 85.7% loose / 38.2% invisible no-box;
+  - threshold `3.00`: 76.1% strict / 87.0% loose / 25.3% invisible no-box.
+- Failure read: naive per-frame switching fires HMM too often inside
+  continuous-visible clips such as e271, so visible continuity drops before
+  null suppression reaches the clip-level router result.
+
+Interpretation: the runtime router should not be a raw per-frame threshold.
+The next useful router experiment needs state/hysteresis around the routing
+decision itself: enter HMM/null mode only after sustained background-lock
+evidence, exit it quickly when target-like continuity dominates, and avoid
+switching inside continuous visible tracks.
