@@ -696,6 +696,51 @@ source is full-frame temporal stack + large-dark proposals, and the next code
 task is to convert that into a cheaper candidate/local/teacher pathway without
 losing the recovered oracle.
 
+CLBA augmentation and partial-label generalization pass:
+
+- Augmented the mixed current/full-stack top-tube rows with offline
+  candidate-local background-alignment features:
+  `artifacts/mixed_aaf1_full_ld_top60_clba_v1`.
+- Adding those CLBA columns to the global LOCO ranker gives only a small
+  aggregate gain:
+  - non-CLBA top60 mixed `hist_gbdt`: strict 74.8%, loose 83.1%;
+  - CLBA top60 mixed `hist_gbdt`: strict 75.6%, loose 82.6%.
+- Held-out aaf1 still does not transfer from other clips:
+  - non-CLBA `hist_gbdt`: 15.0% strict / 16.7% loose;
+  - CLBA `hist_gbdt`: 18.3% strict / 18.3% loose.
+- Feature-level drilldown on aaf1 says the CLBA primitive is real but not
+  enough by itself:
+  - `clba_gain_norm` AUC true-vs-negative: about 0.79;
+  - top false selected branch/terrain boxes have low CLBA gain;
+  - raw `verified_score` still strongly over-scores some false locks.
+- Direct CLBA score adjustment on aaf1 improves the local state-machine result:
+  - best zero-CLBA aaf1 state-machine baseline: 9.3% strict visible recall,
+    34.7% loose, 100% invisible no-box;
+  - best direct CLBA aaf1 sweep: 45.3% strict, 56.0% loose, 89.3% invisible
+    no-box.
+  - fixed aaf1 CLBA weights are not globally safe: they hurt e6 and e271, so
+    this must be a routed hard-surface branch, not a default selector.
+- Added `scripts/evaluate_partial_clip_generalization.py` to test whether
+  adding partial labels from a hard clip actually generalizes to held-out
+  frames from the same clip.
+- Partial-label checks:
+  - aaf1 interleaved labels generalize strongly: held-out alternating-frame
+    strict recall around 80-90%, loose around 93-100%.
+  - aaf1 chronological split with only 6 target-training frames fails, which
+    means the labels must be distributed across the segment, not clustered.
+  - d129 interleaved `hist_gbdt` reaches up to 82.4% strict on held-out
+    alternating frames.
+  - e271 interleaved `hist_gbdt` reaches about 71-73% strict and about 79-80%
+    loose on held-out alternating frames.
+
+Interpretation: targeted distributed labels from the same surface mode are now
+proven high ROI. The model can learn these domains once it sees representative
+surface examples, but current cross-clip transfer remains weak. The next data
+collection should focus on distributed true-target and hard-negative labels in
+aaf1/d129/e271-like tree/grass/terrain footage. The next algorithm work should
+make the CLBA/direct-adjustment branch router-specific and keep it out of e6/e271
+unless the local state says it is in the same hard-surface regime.
+
 ## Next Meaningful Work
 
 1. Add explicit false-lock/null state handling or train a current-top-tube
@@ -708,13 +753,16 @@ losing the recovered oracle.
 3. Add more true surface labels from clips that resemble aaf1, not just skyline
    or clean-sky cases. The transfer failure says the current training set does
    not cover this domain.
-4. Reproduce the CLBA+hysteresis sequence result on at least one more true
+4. Use `scripts/evaluate_partial_clip_generalization.py` after each new labeling
+   packet. A useful packet should improve held-out alternating-frame recall,
+   not just all-fit/demo recall.
+5. Reproduce the CLBA+hysteresis sequence result on at least one more true
    tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
    unless visually verified.
-5. Keep improving the frame/candidate router so delayed sequence selection only
+6. Keep improving the frame/candidate router so delayed sequence selection only
    pays the extra cost in surface-backed states.
-6. Reproduce the full-video OOF state-ranker harness on at least one more
+7. Reproduce the full-video OOF state-ranker harness on at least one more
    complete clip, then integrate null handling only if the null/visible tradeoff
    survives.
-7. Train null-aware tube rankers with explicit no-target/hallucination
+8. Train null-aware tube rankers with explicit no-target/hallucination
    negatives.
