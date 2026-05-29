@@ -901,3 +901,21 @@ The next useful router experiment needs state/hysteresis around the routing
 decision itself: enter HMM/null mode only after sustained background-lock
 evidence, exit it quickly when target-like continuity dominates, and avoid
 switching inside continuous visible tracks.
+
+Adaptive router hysteresis check:
+
+- Added `--adaptive_risk_acquire_threshold`, `--adaptive_risk_keep_threshold`,
+  `--adaptive_risk_hits`, and `--adaptive_risk_release`.
+- Fast sweep over acquire/keep/hit/release settings did not beat the clip-level
+  diagnostic route. The best balanced setting found was:
+  `acquire=0.75`, `keep=0.25`, `hits=1`, `release=3`.
+- Full apply/eval verification for that setting:
+  - 71.5% strict / 81.8% loose;
+  - 73.0% invisible no-box;
+  - 1,571 selected frames.
+
+Interpretation: hysteresis helps no-box relative to raw adaptive thresholding,
+but it still sacrifices too much continuous visible tracking. Do not promote
+`adaptive_hmm` to default. The useful next direction is not more thresholding;
+it is a single state model that scores target, null, and background-lock states
+together instead of switching between two separately optimized selectors.

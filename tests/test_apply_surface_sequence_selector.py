@@ -134,6 +134,23 @@ class ApplySurfaceSequenceSelectorTests(unittest.TestCase):
         self.assertEqual(risks[11], 2.0)
         self.assertEqual(risks[12], 4.0)
 
+    def test_adaptive_hmm_frame_mask_requires_sustained_risk(self):
+        risks = {1: 0.2, 2: 1.2, 3: 0.4, 4: 1.3, 5: 1.4, 6: 0.8, 7: 0.2}
+
+        mask = selector.adaptive_hmm_frame_mask(
+            risks,
+            acquire_threshold=1.0,
+            keep_threshold=0.5,
+            hits_required=2,
+            release_required=2,
+        )
+
+        self.assertFalse(mask[2])
+        self.assertFalse(mask[4])
+        self.assertTrue(mask[5])
+        self.assertTrue(mask[6])
+        self.assertTrue(mask[7])
+
 
 if __name__ == "__main__":
     unittest.main()

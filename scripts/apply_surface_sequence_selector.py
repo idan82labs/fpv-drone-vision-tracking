@@ -105,8 +105,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hmm_max_coast", type=int, default=3)
     p.add_argument("--hmm_clutter_weight", type=float, default=0.0)
     p.add_argument("--adaptive_risk_threshold", type=float, default=0.5)
+    p.add_argument("--adaptive_risk_acquire_threshold", type=float, default=None)
+    p.add_argument("--adaptive_risk_keep_threshold", type=float, default=None)
     p.add_argument("--adaptive_risk_window", type=int, default=9)
     p.add_argument("--adaptive_risk_max_rank", type=int, default=1)
+    p.add_argument("--adaptive_risk_hits", type=int, default=1)
+    p.add_argument("--adaptive_risk_release", type=int, default=1)
     return p.parse_args()
 
 
@@ -525,6 +529,44 @@ def rolling_static_lock_risk(
     return out
 
 
+def adaptive_hmm_frame_mask(
+    risks: dict[int, float],
+    acquire_threshold: float,
+    keep_threshold: float,
+    hits_required: int,
+    release_required: int,
+) -> dict[int, bool]:
+    """Return frames where conservative HMM mode should be used."""
+
+    active = False
+    high_count = 0
+    low_count = 0
+    hits_required = max(1, int(hits_required))
+    release_required = max(1, int(release_required))
+    mask: dict[int, bool] = {}
+    for frame in sorted(risks):
+        risk = risks[frame]
+        if active:
+            if risk >= keep_threshold:
+                low_count = 0
+            else:
+                low_count += 1
+                if low_count >= release_required:
+                    active = False
+                    high_count = 0
+                    low_count = 0
+        else:
+            if risk >= acquire_threshold:
+                high_count += 1
+                if high_count >= hits_required:
+                    active = True
+                    low_count = 0
+            else:
+                high_count = 0
+        mask[frame] = active
+    return mask
+
+
 def select_with_adaptive_hmm(
     by_frame: dict[int, list[dict[str, Any]]],
     max_jump_px: float,
@@ -543,8 +585,12 @@ def select_with_adaptive_hmm(
     hmm_max_coast: int,
     hmm_clutter_weight: float,
     risk_threshold: float,
+    risk_acquire_threshold: float | None,
+    risk_keep_threshold: float | None,
     risk_window: int,
     risk_max_rank: int,
+    risk_hits: int,
+    risk_release: int,
 ) -> dict[int, dict[str, Any]]:
     """Route frames between permissive Viterbi and conservative HMM.
 
@@ -587,9 +633,18 @@ def select_with_adaptive_hmm(
         clutter_weight=hmm_clutter_weight,
     )
     risks = rolling_static_lock_risk(by_frame, window=risk_window, max_rank=risk_max_rank)
+    acquire = risk_threshold if risk_acquire_threshold is None else risk_acquire_threshold
+    keep = risk_threshold if risk_keep_threshold is None else risk_keep_threshold
+    use_hmm_by_frame = adaptive_hmm_frame_mask(
+        risks,
+        acquire_threshold=acquire,
+        keep_threshold=keep,
+        hits_required=risk_hits,
+        release_required=risk_release,
+    )
     selected: dict[int, dict[str, Any]] = {}
     for frame in sorted(by_frame):
-        use_hmm = risks.get(frame, -1e9) > risk_threshold
+        use_hmm = use_hmm_by_frame.get(frame, False)
         row = conservative.get(frame) if use_hmm else permissive.get(frame)
         if row is not None:
             selected[frame] = row
@@ -682,8 +737,12 @@ def main() -> None:
             hmm_max_coast=args.hmm_max_coast,
             hmm_clutter_weight=args.hmm_clutter_weight,
             risk_threshold=args.adaptive_risk_threshold,
+            risk_acquire_threshold=args.adaptive_risk_acquire_threshold,
+            risk_keep_threshold=args.adaptive_risk_keep_threshold,
             risk_window=args.adaptive_risk_window,
             risk_max_rank=args.adaptive_risk_max_rank,
+            risk_hits=args.adaptive_risk_hits,
+            risk_release=args.adaptive_risk_release,
         )
     elif args.sequence_window > 0:
         selected = seq.rolling_viterbi_select(
@@ -748,8 +807,12 @@ def main() -> None:
         },
         "adaptive": {
             "risk_threshold": args.adaptive_risk_threshold,
+            "risk_acquire_threshold": args.adaptive_risk_acquire_threshold,
+            "risk_keep_threshold": args.adaptive_risk_keep_threshold,
             "risk_window": args.adaptive_risk_window,
             "risk_max_rank": args.adaptive_risk_max_rank,
+            "risk_hits": args.adaptive_risk_hits,
+            "risk_release": args.adaptive_risk_release,
         },
         **meta,
     }
