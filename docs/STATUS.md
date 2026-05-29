@@ -1138,6 +1138,16 @@ Crop-stack top-tube integration probe:
     no-box;
   - same strict recall was also seen at slightly lower birth penalties, with
     `88.82-89.47%` invisible no-box.
+- Failure index for the best HMM mode:
+  - artifact:
+    `artifacts/crop_stack_ranker_hmm_sweep_small_v1/hmm_s9_b70_m40_c0_failures.csv`;
+  - remaining errors: `319` visible no-box misses, `92` visible wrong-box
+    selections, `31` invisible false boxes;
+  - e271 dominates remaining misses (`293` visible no-box, `37` wrong boxes),
+    confirming that the conservative HMM route is unsafe for continuous-visible
+    acquisition even though it is useful for null-risk clips;
+  - aaf1 dominates remaining invisible false boxes (`22`), so the next hard
+    labels should still include aaf1 null/near-null surface distractors.
 
 Interpretation: crop-stack is not a standalone selector score. It is useful as
 an additional feature family inside the existing surface ranker. The tuned HMM
