@@ -766,3 +766,43 @@ unless the local state says it is in the same hard-surface regime.
    survives.
 8. Train null-aware tube rankers with explicit no-target/hallucination
    negatives.
+
+Latest hard-surface label/ranker loop:
+
+- Built a conservative Codex-reviewed aaf1 teacher packet from the all-fit
+  full-stack selector:
+  `artifacts/aaf1_teacher_surface_packet_v1/teacher_labels_vision_confirmed.csv`.
+  I did not accept the full teacher packet. Branch/tree jump boxes around the
+  ambiguous early gap were excluded; only 32 medium-high pseudo labels were
+  promoted into
+  `artifacts/aaf1_teacher_surface_packet_v1/labels_plus_codex_aaf1_teacher_v1.csv`.
+- Important harness fix: the older CLBA table did not cover those new frames.
+  Re-augmented aaf1 from the full top60 export into
+  `artifacts/mixed_aaf1_full_ld_top60_clba_codex_v1`, producing 9,380 aaf1
+  candidate rows across 135 merged label frames.
+- With the corrected CLBA table, aaf1 partial-label generalization now shows
+  the new supervision is useful:
+  - early-to-late: `hist_gbdt` 92.6% strict / 96.3% loose;
+  - late-to-early: `extra_trees` 67.7% strict / 73.9% loose;
+  - interleaved splits remain strong, around 78-80% strict and 89-96% loose.
+- Added `--include_null_frames` to `scripts/train_surface_xy_ranker.py` so
+  visible=0 frames can contribute hard negative top-tube examples. This is
+  necessary because the previous ranker ignored null labels and gave no-target
+  temporal-stack candidates scores overlapping real target scores.
+- Null-aware aaf1 score distributions improved, but selection is still a
+  tradeoff:
+  - no null training, threshold 0: 84.1% strict / 96.3% loose, only 3.6%
+    invisible no-box;
+  - null-aware, threshold 0.45: 74.8% strict / 80.4% loose, 46.4% invisible
+    no-box;
+  - null-aware, threshold 0.50: 72.9% strict / 77.6% loose, 57.1% invisible
+    no-box;
+  - null-aware hysteresis acquire 0.70 / keep 0.45: 63.6% strict / 67.3%
+    loose, 92.9% invisible no-box.
+
+Interpretation: the professor's direction is validated in part. Candidate-local
+target-vs-background evidence plus distributed surface labels moves aaf1
+substantially once the candidate table actually covers the new frames. The
+remaining blocker is state calibration: null suppression and visible recall
+still fight each other. The next implementation should make null/background
+state handling first-class rather than relying on one global score threshold.

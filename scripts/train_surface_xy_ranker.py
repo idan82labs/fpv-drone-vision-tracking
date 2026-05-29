@@ -45,6 +45,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--loose_tol_px", type=float, default=16.0)
     p.add_argument("--negative_min_dist_px", type=float, default=24.0)
     p.add_argument("--confidence", nargs="*", default=["high", "medium_high"])
+    p.add_argument(
+        "--include_null_frames",
+        action="store_true",
+        help="Add candidates from visible=0 label frames as negative training examples.",
+    )
+    p.add_argument(
+        "--null_confidence",
+        nargs="*",
+        default=["high_not_visible"],
+        help="Confidence values accepted for null-frame negative examples.",
+    )
     p.add_argument("--models", nargs="+", choices=("logistic", "hist_gbdt", "extra_trees"), default=["logistic", "hist_gbdt", "extra_trees"])
     p.add_argument("--fallback_thresholds", default="0:1:0.02", help="Threshold sweep for learned-score fallback rules: start:end:step or comma list.")
     p.add_argument(
@@ -605,17 +616,26 @@ def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    labels = [r for r in read_csv(Path(args.labels)) if label_visible(r)]
+    raw_labels = read_csv(Path(args.labels))
+    labels = [r for r in raw_labels if label_visible(r)]
     if args.confidence:
         labels = [r for r in labels if r.get("confidence") in set(args.confidence)]
+    null_labels: list[dict[str, str]] = []
+    if args.include_null_frames:
+        null_labels = [r for r in raw_labels if not label_visible(r)]
+        if args.null_confidence:
+            null_labels = [r for r in null_labels if r.get("confidence") in set(args.null_confidence)]
     labels.sort(key=lambda r: (r.get("clip", ""), int_or_default(r.get("frame"), 0)))
-    clips = sorted({r["clip"] for r in labels})
+    null_labels.sort(key=lambda r: (r.get("clip", ""), int_or_default(r.get("frame"), 0)))
+    clips = sorted({r["clip"] for r in labels + null_labels})
     top_by_clip = {clip: load_top_tubes(Path(args.results_dir), clip, args.max_rank) for clip in clips}
 
     examples: list[dict[str, Any]] = []
     all_rows_for_features: list[dict[str, str]] = []
     ignored_near = 0
     missing_frames = 0
+    null_examples = 0
+    null_missing_frames = 0
     for lab in labels:
         frame = int_or_default(lab.get("frame"), 0)
         rows = top_by_clip.get(lab["clip"], {}).get(frame, [])
@@ -633,6 +653,16 @@ def main() -> None:
                 ignored_near += 1
                 continue
             examples.append({"clip": lab["clip"], "frame": frame, "label": lab, "row": row, "dist_px": d, "y": y})
+    for lab in null_labels:
+        frame = int_or_default(lab.get("frame"), 0)
+        rows = top_by_clip.get(lab["clip"], {}).get(frame, [])
+        if not rows:
+            null_missing_frames += 1
+            continue
+        for row in rows:
+            all_rows_for_features.append(row)
+            examples.append({"clip": lab["clip"], "frame": frame, "label": lab, "row": row, "dist_px": "", "y": 0})
+            null_examples += 1
     if not examples:
         raise SystemExit("no examples")
 
@@ -790,10 +820,11 @@ def main() -> None:
                 "clip": ex["clip"],
                 "frame": ex["frame"],
                 "y": ex["y"],
-                "dist_px": round(ex["dist_px"], 3),
+                "dist_px": round(ex["dist_px"], 3) if ex["dist_px"] != "" else "",
                 "rank": ex["row"].get("rank", ""),
                 "source": ex["row"].get("cand_source", ""),
                 "confidence": ex["label"].get("confidence", ""),
+                "visible": int(label_visible(ex["label"])),
             }
             for ex in examples
         ],
@@ -822,9 +853,12 @@ def main() -> None:
         "clips": clips,
         "frames": len(labels),
         "missing_frames": missing_frames,
+        "null_labels": len(null_labels),
+        "null_missing_frames": null_missing_frames,
         "examples": len(examples),
         "positive_examples": int(np.sum(y == 1)),
         "negative_examples": int(np.sum(y == 0)),
+        "null_negative_examples": null_examples,
         "ignored_near_examples": ignored_near,
         "numeric_features": numeric,
         "source_features": sources,
