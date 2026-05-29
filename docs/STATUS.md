@@ -99,6 +99,27 @@ blindly replacing the baseline. It supports the state-machine/fallback direction
 It is not a final surface tracker; the next data need is still true
 tree/grass/terrain labels from additional clips.
 
+From the first live runtime integration of the surface fallback:
+
+- Added explicit `tbd_motion_detector.py` flags:
+  - `--surface_ranker_model`
+  - `--surface_ranker_policy confidence_fallback`
+  - `--surface_ranker_threshold`
+  - `--surface_ranker_top_n`
+- The integration keeps the baseline scorer as the default and only lets the
+  learned ranker override selection when its confidence clears the threshold.
+- On full e271, using the large-dark profile and no top-tube export:
+  - baseline: 63.2% strict, 72.7% loose, 12.56 ms/frame average, 15.77 ms p90.
+  - fallback top-20: 70.2% strict, 77.8% loose, 23.92 ms/frame average, 27.40 ms p90.
+  - fallback top-40/top-80 did not improve accuracy over top-20 and were slightly slower.
+- The late e271 tail `667..698` remains essentially unsolved:
+  0/32 strict and 1/32 loose under the fallback.
+
+Interpretation: confidence-gated surface fallback now works inside the live
+selector and stays Mac-side 30 Hz at top-20. The remaining tail failure is not
+fixed by selector integration; it needs new terrain-tail features or more
+similar hard labels.
+
 From the first complete-video non-sky benchmark:
 
 - Built a full-video d129 vision-label set: 250 total frames, 38 visible target frames, 212 invisible/no-target frames.

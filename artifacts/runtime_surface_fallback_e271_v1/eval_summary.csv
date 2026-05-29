@@ -1,0 +1,5 @@
+run,frames,strict_hit,strict_recall,loose_hit,loose_recall,early_strict_recall,early_loose_recall,tail_strict_recall,tail_loose_recall,avg_ms,p90_ms,selected_rate
+baseline_no_top_export,699,442,0.6323,508,0.7268,0.6296,0.7391,0.0,0.0312,12.564,15.765,0.997
+fallback_extra_trees_thr076_top20,699,491,0.7024,544,0.7783,0.7121,0.7997,0.0,0.0312,23.918,27.404,0.997
+fallback_extra_trees_thr076_top40,699,491,0.7024,544,0.7783,0.7121,0.7997,0.0,0.0312,24.267,28.281,0.997
+fallback_extra_trees_thr076_top80,699,491,0.7024,544,0.7783,0.7121,0.7997,0.0,0.0312,24.285,28.357,0.997

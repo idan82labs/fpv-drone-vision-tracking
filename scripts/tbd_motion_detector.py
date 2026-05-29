@@ -144,6 +144,15 @@ def parse_args() -> argparse.Namespace:
         help="When using a tube verifier/ranker, optionally apply it only to surface-backed tubes.",
     )
     p.add_argument("--surface_ranker_min_rate", type=float, default=0.45)
+    p.add_argument("--surface_ranker_model", default="", help="Optional trained surface ranker .joblib bundle.")
+    p.add_argument(
+        "--surface_ranker_policy",
+        choices=("off", "confidence_fallback"),
+        default="off",
+        help="Use learned surface ranker only as a confidence-gated selector fallback.",
+    )
+    p.add_argument("--surface_ranker_threshold", type=float, default=0.76)
+    p.add_argument("--surface_ranker_top_n", type=int, default=80, help="Maximum baseline-ranked states to rescore; <=0 means all.")
     p.add_argument("--scenario_balance", action="store_true")
     p.add_argument("--scenario_pool_factor", type=float, default=3.0)
     p.add_argument("--scenario_sky_top_k", type=int, default=24)
@@ -1822,12 +1831,109 @@ def scoped_tube_verifier_score(features: dict[str, float], args: argparse.Namesp
     return tube_verifier_score(features, args.tube_verifier)
 
 
+def surface_ranker_applies(features: dict[str, float], args: argparse.Namespace) -> bool:
+    if args.surface_ranker_policy == "off":
+        return False
+    if args.surface_ranker_scope == "surface_backed":
+        return features.get("router_surface_backed_rate", 0.0) >= args.surface_ranker_min_rate
+    return True
+
+
+def state_feature_row(
+    st: PathState,
+    args: argparse.Namespace,
+    rank: int,
+    baseline_score: float,
+    tube_score: float,
+    competitor_margin: float | None = None,
+) -> dict[str, object]:
+    features = tube_features(st)
+    eligible = st.misses <= args.max_selected_misses and st.hit_count() >= args.min_path_hits
+    passes_floor = (
+        st.score() >= args.selected_score
+        if args.tube_verifier == "off"
+        else tube_score >= args.tube_verifier_floor and baseline_score >= args.selected_score
+    )
+    row: dict[str, object] = {
+        "rank": rank,
+        "track_id": st.sid,
+        "x": st.bbox[0],
+        "y": st.bbox[1],
+        "w": st.bbox[2],
+        "h": st.bbox[3],
+        "score": st.score(),
+        "verified_score": baseline_score,
+        "tube_verifier_score": tube_score,
+        "eligible": int(eligible),
+        "passes_floor": int(passes_floor),
+        "selected": 0,
+        "hits": st.hit_count(),
+        "misses": st.misses,
+        "vx": st.vx,
+        "vy": st.vy,
+        "competitor_margin": 0.0 if competitor_margin is None else competitor_margin,
+    }
+    cand_is_current = st.misses == 0 and st.last_candidate is not None
+    if cand_is_current:
+        cand_json = st.last_candidate.to_json()
+        for key, value in cand_json.items():
+            if isinstance(value, (int, float, str)):
+                row[f"cand_{key}"] = value
+    for key, value in features.items():
+        row[f"tube_{key}"] = float(value)
+    return row
+
+
+class LearnedSurfaceRanker:
+    def __init__(self, bundle_path: str):
+        try:
+            import joblib
+        except ImportError as exc:  # pragma: no cover - depends on optional runtime install
+            raise SystemExit("surface ranker requires joblib/scikit-learn in the active environment") from exc
+        bundle = joblib.load(bundle_path)
+        self.model = bundle["model"]
+        self.numeric_features = list(bundle.get("numeric_features", []))
+        self.source_features = list(bundle.get("source_features", []))
+
+    @staticmethod
+    def _float(value: object) -> float:
+        if value in (None, ""):
+            return float("nan")
+        try:
+            out = float(value)  # type: ignore[arg-type]
+        except Exception:
+            return float("nan")
+        return out if math.isfinite(out) else float("nan")
+
+    def vectorize(self, rows: list[dict[str, object]]) -> np.ndarray:
+        data: list[list[float]] = []
+        for row in rows:
+            vals = [self._float(row.get(name)) for name in self.numeric_features]
+            src = str(row.get("cand_source", ""))
+            vals.extend(1.0 if name == f"src_{src}" else 0.0 for name in self.source_features)
+            data.append(vals)
+        return np.asarray(data, dtype=np.float64)
+
+    def scores(self, rows: list[dict[str, object]]) -> np.ndarray:
+        if not rows:
+            return np.asarray([], dtype=np.float64)
+        x = self.vectorize(rows)
+        if hasattr(self.model, "predict_proba"):
+            return self.model.predict_proba(x)[:, 1]
+        return self.model.decision_function(x)
+
+
 class BeamTBD:
     def __init__(self, args: argparse.Namespace, px_per_frame: float):
         self.args = args
         self.px_per_frame = px_per_frame
         self.states: list[PathState] = []
         self.next_sid = 1
+        self.surface_ranker = (
+            LearnedSurfaceRanker(args.surface_ranker_model)
+            if args.surface_ranker_policy != "off" and args.surface_ranker_model
+            else None
+        )
 
     def verified_score(self, st: PathState) -> float:
         if self.args.tube_verifier == "off":
@@ -1839,6 +1945,42 @@ class BeamTBD:
         )
         density_penalty = self.args.density_penalty_weight * features.get("log_cand_density", 0.0)
         return st.score() + self.args.tube_verifier_weight * tube_score + sky_bonus - density_penalty
+
+    def _ranked_eligible(self, eligible: list[PathState]) -> list[tuple[float, float, PathState]]:
+        scored: list[tuple[float, float, PathState]] = []
+        for st in eligible:
+            features = tube_features(st)
+            tube_score = scoped_tube_verifier_score(features, self.args)
+            if self.args.tube_verifier != "off" and tube_score < self.args.tube_verifier_floor:
+                continue
+            scored.append((self.verified_score(st), tube_score, st))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored
+
+    def _surface_ranker_fallback_best(self, scored: list[tuple[float, float, PathState]]) -> PathState | None:
+        if self.surface_ranker is None or self.args.surface_ranker_policy != "confidence_fallback":
+            return None
+        rows: list[dict[str, object]] = []
+        states: list[PathState] = []
+        limit = self.args.surface_ranker_top_n
+        rescored = scored if limit <= 0 else scored[:limit]
+        for rank, (baseline_score, tube_score, st) in enumerate(rescored, start=1):
+            features = tube_features(st)
+            if not surface_ranker_applies(features, self.args):
+                continue
+            next_score = scored[rank][0] if rank < len(scored) else None
+            margin = (baseline_score - next_score) if next_score is not None else None
+            rows.append(state_feature_row(st, self.args, rank, baseline_score, tube_score, margin))
+            states.append(st)
+        if not rows:
+            return None
+        scores = self.surface_ranker.scores(rows)
+        if len(scores) == 0:
+            return None
+        best_i = int(np.argmax(scores))
+        if float(scores[best_i]) >= self.args.surface_ranker_threshold:
+            return states[best_i]
+        return None
 
     def _sky_rescue_best(self) -> PathState | None:
         if not self.args.sky_rescue:
@@ -2121,23 +2263,18 @@ class BeamTBD:
         ]
         if not eligible:
             return None
-        if self.args.tube_verifier == "off":
-            best = max(eligible, key=lambda st: st.score())
-            if best.score() >= self.args.selected_score:
-                return best
-            return self._sky_rescue_best()
 
-        scored: list[tuple[float, PathState]] = []
-        for st in eligible:
-            features = tube_features(st)
-            tube_score = scoped_tube_verifier_score(features, self.args)
-            if tube_score < self.args.tube_verifier_floor:
-                continue
-            scored.append((self.verified_score(st), st))
+        scored = self._ranked_eligible(eligible)
         if not scored:
             return self._sky_rescue_best()
-        scored.sort(key=lambda x: x[0], reverse=True)
-        best_score, best = scored[0]
+
+        learned_best = self._surface_ranker_fallback_best(scored)
+        if learned_best is not None:
+            learned_score = self.verified_score(learned_best)
+            if learned_score >= self.args.selected_score:
+                return learned_best
+
+        best_score, _tube_score, best = scored[0]
         if self.args.selection_margin > 0.0 and len(scored) > 1:
             if best_score - scored[1][0] < self.args.selection_margin:
                 return self._sky_rescue_best()

@@ -34,8 +34,23 @@ def args(**overrides):
         "surface_branch_track_min_hits": 6,
         "surface_branch_track_min_score": 24.0,
         "surface_branch_track_rate": 0.55,
+        "surface_ranker_scope": "all",
+        "surface_ranker_min_rate": 0.45,
+        "surface_ranker_model": "",
+        "surface_ranker_policy": "off",
+        "surface_ranker_threshold": 0.76,
+        "surface_ranker_top_n": 80,
         "beam_width": 90,
         "max_selected_misses": 1,
+        "min_path_hits": 1,
+        "selected_score": 6.0,
+        "tube_verifier": "off",
+        "tube_verifier_floor": -999.0,
+        "tube_verifier_weight": 1.0,
+        "sky_bonus_weight": 0.0,
+        "density_penalty_weight": 0.0,
+        "selection_margin": 0.0,
+        "sky_rescue": False,
     }
     vals.update(overrides)
     return argparse.Namespace(**vals)
@@ -119,6 +134,26 @@ class RuntimeRouterTests(unittest.TestCase):
             max_n=1,
         )
         self.assertIs(balanced[0], native_confirmed)
+
+    def test_surface_ranker_confidence_fallback_overrides_baseline_only_when_confident(self):
+        class FakeRanker:
+            def __init__(self, high_score):
+                self.high_score = high_score
+
+            def scores(self, rows):
+                return [0.10 if row["rank"] == 1 else self.high_score for row in rows]
+
+        opts = args(surface_ranker_policy="confidence_fallback", surface_ranker_threshold=0.76)
+        tracker = tbd.BeamTBD(opts, px_per_frame=10.0)
+        baseline = tbd.PathState(1, (0, 0, 3, 3), contribs=[10.0], hit_flags=[True])
+        learned = tbd.PathState(2, (10, 0, 3, 3), contribs=[9.0], hit_flags=[True])
+        tracker.states = [baseline, learned]
+
+        tracker.surface_ranker = FakeRanker(high_score=0.90)
+        self.assertEqual(tracker.best().sid, 2)
+
+        tracker.surface_ranker = FakeRanker(high_score=0.50)
+        self.assertEqual(tracker.best().sid, 1)
 
 
 if __name__ == "__main__":
