@@ -127,6 +127,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hybrid_coast_max_misses", type=int, default=8)
     p.add_argument("--hybrid_coast_min_hits", type=int, default=5)
     p.add_argument("--hybrid_coast_min_verified_score", type=float, default=18.0)
+    p.add_argument("--hybrid_coast_min_evidence", type=float, default=0.1)
     p.add_argument("--hybrid_coast_offsets", default="0:0,-4:0,4:0,0:-4,0:4,-7:0,7:0,0:-7,0:7")
     p.add_argument("--hybrid_coast_score_weight", type=float, default=0.18)
     p.add_argument(
@@ -152,7 +153,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--surface_branch_track_rate", type=float, default=0.55)
     p.add_argument(
         "--surface_ranker_scope",
-        choices=("all", "surface_backed"),
+        choices=("all", "surface_backed", "surface_context"),
         default="all",
         help="When using a tube verifier/ranker, optionally apply it only to surface-backed tubes.",
     )
@@ -204,6 +205,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--temporal_stack_score_weight", type=float, default=0.78)
     p.add_argument("--temporal_stack_native_weight", type=float, default=0.55)
     p.add_argument("--temporal_stack_clahe_weight", type=float, default=0.25)
+    p.add_argument(
+        "--temporal_stack_candidate_local",
+        action="store_true",
+        help="Score temporal-stack evidence only around cheap candidate centers instead of full-frame peak maps.",
+    )
+    p.add_argument("--temporal_stack_seed_top_k", type=int, default=36)
+    p.add_argument("--temporal_stack_local_halo_limit", type=int, default=5)
     p.add_argument(
         "--temporal_stack_direct_warp",
         action="store_true",
@@ -989,6 +997,152 @@ def dedupe_full_peaks(
     return out
 
 
+def inverse_warp_point(
+    x: float,
+    y: float,
+    inv_h_to_current: np.ndarray,
+) -> tuple[float, float] | None:
+    pt = np.array([[[x, y]]], dtype=np.float32)
+    try:
+        warped = cv2.perspectiveTransform(pt, inv_h_to_current).reshape(2)
+    except cv2.error:
+        return None
+    if not np.isfinite(warped).all():
+        return None
+    return float(warped[0]), float(warped[1])
+
+
+def temporal_stack_local_score(
+    cur_full_gray: np.ndarray,
+    history_refs: list[tuple[TemporalStackFrame, np.ndarray]],
+    x_full: float,
+    y_full: float,
+    radius: int,
+    min_frames: int,
+) -> float | None:
+    vals: list[float] = []
+    h_full, w_full = cur_full_gray.shape[:2]
+    if not (0 <= x_full < w_full and 0 <= y_full < h_full):
+        return None
+    for entry, inv_h in history_refs:
+        prev_pt = inverse_warp_point(x_full, y_full, inv_h)
+        if prev_pt is None:
+            continue
+        px, py = prev_pt
+        if not (0 <= px < entry.gray_full.shape[1] and 0 <= py < entry.gray_full.shape[0]):
+            continue
+        vals.append(patch_mean(entry.gray_full, px, py, radius))
+    if len(vals) < min_frames:
+        return None
+    cur = patch_mean(cur_full_gray, x_full, y_full, radius)
+    residual_dark = float(np.median(vals) - cur)
+    spread = max(4.0, float(np.std(vals)) + 3.0)
+    return residual_dark / spread
+
+
+def temporal_stack_candidate_local_candidates(
+    cur_full: np.ndarray | None,
+    downscale: float,
+    history: list[TemporalStackFrame],
+    seed_cands: list[base.Candidate],
+    residual_blur: np.ndarray,
+    app_resp: np.ndarray,
+    cur_g: np.ndarray,
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    if not args.temporal_stack_peaks or cur_full is None or downscale <= 0:
+        return []
+    full_g = base.ensure_gray(cur_full)
+    inv_downscale = 1.0 / downscale
+    offsets = parse_int_offsets(args.temporal_stack_offsets)
+    history_refs: list[tuple[TemporalStackFrame, np.ndarray]] = []
+    for off in offsets:
+        age = abs(off)
+        if age <= 0 or age > len(history):
+            continue
+        entry = history[-age]
+        try:
+            inv_h = np.linalg.inv(entry.h_to_current_full)
+        except np.linalg.LinAlgError:
+            continue
+        history_refs.append((entry, inv_h.astype(np.float32)))
+    if len(history_refs) < args.temporal_stack_min_frames:
+        return []
+    halo_offsets = parse_xy_offsets(args.temporal_stack_halo_offsets)[: max(1, args.temporal_stack_local_halo_limit)]
+    radii = parse_radii(args.temporal_stack_radii)[:3]
+    seed_pool = [
+        cand
+        for cand in seed_cands
+        if getattr(cand, "router_state", "unknown")
+        in {"surface_backed", "boundary_mixed", "sky_target_near_surface", "unknown"}
+    ]
+    if not seed_pool:
+        seed_pool = seed_cands
+    seed_pool = sorted(seed_pool, key=lambda cand: candidate_obs(cand, args), reverse=True)[
+        : max(1, args.temporal_stack_seed_top_k)
+    ]
+
+    h_img, w_img = cur_g.shape[:2]
+    proposals: list[tuple[float, float, float, int]] = []
+    for seed in seed_pool:
+        scx, scy = base.bbox_center(seed.bbox)
+        x_full = scx * inv_downscale
+        y_full = scy * inv_downscale
+        for dx, dy in halo_offsets:
+            hx = x_full + dx
+            hy = y_full + dy
+            for radius in radii:
+                stack_score = temporal_stack_local_score(
+                    full_g,
+                    history_refs,
+                    hx,
+                    hy,
+                    radius,
+                    args.temporal_stack_min_frames,
+                )
+                if stack_score is None:
+                    continue
+                native_score = native_dark_score_for_bbox(
+                    full_g,
+                    (
+                        int(round((hx * downscale) - radius * downscale)),
+                        int(round((hy * downscale) - radius * downscale)),
+                        max(3, int(round((2 * radius + 1) * downscale))),
+                        max(3, int(round((2 * radius + 1) * downscale))),
+                    ),
+                    inv_downscale,
+                )
+                score = float(stack_score + args.temporal_stack_native_weight * native_score)
+                proposals.append((score, hx, hy, radius))
+
+    peaks = dedupe_full_peaks(
+        proposals,
+        max(2.5, 0.45 * args.temporal_stack_nms_px),
+        args.temporal_stack_top_k,
+    )
+    cands: list[base.Candidate] = []
+    for score, x_full, y_full, radius in peaks:
+        if score <= 0.1:
+            continue
+        side_full = max(3, int(round(2 * radius + 1)))
+        side = max(3, int(round(side_full * downscale)))
+        cx = x_full * downscale
+        cy = y_full * downscale
+        bx = max(0, min(w_img - side, int(round(cx - 0.5 * side))))
+        by = max(0, min(h_img - side, int(round(cy - 0.5 * side))))
+        bbox = (bx, by, side, side)
+        mask = np.zeros_like(cur_g, dtype=np.uint8)
+        mask[by : by + side, bx : bx + side] = 255
+        cand = base.candidate_score("temporal_stack", bbox, side * side, residual_blur, app_resp, mask, cur_g)
+        cand.map_score = float(score)
+        cand.score = 0.35 * cand.score + args.temporal_stack_score_weight * float(score)
+        if cand.score <= 0.1:
+            continue
+        cands.append(cand)
+    cands.sort(key=lambda c: c.score, reverse=True)
+    return cands
+
+
 def temporal_stack_candidates(
     cur_full: np.ndarray | None,
     downscale: float,
@@ -1115,9 +1269,12 @@ def hybrid_coast_candidates(
             x, y, w, h = bbox
             mask[y : y + h, x : x + w] = 255
             cand = base.candidate_score("hybrid_coast", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+            evidence_score = float(cand.score)
+            if evidence_score < args.hybrid_coast_min_evidence:
+                continue
             state_score = max(0.0, min(12.0, tbd.verified_score(st)))
-            cand.map_score = float(state_score)
-            cand.score = 0.70 * cand.score + args.hybrid_coast_score_weight * state_score
+            cand.map_score = evidence_score
+            cand.score = 0.70 * evidence_score + args.hybrid_coast_score_weight * state_score
             if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
                 continue
             occupied.append(cand)
@@ -1279,7 +1436,11 @@ def attached_support_score(
     return float(dark_column + 0.05 * edge_column)
 
 
-def assign_attached_support(cands: list[base.Candidate], cur_g: np.ndarray) -> None:
+def assign_attached_support(cands: list[base.Candidate], cur_g: np.ndarray, only_missing: bool = False) -> None:
+    if only_missing:
+        cands = [cand for cand in cands if getattr(cand, "router_state", "unrouted") == "unrouted"]
+    if not cands:
+        return
     gx_abs = np.abs(cv2.Sobel(cur_g.astype(np.float32), cv2.CV_32F, 1, 0, ksize=3))
     for cand in cands:
         cand.attached_support = attached_support_score(cur_g, gx_abs, cand.bbox)
@@ -1385,7 +1546,40 @@ def runtime_budget_applies(args: argparse.Namespace) -> bool:
 
 
 def candidate_surface_source(cand: base.Candidate) -> bool:
-    return cand.source == "temporal_stack"
+    return cand.source in {"temporal_stack", "temporal_stack_local"}
+
+
+def surface_ranker_transition_features_needed(
+    st: PathState,
+    cand: base.Candidate,
+    args: argparse.Namespace,
+) -> bool:
+    """Return whether a transition can become surface-ranker eligible.
+
+    Surface-ranker feature histories are comparatively expensive because they
+    require additional target-vs-background pair diagnostics. When the ranker
+    is explicitly scoped to surface-backed tubes, avoid computing those
+    diagnostics for paths that cannot pass the same scope check.
+    """
+    if args.surface_ranker_scope == "all":
+        return True
+    states = {"surface_backed"}
+    if args.surface_ranker_scope == "surface_context":
+        states |= {"boundary_mixed", "sky_target_near_surface"}
+    window = max(1, int(args.window))
+    recent = st.candidate_history[-max(0, window - 1) :]
+    scoped_hits = 0
+    hits = 0
+    for item in recent:
+        if item is None:
+            continue
+        hits += 1
+        if str(item.get("router_state", "unrouted")) in states:
+            scoped_hits += 1
+    hits += 1
+    if str(getattr(cand, "router_state", "unrouted")) in states:
+        scoped_hits += 1
+    return (scoped_hits / max(1, hits)) >= args.surface_ranker_min_rate
 
 
 def existing_surface_track(states: list[PathState], args: argparse.Namespace) -> bool:
@@ -1606,7 +1800,23 @@ def classify_candidate_router_state(
     return "unknown", 0.35
 
 
-def assign_candidate_router_states(cands: list[base.Candidate], cur_g: np.ndarray) -> dict[str, int]:
+def assign_candidate_router_states(
+    cands: list[base.Candidate],
+    cur_g: np.ndarray,
+    only_missing: bool = False,
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    if only_missing:
+        unrouted: list[base.Candidate] = []
+        for cand in cands:
+            state = getattr(cand, "router_state", "unrouted")
+            if state == "unrouted":
+                unrouted.append(cand)
+            else:
+                counts[str(state)] = counts.get(str(state), 0) + 1
+        cands = unrouted
+    if not cands:
+        return counts
     gray = cur_g.astype(np.float32)
     gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
@@ -1614,7 +1824,6 @@ def assign_candidate_router_states(cands: list[base.Candidate], cur_g: np.ndarra
     gray_i = cv2.integral(gray)
     gray2_i = cv2.integral(gray * gray)
     grad_i = cv2.integral(grad)
-    counts: dict[str, int] = {}
     for cand in cands:
         close = _router_box_ring_stats(gray_i, gray2_i, grad_i, cur_g.shape[:2], cand.bbox, 1.4, 3.2)
         far = _router_box_ring_stats(gray_i, gray2_i, grad_i, cur_g.shape[:2], cand.bbox, 3.8, 7.0)
@@ -1692,7 +1901,8 @@ def tube_features(st: PathState) -> dict[str, float]:
         "mean_map_score": _mean(map_scores),
         "map_hit_rate": sum(1 for v in map_scores if v > 0.0) / max(1, hits),
         "appearance_only_rate": len(app_only) / max(1, hits),
-        "surface_source_rate": sum(1 for v in source_vals if v in {"temporal_stack", "hybrid_coast"}) / max(1, hits),
+        "surface_source_rate": sum(1 for v in source_vals if v in {"temporal_stack", "temporal_stack_local"})
+        / max(1, hits),
         "router_surface_backed_rate": sum(1 for v in router_vals if v == "surface_backed") / max(1, hits),
         "router_clean_sky_rate": sum(1 for v in router_vals if v == "clean_sky") / max(1, hits),
         "router_boundary_rate": sum(1 for v in router_vals if v in {"boundary_mixed", "sky_target_near_surface"}) / max(1, hits),
@@ -1899,14 +2109,24 @@ def tube_verifier_score(features: dict[str, float], mode: str) -> float:
     return heuristic_tube_verifier_score(features)
 
 
+def surface_ranker_scope_rate(features: dict[str, float], args: argparse.Namespace) -> float:
+    if args.surface_ranker_scope == "surface_backed":
+        return features.get("router_surface_backed_rate", 0.0)
+    if args.surface_ranker_scope == "surface_context":
+        return features.get("router_surface_backed_rate", 0.0) + features.get("router_boundary_rate", 0.0)
+    return 1.0
+
+
+def surface_ranker_scope_allows(features: dict[str, float], args: argparse.Namespace) -> bool:
+    if args.surface_ranker_scope == "all":
+        return True
+    return surface_ranker_scope_rate(features, args) >= args.surface_ranker_min_rate
+
+
 def scoped_tube_verifier_score(features: dict[str, float], args: argparse.Namespace) -> float:
     if args.tube_verifier == "off":
         return 0.0
-    if (
-        router_applies(args)
-        and args.surface_ranker_scope == "surface_backed"
-        and features.get("router_surface_backed_rate", 0.0) < args.surface_ranker_min_rate
-    ):
+    if router_applies(args) and not surface_ranker_scope_allows(features, args):
         return 0.0
     return tube_verifier_score(features, args.tube_verifier)
 
@@ -1914,9 +2134,7 @@ def scoped_tube_verifier_score(features: dict[str, float], args: argparse.Namesp
 def surface_ranker_applies(features: dict[str, float], args: argparse.Namespace) -> bool:
     if args.surface_ranker_policy == "off":
         return False
-    if args.surface_ranker_scope == "surface_backed":
-        return features.get("router_surface_backed_rate", 0.0) >= args.surface_ranker_min_rate
-    return True
+    return surface_ranker_scope_allows(features, args)
 
 
 def state_feature_row(
@@ -2204,10 +2422,13 @@ class BeamTBD:
                 tuple[float, float, int, int],
             ]
         ] = []
-        need_extra_pair_features = (
+        need_extra_pair_features_global = (
             self.args.tube_verifier == "likelihood"
             or self.args.export_top_tubes > 0
-            or self.surface_ranker is not None
+            or (self.surface_ranker is not None and self.args.surface_ranker_scope == "all")
+        )
+        need_extra_pair_features_scoped = (
+            self.surface_ranker is not None and self.args.surface_ranker_scope != "all"
         )
         for st in self.states:
             dt = max(1, frame_no - st.last_frame)
@@ -2278,7 +2499,11 @@ class BeamTBD:
                     self.args.local_pair_norm,
                     self.args.pair_search_penalty,
                 )
-                if need_extra_pair_features:
+                extra_pair_features = need_extra_pair_features_global or (
+                    need_extra_pair_features_scoped
+                    and surface_ranker_transition_features_needed(st, cand, self.args)
+                )
+                if extra_pair_features:
                     pair_raw = dark_dipole_score(
                         signed_diff,
                         st.bbox,
@@ -2399,6 +2624,17 @@ class BeamTBD:
                 break
         self.states = deduped
         return self.states
+
+    def raw_best_for_mask(self) -> PathState | None:
+        eligible = [
+            st
+            for st in self.states
+            if st.misses <= self.args.max_selected_misses and st.hit_count() >= self.args.min_path_hits
+        ]
+        if not eligible:
+            return None
+        best = max(eligible, key=lambda st: st.score())
+        return best if best.score() >= self.args.selected_score else None
 
     def best(self) -> PathState | None:
         self.last_surface_ranker_used = False
@@ -2944,10 +3180,10 @@ def run(args: argparse.Namespace) -> None:
         )
     if (
         args.surface_ranker_policy != "off"
-        and args.surface_ranker_scope == "surface_backed"
+        and args.surface_ranker_scope in {"surface_backed", "surface_context"}
         and not router_is_active(args)
     ):
-        raise SystemExit("--surface_ranker_scope surface_backed requires an active candidate router/runtime mode")
+        raise SystemExit("--surface_ranker_scope surface_backed/surface_context requires an active candidate router/runtime mode")
 
     cap = cv2.VideoCapture(video_capture_source(args.video))
     if not cap.isOpened():
@@ -3114,6 +3350,7 @@ def run(args: argparse.Namespace) -> None:
         cheap_cands = motion_cands + app_cands + map_cands + native_cands + large_dark_cands
         stack_cands: list[base.Candidate] = []
         hybrid_coast_cands: list[base.Candidate] = []
+        routed_cheap: list[base.Candidate] = []
         cheap_limit = (
             max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
             if args.scenario_balance
@@ -3140,15 +3377,28 @@ def run(args: argparse.Namespace) -> None:
             surface_branch_reason = "candidate_local_or_track" if surface_extras_allowed else "not_candidate_local_surface"
 
         if surface_extras_allowed:
-            stack_cands = temporal_stack_candidates(
-                cur_full,
-                args.downscale,
-                temporal_history,
-                residual_blur,
-                app_resp,
-                cur_g,
-                args,
-            )
+            if args.temporal_stack_candidate_local:
+                seed_cands = routed_cheap if routed_cheap else dedupe_candidates(cheap_cands, cheap_limit, None)
+                stack_cands = temporal_stack_candidate_local_candidates(
+                    cur_full,
+                    args.downscale,
+                    temporal_history,
+                    seed_cands,
+                    residual_blur,
+                    app_resp,
+                    cur_g,
+                    args,
+                )
+            else:
+                stack_cands = temporal_stack_candidates(
+                    cur_full,
+                    args.downscale,
+                    temporal_history,
+                    residual_blur,
+                    app_resp,
+                    cur_g,
+                    args,
+                )
         if args.hybrid_coast_proposals and (surface_extras_allowed or runtime_budget_applies(args)):
             hybrid_coast_cands = hybrid_coast_candidates(
                 tbd.states,
@@ -3175,12 +3425,12 @@ def run(args: argparse.Namespace) -> None:
             cands = dedupe_candidates(raw_cands, pool_n, preselect_score)
         else:
             cands = dedupe_candidates(raw_cands, args.top_k_candidates, preselect_score)
-        assign_attached_support(cands, cur_g)
+        assign_attached_support(cands, cur_g, only_missing=router_applies(args))
         if args.native_roi_score:
             assign_native_roi_scores(cands, cur_full, args.downscale)
         candidate_router_counts: dict[str, int] = {}
         if router_is_active(args):
-            assign_candidate_router_states(cands, cur_g)
+            assign_candidate_router_states(cands, cur_g, only_missing=router_applies(args))
             if not router_applies(args):
                 assign_sky_context(cands, cur_g)
         else:
@@ -3207,7 +3457,7 @@ def run(args: argparse.Namespace) -> None:
         t_scenario = time.perf_counter()
 
         states = tbd.update(fno, cands, signed_diff, signed_sigma, w_img, h_img, chosen["h"], residual_blur, app_resp)
-        selected = tbd.best()
+        selected = tbd.raw_best_for_mask() if args.delayed_sequence_select else tbd.best()
         t_tbd = time.perf_counter()
 
         selected_json = selected_state_json(fno, selected, tbd, args) if selected is not None else None

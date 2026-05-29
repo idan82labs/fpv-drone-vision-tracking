@@ -234,6 +234,54 @@ class RuntimeRouterTests(unittest.TestCase):
             )
         )
 
+    def test_surface_ranker_extra_features_are_scoped_to_surface_paths(self):
+        opts = args(window=5, surface_ranker_scope="surface_backed", surface_ranker_min_rate=0.5)
+        st = tbd.PathState(
+            1,
+            (0, 0, 3, 3),
+            candidate_history=[
+                {"router_state": "clean_sky"},
+                {"router_state": "surface_backed"},
+            ],
+        )
+
+        self.assertTrue(tbd.surface_ranker_transition_features_needed(st, cand(5.0, "surface_backed"), opts))
+        self.assertFalse(tbd.surface_ranker_transition_features_needed(st, cand(5.0, "clean_sky"), opts))
+        self.assertTrue(
+            tbd.surface_ranker_transition_features_needed(
+                st,
+                cand(5.0, "clean_sky"),
+                args(surface_ranker_scope="all", surface_ranker_min_rate=0.9),
+            )
+        )
+
+    def test_surface_context_scope_includes_boundary_tubes(self):
+        features = {"router_surface_backed_rate": 0.0, "router_boundary_rate": 0.5}
+        opts = args(surface_ranker_scope="surface_context", surface_ranker_min_rate=0.45)
+
+        self.assertTrue(tbd.surface_ranker_scope_allows(features, opts))
+        self.assertFalse(
+            tbd.surface_ranker_scope_allows(
+                features,
+                args(surface_ranker_scope="surface_backed", surface_ranker_min_rate=0.45),
+            )
+        )
+
+    def test_raw_best_for_mask_avoids_learned_ranker_path(self):
+        class ExplodingRanker:
+            def scores(self, rows):
+                raise AssertionError("ranker should not run for mask-only best")
+
+        opts = args(surface_ranker_policy="confidence_fallback", surface_ranker_threshold=0.0)
+        tracker = tbd.BeamTBD(opts, px_per_frame=10.0)
+        tracker.surface_ranker = ExplodingRanker()
+        tracker.states = [
+            tbd.PathState(1, (0, 0, 3, 3), contribs=[10.0], hit_flags=[True]),
+            tbd.PathState(2, (10, 0, 3, 3), contribs=[9.0], hit_flags=[True]),
+        ]
+
+        self.assertEqual(tracker.raw_best_for_mask().sid, 1)
+
     def test_surface_ranker_gate_applies_after_best_learned_choice(self):
         class FakeRanker:
             def scores(self, rows):

@@ -63,8 +63,7 @@ PAIR_RESCUE_ARGS = [
 SURFACE_EXTRAS_ARGS = [
     "--scenario_balance",
     "--temporal_stack_peaks",
-    "--temporal_stack_offsets",
-    "-5,-3,-1",
+    "--temporal_stack_offsets=-5,-3,-1",
     "--temporal_stack_top_k",
     "80",
     "--temporal_stack_halo_bases",

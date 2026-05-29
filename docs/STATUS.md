@@ -614,10 +614,50 @@ surface/temporal-stack runtime path is much too slow as a global mode. The
 offline aaf1 gain still needs a bounded, router-gated implementation before it
 is a Pi candidate.
 
+Runtime bounded-surface follow-up:
+
+- Fixed `scripts/benchmark_runtime_modes.py` surface-extras invocation so
+  negative temporal offsets are passed as `--temporal_stack_offsets=-5,-3,-1`
+  instead of being parsed as flags.
+- Reduced learned-ranker runtime overhead:
+  - delayed mode now uses a raw best state only for motion-model masking;
+  - surface-ranker extra pair/background/alignment diagnostics are computed
+    only when a scoped path can actually enter the learned ranker.
+- Added experimental candidate-local temporal stack:
+  - `--temporal_stack_candidate_local`
+  - `--temporal_stack_seed_top_k`
+  - `--temporal_stack_local_halo_limit`
+- Avoided recomputing candidate router/support context for candidates already
+  routed in the cheap proposal pass.
+- Added `--hybrid_coast_min_evidence` and stopped treating coast state prior as
+  `map_score`; coast is no longer counted as a surface-source tube feature.
+- Added `--surface_ranker_scope surface_context`, which includes
+  `surface_backed` plus `boundary_mixed` / `sky_target_near_surface` tubes.
+
+Measured on aaf1 first 360 frames:
+
+- Previous auto surface-extras learned sequence: 100.13 ms/frame average,
+  164.54 ms p95.
+- Scoped ranker diagnostics: 73.27 ms/frame average, 134.33 ms p95.
+- Candidate-local stack: 69.76 ms/frame average, 128.31 ms p95.
+- Bounded candidate budget + de-duplicated context: 52.39 ms/frame average,
+  73.82 ms p95.
+- Coast-evidence/surface-context top-tube audit:
+  - true target in top-80 for 31/54 visible aaf1 labels under frame 360;
+  - selected strict is still only 1/54 in that window.
+
+Interpretation: the runtime path is substantially lighter, but this is not a
+tracking-quality win yet. The remaining aaf1 failure is a state/identity issue:
+the selector acquires a smooth false map tube before the target window and does
+not switch when the true target appears in nearby top alternatives. Next work
+should be explicit false-lock/null state handling or retraining on current
+top-tube hard alternatives, not more broad threshold/runtime tuning.
+
 ## Next Meaningful Work
 
-1. Bound the runtime delayed-sequence path: only score top-K surface-backed
-   candidates, avoid full surface extras globally, and benchmark p95/p99.
+1. Add explicit false-lock/null state handling or train a current-top-tube
+   ranker on the aaf1/e6 hard alternatives; verify it can switch away from the
+   early aaf1 false map tube when the true target appears.
 2. Reproduce the CLBA+hysteresis sequence result on at least one more true
    tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
    unless visually verified.
