@@ -837,3 +837,43 @@ the aaf1 hard-surface/null problem, but it must stay behind a routed hard-surfac
 or null-risk policy. It should not replace the global selector. The next useful
 work is to add a router/state criterion for when to use HMM null mode and when
 to keep the more permissive visible-continuity selector.
+
+Selector-router probe:
+
+- Added HMM evidence score modes to `scripts/apply_surface_sequence_selector.py`
+  for analysis:
+  - `logit`: previous default;
+  - `centered`: score evidence is `scale * (score - center)`;
+  - `raw`: score evidence is `scale * score`.
+- The score-mode sweep did not produce a safe global selector:
+  - centered modes can improve aaf1 visible recall, but e271 remains too weak;
+  - raw modes recover more e271 continuity, but collapse no-target suppression.
+  This confirms the problem is routing/state calibration, not just a score
+  transform.
+- Added `scripts/evaluate_selector_router_policy.py`, an offline diagnostic for
+  combining existing selector outputs by CLBA background-lock risk.
+- Current CLBA clip-risk statistic is median rank-1
+  `clba_bg_static_likelihood - clba_target_likelihood`:
+  - aaf1: `0.911`;
+  - d129: `0.812`;
+  - e271: `0.315`;
+  - e6: `-0.966`;
+  - other clips are strongly negative.
+- Routing HMM only when risk > `0.5` selects HMM for aaf1/d129 and Viterbi for
+  the other seven clips:
+  - global HMM: 64.9% strict / 74.2% loose / 97.7% invisible no-box;
+  - global Viterbi: 79.7% strict / 88.2% loose / 3.3% invisible no-box;
+  - routed risk > `0.5`: 79.4% strict / 87.4% loose / 79.6% invisible no-box.
+- Robustness check: this routing signal is sensitive to the statistic. Mean
+  risk and p75 risk overreact to high-risk tails in otherwise normal clips;
+  median rank-3 risk underreacts to aaf1/d129 null risk. The best current probe
+  is specifically median rank-1 risk, which means the runtime version should use
+  a recent top-candidate/window signal rather than a broad candidate-population
+  statistic.
+
+Interpretation: CLBA static-vs-target risk is a promising selector-router
+signal. It is not yet a runtime solution, because this probe uses clip-level
+median risk from exported top tubes. The next implementation should make the
+same decision candidate/window-local: use HMM/null behavior only when the recent
+candidate stream looks background-locked, otherwise keep the permissive
+continuity selector.

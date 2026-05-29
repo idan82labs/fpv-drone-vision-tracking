@@ -90,7 +90,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clba_attached_weight", type=float, default=0.0)
     p.add_argument("--clba_density_weight", type=float, default=0.0)
     p.add_argument("--hmm_beam", type=int, default=128)
+    p.add_argument("--hmm_score_mode", choices=("logit", "centered", "raw"), default="logit")
     p.add_argument("--hmm_score_scale", type=float, default=1.0)
+    p.add_argument("--hmm_score_center", type=float, default=0.5)
     p.add_argument("--hmm_birth_penalty", type=float, default=1.2)
     p.add_argument("--hmm_track_bonus", type=float, default=0.05)
     p.add_argument("--hmm_miss_penalty", type=float, default=0.65)
@@ -217,7 +219,13 @@ def logit_score(value: float) -> float:
     return math.log(p / (1.0 - p))
 
 
-def candidate_evidence(row: dict[str, Any], score_scale: float, clutter_weight: float) -> float:
+def candidate_evidence(
+    row: dict[str, Any],
+    score_mode: str,
+    score_scale: float,
+    score_center: float,
+    clutter_weight: float,
+) -> float:
     """Return log-likelihood-ish evidence for target vs null/clutter.
 
     The learned score is still the primary observation. Optional clutter terms
@@ -225,7 +233,15 @@ def candidate_evidence(row: dict[str, Any], score_scale: float, clutter_weight: 
     explanations are stronger than the target likelihood.
     """
 
-    evidence = score_scale * logit_score(score(row))
+    row_score = score(row)
+    if score_mode == "logit":
+        evidence = score_scale * logit_score(row_score)
+    elif score_mode == "centered":
+        evidence = score_scale * (row_score - score_center)
+    elif score_mode == "raw":
+        evidence = score_scale * row_score
+    else:
+        raise ValueError(f"unknown score mode: {score_mode}")
     if clutter_weight > 0.0:
         target = safe_float(row.get("clba_target_likelihood"))
         static = safe_float(row.get("clba_bg_static_likelihood"))
@@ -289,7 +305,9 @@ def select_with_null_hmm(
     transition_weight: float,
     size_jump_weight: float,
     beam: int,
+    score_mode: str,
     score_scale: float,
+    score_center: float,
     birth_penalty: float,
     track_bonus: float,
     miss_penalty: float,
@@ -396,7 +414,7 @@ def select_with_null_hmm(
 
             # Emit a real candidate.
             for row in rows:
-                obs = candidate_evidence(row, score_scale, clutter_weight)
+                obs = candidate_evidence(row, score_mode, score_scale, score_center, clutter_weight)
                 new_selected = dict(selected)
                 new_selected[frame] = row
                 if state_name == "A":
@@ -515,7 +533,9 @@ def main() -> None:
             transition_weight=args.transition_weight,
             size_jump_weight=args.size_jump_weight,
             beam=args.hmm_beam,
+            score_mode=args.hmm_score_mode,
             score_scale=args.hmm_score_scale,
+            score_center=args.hmm_score_center,
             birth_penalty=args.hmm_birth_penalty,
             track_bonus=args.hmm_track_bonus,
             miss_penalty=args.hmm_miss_penalty,
@@ -574,7 +594,9 @@ def main() -> None:
         "clba_weights": clba_weights.__dict__,
         "hmm": {
             "beam": args.hmm_beam,
+            "score_mode": args.hmm_score_mode,
             "score_scale": args.hmm_score_scale,
+            "score_center": args.hmm_score_center,
             "birth_penalty": args.hmm_birth_penalty,
             "track_bonus": args.hmm_track_bonus,
             "miss_penalty": args.hmm_miss_penalty,

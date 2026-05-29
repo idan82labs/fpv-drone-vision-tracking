@@ -17,6 +17,8 @@ bundle.
 - `evaluate_tracking_run.py` - compare selected boxes against frame labels.
 - `apply_surface_sequence_selector.py` - offline/deferred continuity selector.
 - `evaluate_surface_selector_modes.py` - batch selector-mode evaluation.
+- `evaluate_selector_router_policy.py` - offline diagnostic for routing between
+  permissive Viterbi and conservative HMM/null selector outputs.
 - `evaluate_lock_state_machine.py` - lock/acquisition/null state-machine
   evaluation.
 - `evaluate_xy_sequence_ranker.py` - sequence-ranking utilities.

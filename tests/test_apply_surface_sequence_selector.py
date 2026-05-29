@@ -100,6 +100,16 @@ class ApplySurfaceSequenceSelectorTests(unittest.TestCase):
         self.assertLess(adjusted[0]["learned_score"], adjusted[1]["learned_score"])
         self.assertIn("clba_adjusted_score", adjusted[1])
 
+    def test_hmm_candidate_evidence_score_modes(self):
+        row = {"learned_score": 0.75}
+
+        self.assertAlmostEqual(
+            selector.candidate_evidence(row, "logit", 2.0, 0.5, 0.0),
+            2.0 * selector.logit_score(0.75),
+        )
+        self.assertAlmostEqual(selector.candidate_evidence(row, "centered", 2.0, 0.5, 0.0), 0.5)
+        self.assertAlmostEqual(selector.candidate_evidence(row, "raw", 2.0, 0.5, 0.0), 1.5)
+
 
 if __name__ == "__main__":
     unittest.main()
