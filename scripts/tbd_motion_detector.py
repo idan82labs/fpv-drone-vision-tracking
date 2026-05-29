@@ -96,6 +96,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--native_roi_score", action="store_true")
     p.add_argument("--native_roi_weight", type=float, default=0.35)
     p.add_argument("--native_roi_neutral", type=float, default=1.0)
+    p.add_argument("--large_dark_peaks", action="store_true")
+    p.add_argument("--large_dark_top_k", type=int, default=40)
+    p.add_argument("--large_dark_score_floor", type=float, default=35.0)
+    p.add_argument("--large_dark_nms_px", type=float, default=18.0)
+    p.add_argument("--large_dark_box_full", type=float, default=28.0)
+    p.add_argument("--large_dark_bg_sigma", type=float, default=5.0)
+    p.add_argument("--large_dark_score_weight", type=float, default=0.08)
     p.add_argument("--temporal_stack_peaks", action="store_true")
     p.add_argument("--temporal_stack_offsets", default="-8,-5,-3,-2,-1")
     p.add_argument("--temporal_stack_radii", default="2,3,4,5,7")
@@ -499,7 +506,7 @@ def map_peak_candidates(
             peaks.append((float(vals[idx]), int(xs[idx]), int(ys[idx]), radius))
 
     cands: list[base.Candidate] = []
-    occupied: list[tuple[int, int, int, int]] = []
+    occupied: list[tuple[float, float]] = []
     for score, x, y, radius in sorted(peaks, reverse=True):
         if len(cands) >= args.map_top_k:
             break
@@ -606,6 +613,78 @@ def native_micro_candidates(
             continue
         occupied.append(bbox)
         cands.append(cand)
+    cands.sort(key=lambda c: c.score, reverse=True)
+    return cands
+
+
+def large_dark_candidates(
+    cur_full: np.ndarray | None,
+    downscale: float,
+    residual_blur: np.ndarray,
+    app_resp: np.ndarray,
+    cur_g: np.ndarray,
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    """Full-frame dark-silhouette proposals for close, clearly visible drones.
+
+    The existing micro and temporal-stack proposal paths are tuned for tiny
+    3-10 px events and motion residuals. In the e271 gap, the drone is larger
+    and often obvious as a dark local-contrast object, while residual ranking
+    can suppress it. This source deliberately adds a small number of large
+    dark-object proposals so the tube/ranker can choose them.
+    """
+    if not args.large_dark_peaks or cur_full is None or abs(downscale - 1.0) < 1e-6:
+        return []
+    full_g = base.ensure_gray(cur_full)
+    h_full, w_full = full_g.shape[:2]
+    h_img, w_img = cur_g.shape[:2]
+    gray = cv2.GaussianBlur(full_g, (3, 3), 0).astype(np.float32)
+    bg = cv2.GaussianBlur(full_g.astype(np.float32), (0, 0), args.large_dark_bg_sigma)
+    score_map = (bg - gray).astype(np.float32)
+    border = max(8, int(round(args.border_frac * min(w_full, h_full))))
+    if border:
+        score_map[:border, :] = -999.0
+        score_map[-border:, :] = -999.0
+        score_map[:, :border] = -999.0
+        score_map[:, -border:] = -999.0
+
+    nms = max(3, int(round(args.large_dark_nms_px)))
+    if nms % 2 == 0:
+        nms += 1
+    dilated = cv2.dilate(score_map, np.ones((nms, nms), dtype=np.uint8))
+    mask = (score_map >= args.large_dark_score_floor) & (score_map >= dilated - 1e-6)
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return []
+    vals = score_map[ys, xs]
+    order = np.argsort(vals)[::-1][: args.large_dark_top_k]
+
+    cands: list[base.Candidate] = []
+    occupied: list[tuple[int, int, int, int]] = []
+    side = max(3, int(round(args.large_dark_box_full * downscale)))
+    for idx in order:
+        score = float(vals[idx])
+        x_full = int(xs[idx])
+        y_full = int(ys[idx])
+        cx = x_full * downscale
+        cy = y_full * downscale
+        bx = max(0, min(w_img - side, int(round(cx - 0.5 * side))))
+        by = max(0, min(h_img - side, int(round(cy - 0.5 * side))))
+        bbox = (bx, by, side, side)
+        ccx, ccy = base.bbox_center(bbox)
+        if any(math.hypot(ccx - kcx, ccy - kcy) <= max(3.0, side) for kcx, kcy in occupied):
+            continue
+        mask_img = np.zeros_like(cur_g, dtype=np.uint8)
+        mask_img[by : by + side, bx : bx + side] = 255
+        cand = base.candidate_score("large_dark", bbox, side * side, residual_blur, app_resp, mask_img, cur_g)
+        cand.map_score = score
+        cand.score = 0.45 * cand.score + args.large_dark_score_weight * score
+        if cand.score <= 0.1:
+            continue
+        occupied.append((ccx, ccy))
+        cands.append(cand)
+        if len(cands) >= args.large_dark_top_k:
+            break
     cands.sort(key=lambda c: c.score, reverse=True)
     return cands
 
@@ -1777,6 +1856,14 @@ def run(args: argparse.Namespace) -> None:
             cur_g,
             args,
         )
+        large_dark_cands = large_dark_candidates(
+            cur_full,
+            args.downscale,
+            residual_blur,
+            app_resp,
+            cur_g,
+            args,
+        )
         stack_cands = temporal_stack_candidates(
             cur_full,
             args.downscale,
@@ -1786,7 +1873,10 @@ def run(args: argparse.Namespace) -> None:
             cur_g,
             args,
         )
-        cands = dedupe_candidates(motion_cands + app_cands + map_cands + native_cands + stack_cands, args.top_k_candidates)
+        cands = dedupe_candidates(
+            motion_cands + app_cands + map_cands + native_cands + large_dark_cands + stack_cands,
+            args.top_k_candidates,
+        )
         assign_attached_support(cands, cur_g)
         if args.native_roi_score:
             assign_native_roi_scores(cands, cur_full, args.downscale)
@@ -1867,6 +1957,7 @@ def run(args: argparse.Namespace) -> None:
             "n_candidates": len(cands),
             "n_map_candidates": len(map_cands),
             "n_native_candidates": len(native_cands),
+            "n_large_dark_candidates": len(large_dark_cands),
             "n_temporal_stack_candidates": len(stack_cands),
             "n_tracks": len(states),
             "selected": selected_json,
