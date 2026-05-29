@@ -806,3 +806,34 @@ substantially once the candidate table actually covers the new frames. The
 remaining blocker is state calibration: null suppression and visible recall
 still fight each other. The next implementation should make null/background
 state handling first-class rather than relying on one global score threshold.
+
+Offline null-state HMM selector pass:
+
+- Added `--selector hmm` to `scripts/apply_surface_sequence_selector.py`. This
+  keeps the existing Viterbi selector as the default, but adds an explicit
+  candidate-HMM test path with:
+  - `A`: absent/no box;
+  - `T`: acquired target, emits a candidate;
+  - `C`: lost/coast, emits no box and can reacquire near the prior box.
+- Best conservative aaf1 setting so far:
+  `--hmm_score_scale 1.0 --hmm_birth_penalty 0.6 --hmm_miss_penalty 0.35
+  --hmm_track_bonus 0.15 --hmm_max_coast 1 --hmm_clutter_weight 0.3`.
+  Result on the merged aaf1 label set:
+  - 77.6% strict / 83.2% loose visible recall;
+  - 78.6% invisible no-box;
+  - 97 selected frames out of 134 candidate frames.
+- This beats the best simple null-aware threshold point tested in this loop:
+  threshold 0.45 gave 74.8% strict / 80.4% loose with 46.4% invisible no-box.
+- A softer HMM setting improves visible recall but weakens null suppression:
+  `--hmm_clutter_weight 0.15` gives 79.4% strict / 84.1% loose with 57.1%
+  invisible no-box.
+- Regression check: the conservative HMM setting is not globally safe. It works
+  reasonably on aaf1/d129/e6-style null-heavy or hard-surface cases, but hurts
+  e271 badly because it emits no box on too many visible-only frames
+  (e271 strict about 38.6%, loose about 47.4% in the quick regression run).
+
+Interpretation: explicit null/coast state handling is a real improvement for
+the aaf1 hard-surface/null problem, but it must stay behind a routed hard-surface
+or null-risk policy. It should not replace the global selector. The next useful
+work is to add a router/state criterion for when to use HMM null mode and when
+to keep the more permissive visible-continuity selector.

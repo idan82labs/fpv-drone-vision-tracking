@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -37,6 +38,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_jump_px", type=float, default=12.0)
     p.add_argument("--transition_weight", type=float, default=0.35)
     p.add_argument("--size_jump_weight", type=float, default=0.0)
+    p.add_argument(
+        "--selector",
+        choices=("viterbi", "hmm"),
+        default="viterbi",
+        help="Selection model. hmm adds explicit absent/coast/null states.",
+    )
     p.add_argument(
         "--sequence_window",
         type=int,
@@ -82,6 +89,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clba_bg_weight", type=float, default=0.0)
     p.add_argument("--clba_attached_weight", type=float, default=0.0)
     p.add_argument("--clba_density_weight", type=float, default=0.0)
+    p.add_argument("--hmm_beam", type=int, default=128)
+    p.add_argument("--hmm_score_scale", type=float, default=1.0)
+    p.add_argument("--hmm_birth_penalty", type=float, default=1.2)
+    p.add_argument("--hmm_track_bonus", type=float, default=0.05)
+    p.add_argument("--hmm_miss_penalty", type=float, default=0.65)
+    p.add_argument("--hmm_coast_penalty", type=float, default=0.15)
+    p.add_argument("--hmm_reacquire_penalty", type=float, default=0.35)
+    p.add_argument("--hmm_max_coast", type=int, default=3)
+    p.add_argument("--hmm_clutter_weight", type=float, default=0.0)
     return p.parse_args()
 
 
@@ -186,6 +202,38 @@ def score(row: dict[str, Any] | None) -> float:
     return float(row.get("learned_score", 0.0) or 0.0)
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    if value in (None, ""):
+        return default
+    try:
+        out = float(value)
+    except Exception:
+        return default
+    return out if math.isfinite(out) else default
+
+
+def logit_score(value: float) -> float:
+    p = min(1.0 - 1e-4, max(1e-4, float(value)))
+    return math.log(p / (1.0 - p))
+
+
+def candidate_evidence(row: dict[str, Any], score_scale: float, clutter_weight: float) -> float:
+    """Return log-likelihood-ish evidence for target vs null/clutter.
+
+    The learned score is still the primary observation. Optional clutter terms
+    are deliberately conservative: they only subtract when CLBA static/attached
+    explanations are stronger than the target likelihood.
+    """
+
+    evidence = score_scale * logit_score(score(row))
+    if clutter_weight > 0.0:
+        target = safe_float(row.get("clba_target_likelihood"))
+        static = safe_float(row.get("clba_bg_static_likelihood"))
+        attached = safe_float(row.get("clba_attached_likelihood"))
+        evidence -= clutter_weight * max(0.0, static - target, attached - target)
+    return evidence
+
+
 def apply_hysteresis_gate(
     selected: dict[int, dict[str, Any]],
     acquire_threshold: float,
@@ -233,6 +281,182 @@ def apply_hysteresis_gate(
             last_row = row
             last_frame = frame
     return out
+
+
+def select_with_null_hmm(
+    by_frame: dict[int, list[dict[str, Any]]],
+    max_jump_px: float,
+    transition_weight: float,
+    size_jump_weight: float,
+    beam: int,
+    score_scale: float,
+    birth_penalty: float,
+    track_bonus: float,
+    miss_penalty: float,
+    coast_penalty: float,
+    reacquire_penalty: float,
+    max_coast: int,
+    clutter_weight: float,
+) -> dict[int, dict[str, Any]]:
+    """Candidate HMM with explicit absent and coast/null states.
+
+    States:
+      A: absent/no target, emits no box.
+      T: target acquired, emits a candidate box.
+      C: recently lost/coasting from a prior target, emits no box.
+
+    This is intentionally candidate-based, not dense image Viterbi. It tests the
+    professor's recommended structure in the existing top-tube harness before we
+    move any logic into the runtime detector.
+    """
+
+    frames = sorted(by_frame)
+    if not frames:
+        return {}
+
+    states: list[dict[str, Any]] = [
+        {
+            "state": "A",
+            "score": 0.0,
+            "row": None,
+            "last_frame": None,
+            "misses": 0,
+            "selected": {},
+        }
+    ]
+    beam = max(1, int(beam))
+
+    def transition_cost(prev_row: dict[str, Any], row: dict[str, Any], gap: int) -> float | None:
+        pb = bbox(prev_row)
+        rb = bbox(row)
+        size_allowance = size_jump_weight * max(pb[2], pb[3], rb[2], rb[3])
+        allowed = max_jump_px * max(1, gap) + size_allowance
+        jump = center_dist(pb, rb)
+        if jump > allowed:
+            return None
+        return transition_weight * (jump / max(1e-6, allowed)) ** 2
+
+    for frame in frames:
+        rows = by_frame.get(frame, [])
+        next_states: list[dict[str, Any]] = []
+        for st in states:
+            state_name = st["state"]
+            base_score = float(st["score"])
+            last_row = st.get("row")
+            last_frame = st.get("last_frame")
+            misses = int(st.get("misses", 0))
+            selected = dict(st.get("selected", {}))
+
+            # Emit null/no-box.
+            if state_name == "A":
+                next_states.append(
+                    {
+                        "state": "A",
+                        "score": base_score,
+                        "row": None,
+                        "last_frame": None,
+                        "misses": 0,
+                        "selected": selected,
+                    }
+                )
+            elif state_name == "T":
+                next_states.append(
+                    {
+                        "state": "C",
+                        "score": base_score - miss_penalty,
+                        "row": last_row,
+                        "last_frame": last_frame,
+                        "misses": 1,
+                        "selected": selected,
+                    }
+                )
+            elif state_name == "C":
+                new_misses = misses + 1
+                if new_misses <= max_coast:
+                    next_states.append(
+                        {
+                            "state": "C",
+                            "score": base_score - coast_penalty,
+                            "row": last_row,
+                            "last_frame": last_frame,
+                            "misses": new_misses,
+                            "selected": selected,
+                        }
+                    )
+                next_states.append(
+                    {
+                        "state": "A",
+                        "score": base_score - 0.05 * max(0, new_misses - max_coast),
+                        "row": None,
+                        "last_frame": None,
+                        "misses": 0,
+                        "selected": selected,
+                    }
+                )
+
+            # Emit a real candidate.
+            for row in rows:
+                obs = candidate_evidence(row, score_scale, clutter_weight)
+                new_selected = dict(selected)
+                new_selected[frame] = row
+                if state_name == "A":
+                    next_states.append(
+                        {
+                            "state": "T",
+                            "score": base_score + obs - birth_penalty,
+                            "row": row,
+                            "last_frame": frame,
+                            "misses": 0,
+                            "selected": new_selected,
+                        }
+                    )
+                else:
+                    if last_row is None or last_frame is None:
+                        continue
+                    gap = max(1, frame - int(last_frame))
+                    cost = transition_cost(last_row, row, gap)
+                    if cost is None:
+                        continue
+                    penalty = reacquire_penalty if state_name == "C" else 0.0
+                    next_states.append(
+                        {
+                            "state": "T",
+                            "score": base_score + obs + track_bonus - cost - penalty,
+                            "row": row,
+                            "last_frame": frame,
+                            "misses": 0,
+                            "selected": new_selected,
+                        }
+                    )
+
+        # Collapse equivalent absent/coast states and prune by score. Keeping a
+        # few distinct coasting states preserves possible reacquisition anchors.
+        next_states.sort(key=lambda s: float(s["score"]), reverse=True)
+        deduped: list[dict[str, Any]] = []
+        seen_absent = False
+        seen_track_keys: set[tuple[str, int, str]] = set()
+        for st in next_states:
+            if st["state"] == "A":
+                if seen_absent:
+                    continue
+                seen_absent = True
+            else:
+                row = st.get("row") or {}
+                key = (
+                    st["state"],
+                    int(st.get("last_frame") or -1),
+                    str(row.get("track_id", row.get("rank", ""))),
+                )
+                if key in seen_track_keys:
+                    continue
+                seen_track_keys.add(key)
+            deduped.append(st)
+            if len(deduped) >= beam:
+                break
+        states = deduped
+
+    best = max(states, key=lambda s: float(s["score"]))
+    return dict(best.get("selected", {}))
 
 
 def output_rows(
@@ -284,7 +508,23 @@ def main() -> None:
     if args.clba_adjustment:
         scored = apply_clba_adjustment(scored, clba_weights)
     by_frame = group_by_frame(scored)
-    if args.sequence_window > 0:
+    if args.selector == "hmm":
+        selected = select_with_null_hmm(
+            by_frame,
+            max_jump_px=args.max_jump_px,
+            transition_weight=args.transition_weight,
+            size_jump_weight=args.size_jump_weight,
+            beam=args.hmm_beam,
+            score_scale=args.hmm_score_scale,
+            birth_penalty=args.hmm_birth_penalty,
+            track_bonus=args.hmm_track_bonus,
+            miss_penalty=args.hmm_miss_penalty,
+            coast_penalty=args.hmm_coast_penalty,
+            reacquire_penalty=args.hmm_reacquire_penalty,
+            max_coast=args.hmm_max_coast,
+            clutter_weight=args.hmm_clutter_weight,
+        )
+    elif args.sequence_window > 0:
         selected = seq.rolling_viterbi_select(
             by_frame,
             max_jump_px=args.max_jump_px,
@@ -319,6 +559,7 @@ def main() -> None:
         "rows": len(rows),
         "frames": len(out_rows),
         "selected_frames": sum(int(r["selected"]) for r in out_rows),
+        "selector": args.selector,
         "max_rank": args.max_rank,
         "max_jump_px": args.max_jump_px,
         "transition_weight": args.transition_weight,
@@ -331,6 +572,17 @@ def main() -> None:
         "lost_patience": args.lost_patience,
         "clba_adjustment": int(args.clba_adjustment),
         "clba_weights": clba_weights.__dict__,
+        "hmm": {
+            "beam": args.hmm_beam,
+            "score_scale": args.hmm_score_scale,
+            "birth_penalty": args.hmm_birth_penalty,
+            "track_bonus": args.hmm_track_bonus,
+            "miss_penalty": args.hmm_miss_penalty,
+            "coast_penalty": args.hmm_coast_penalty,
+            "reacquire_penalty": args.hmm_reacquire_penalty,
+            "max_coast": args.hmm_max_coast,
+            "clutter_weight": args.hmm_clutter_weight,
+        },
         **meta,
     }
     (out_path.parent / "sequence_selector_summary.json").write_text(json.dumps(summary, indent=2))
