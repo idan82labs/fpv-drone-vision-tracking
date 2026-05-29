@@ -36,8 +36,8 @@ bundle.
 
 - `train_surface_xy_ranker.py` - train/check surface candidate rankers.
 - `train_crop_stack_verifier.py` - offline hard-alternative target/background
-  crop-stack verifier probe, including a diagnostic pairwise top-alternative
-  ranking mode.
+  crop-stack verifier probe, including diagnostic pairwise ranking and optional
+  candidate source/geometry feature modes.
 - `apply_crop_stack_verifier.py` - apply a trained crop-stack verifier to
   exported top-tube rows for offline selector evaluation.
 - `train_acquisition_null_ranker.py` - train/check acquisition/null filtering.

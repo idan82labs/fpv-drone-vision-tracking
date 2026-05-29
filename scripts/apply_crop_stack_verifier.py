@@ -105,6 +105,7 @@ def score_rows(
 ) -> list[dict[str, Any]]:
     model = bundle["model"]
     score_mode = str(bundle.get("score_mode", "auto"))
+    source_geometry_features = bool(bundle.get("source_geometry_features", False))
     out_rows: list[dict[str, Any]] = []
     vectors: list[np.ndarray] = []
     vector_indexes: list[int] = []
@@ -124,6 +125,7 @@ def score_rows(
             int(bundle["window_radius"]),
             int(bundle["crop_size"]),
             int(bundle["patch_size"]),
+            source_geometry_features,
         )
         out.update(meta)
         vectors.append(vector)
@@ -218,6 +220,7 @@ def main() -> None:
             "patch_size": bundle["patch_size"],
             "detector_scale": bundle["detector_scale"],
             "score_mode": bundle.get("score_mode", "auto"),
+            "source_geometry_features": bool(bundle.get("source_geometry_features", False)),
         }
         out_root.mkdir(parents=True, exist_ok=True)
         (out_root / "crop_stack_score_metadata.json").write_text(json.dumps(meta, indent=2) + "\n")

@@ -63,6 +63,8 @@ SCALAR_COLUMNS = [
     "clba_attached_likelihood",
 ]
 
+SOURCE_CATEGORIES = ["motion", "map", "appearance", "temporal_stack", "large_dark", "hybrid_coast", ""]
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -83,6 +85,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--window_radius", type=int, default=4)
     p.add_argument("--crop_size", type=int, default=31)
     p.add_argument("--patch_size", type=int, default=11)
+    p.add_argument(
+        "--source_geometry_features",
+        action="store_true",
+        help="Append candidate box geometry and candidate-source one-hot flags. Off by default for legacy model compatibility.",
+    )
     p.add_argument("--detector_scale", type=float, default=0.5)
     p.add_argument("--orb_features", type=int, default=900)
     p.add_argument("--min_matches", type=int, default=18)
@@ -279,6 +286,22 @@ def resize_patch(img: np.ndarray, patch_size: int) -> np.ndarray:
     return cv2.resize(img.astype(np.float32), (patch_size, patch_size), interpolation=cv2.INTER_AREA)
 
 
+def source_geometry_vector(row: dict[str, str]) -> np.ndarray:
+    source = str(row.get("cand_source", "")).strip().lower()
+    source_flags = [1.0 if source == cat else 0.0 for cat in SOURCE_CATEGORIES]
+    source_other = 0.0 if source in SOURCE_CATEGORIES else 1.0
+    area = safe_float(row.get("cand_area"), safe_float(row.get("w")) * safe_float(row.get("h")))
+    geom = [
+        safe_float(row.get("w")),
+        safe_float(row.get("h")),
+        area,
+        safe_float(row.get("cand_aspect")),
+        safe_float(row.get("cand_fill")),
+        source_other,
+    ]
+    return np.asarray(geom + source_flags, dtype=np.float32)
+
+
 def extract_stack_features(
     row: dict[str, str],
     frame_cache: align.FrameCache,
@@ -287,6 +310,7 @@ def extract_stack_features(
     window_radius: int,
     crop_size: int,
     patch_size: int,
+    source_geometry_features: bool = False,
 ) -> tuple[np.ndarray, dict[str, Any]]:
     clip = row.get("clip", "")
     frame = safe_int(row.get("frame"), -1)
@@ -347,7 +371,10 @@ def extract_stack_features(
         ],
         dtype=np.float32,
     )
-    vector = np.concatenate([p.reshape(-1) for p in patch_parts] + [scalar])
+    vector_parts = [p.reshape(-1) for p in patch_parts] + [scalar]
+    if source_geometry_features:
+        vector_parts.append(source_geometry_vector(row))
+    vector = np.concatenate(vector_parts)
     meta = {
         "crop_target_q": round(float(tq["q"]), 6),
         "crop_bg_q": round(float(bq["q"]), 6),
@@ -605,6 +632,7 @@ def main() -> None:
                 args.window_radius,
                 args.crop_size,
                 args.patch_size,
+                args.source_geometry_features,
             )
             out = dict(row)
             out.update(meta)
@@ -652,6 +680,8 @@ def main() -> None:
             "detector_scale": args.detector_scale,
             "scalar_columns": SCALAR_COLUMNS,
             "score_mode": score_mode_for_model(best_model_name),
+            "source_geometry_features": bool(args.source_geometry_features),
+            "source_categories": SOURCE_CATEGORIES,
         },
         model_path,
     )
@@ -677,6 +707,7 @@ def main() -> None:
         "best_model_loco": best_model_name,
         "model_path": str(model_path),
         "score_mode": score_mode_for_model(best_model_name),
+        "source_geometry_features": bool(args.source_geometry_features),
         "metric_caveat": "hard-alternative separation only; not full selected-box tracking accuracy",
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

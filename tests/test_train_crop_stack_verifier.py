@@ -77,6 +77,25 @@ class CropStackVerifierTests(unittest.TestCase):
         self.assertEqual(crop.score_mode_for_model("pairwise_logistic"), "decision_function")
         self.assertEqual(crop.score_mode_for_model("hist_gbdt"), "auto")
 
+    def test_source_geometry_vector_encodes_box_and_source(self):
+        row = {
+            "w": "14",
+            "h": "7",
+            "cand_area": "98",
+            "cand_aspect": "2",
+            "cand_fill": "0.5",
+            "cand_source": "large_dark",
+        }
+
+        vec = crop.source_geometry_vector(row)
+
+        self.assertEqual(float(vec[0]), 14.0)
+        self.assertEqual(float(vec[1]), 7.0)
+        self.assertEqual(float(vec[2]), 98.0)
+        self.assertEqual(float(vec[5]), 0.0)
+        large_dark_idx = 6 + crop.SOURCE_CATEGORIES.index("large_dark")
+        self.assertEqual(float(vec[large_dark_idx]), 1.0)
+
 
 if __name__ == "__main__":
     unittest.main()

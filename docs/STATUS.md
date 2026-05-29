@@ -1191,6 +1191,35 @@ is either richer target/background observation features, typed hard-negative
 labels for aaf1/e271/d129, or a nonlinear pairwise/listwise ranker once the
 feature/label set supports it.
 
+Crop-stack source/geometry feature check:
+
+- Added optional `--source_geometry_features` to
+  `scripts/train_crop_stack_verifier.py`. It appends candidate width/height,
+  area/aspect/fill, and one-hot candidate-source flags such as `temporal_stack`
+  and `large_dark`.
+- Kept this feature family off by default and wrote `source_geometry_features`
+  into model metadata so old crop-stack model bundles remain compatible with
+  `scripts/apply_crop_stack_verifier.py`.
+- Full nine-clip run:
+  `artifacts/crop_stack_verifier_multiclip_source_geom_v1`.
+- Result:
+  - HGBDT with source/geometry: AUC `0.898`, pairwise win rate `0.918`;
+  - prior HGBDT without source/geometry: AUC `0.900`, pairwise win rate
+    `0.920`;
+  - pairwise-logistic with source/geometry: pairwise win rate `0.812`, still
+    below HGBDT and catastrophic on held-out aaf1 (`0.063`).
+- Per-clip read:
+  - source/geometry slightly improved HGBDT e271 pairwise (`0.910` vs `0.904`);
+  - it regressed aaf1 (`0.456` vs `0.492`) and d129 (`0.549` vs `0.578`);
+  - failure count stayed effectively unchanged (`191` vs `187` pair-failure
+    frames).
+
+Interpretation: explicit source/box-size cues are useful diagnostics but not a
+portable fix. They can describe the aaf1 failure visually, yet the transferred
+model still cannot decide when a small temporal-stack candidate is the true
+target versus when a larger dark patch is clutter. Do not promote this feature
+as a default until it wins in full selector metrics.
+
 Current crop-ranker / HMM router check:
 
 - Fixed the router/disagreement harnesses to read both historical
