@@ -99,14 +99,22 @@ From the embedded runtime candidate-router implementation:
 - Candidate-local router states are now exported in candidates and tube features.
 - Per-frame timing is exported in `report.json` and `timing_summary.csv`.
 - Added `scripts/benchmark_runtime_modes.py`.
+- Fixed audit issues:
+  - `candidate_router=log` no longer gates surface ranker behavior.
+  - `candidate_router=off` is respected even in fixed runtime modes.
+  - scenario-balanced candidate lists now honor the effective runtime cap.
+  - final router counts use the final candidate set.
+  - `hybrid_coast` is no longer treated as a surface-only source.
+- Beam hot-path pass:
+  - precomputes state warp/prediction references once per frame;
+  - skips diagnostic pair/background/alignment features unless needed.
 - Pair-rescue profile, 89-frame slices:
-  - d129 baseline 51.77 ms/frame, auto_apply 43.82 ms/frame, clean_sky 37.89 ms/frame.
-  - aaf1 baseline 61.46 ms/frame, clean_sky 43.83 ms/frame.
-  - e271 baseline 33.42 ms/frame, clean_sky 27.23 ms/frame.
-- Candidate-local router cost after integral-image rewrite is roughly 1.6-3.3 ms/frame in these runs; the Python TBD beam update is the dominant cost when candidate count approaches 90.
-- Heavy surface extras remain too slow globally: 120-140 ms/frame when enabled broadly.
+  - d129 baseline 28.72 ms/frame, auto_apply 29.12 ms/frame, clean_sky 27.83 ms/frame.
+  - aaf1 baseline 34.41 ms/frame, clean_sky 33.09 ms/frame.
+  - e271 baseline 16.39 ms/frame, clean_sky 17.53 ms/frame.
+- Heavy surface extras remain too slow as explicit `surface` mode: d129 90.28 ms/frame, e271 54.56 ms/frame on 45-frame slices.
 
-Interpretation: the router infrastructure is now in the detector and cheap enough to continue testing. The frame router still over-classifies some clips as surface, so `auto_apply` is not ready as default. Candidate caps and state-conditioned surface branches are the right runtime direction; beam update is now a clear hot-path candidate after behavior stabilizes.
+Interpretation: the router infrastructure is now cleaner and the Python beam update is no longer the only dominant cost in normal pair-rescue mode. Mac-side 30 Hz is plausible for d129/e271 and borderline for aaf1, but this is still not a Pi 5 claim. Surface acquisition remains a separate, explicit experiment because disabling it improves runtime but risks missing hard surface targets.
 
 ## Next Meaningful Work
 

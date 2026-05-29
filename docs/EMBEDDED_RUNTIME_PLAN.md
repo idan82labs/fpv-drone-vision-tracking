@@ -240,8 +240,12 @@ Current status:
 - `auto` is still a logging/experiment path, not a default control path;
 - candidate-local routing is cheap enough for continued testing after the
   integral-image rewrite;
-- Python beam update is now the dominant runtime bottleneck when candidate
-  count approaches 90.
+- first Python beam hot-path pass is complete: state warp/prediction references
+  are precomputed once per frame and diagnostic pair features are skipped unless
+  needed;
+- normal pair-rescue mode now reaches Mac-side 30 Hz on d129/e271 slices and is
+  borderline on aaf1, but Pi 5 capture/decode/p90/p99 timing is still untested;
+- explicit surface mode is still too slow for live Python deployment.
 
 Benchmark artifacts:
 

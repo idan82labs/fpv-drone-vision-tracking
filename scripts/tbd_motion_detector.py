@@ -106,6 +106,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hybrid_coast_proposals", action="store_true")
     p.add_argument("--hybrid_coast_top_k", type=int, default=18)
     p.add_argument("--hybrid_coast_max_misses", type=int, default=8)
+    p.add_argument("--hybrid_coast_min_hits", type=int, default=5)
+    p.add_argument("--hybrid_coast_min_verified_score", type=float, default=18.0)
     p.add_argument("--hybrid_coast_offsets", default="0:0,-4:0,4:0,0:-4,0:4,-7:0,7:0,0:-7,0:7")
     p.add_argument("--hybrid_coast_score_weight", type=float, default=0.18)
     p.add_argument(
@@ -123,6 +125,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--router_surface_source_penalty", type=float, default=2.5)
     p.add_argument("--router_line_penalty", type=float, default=1.5)
     p.add_argument("--router_surface_bonus", type=float, default=0.0)
+    p.add_argument("--surface_branch_allow_acquisition", action="store_true")
+    p.add_argument("--surface_branch_min_candidates", type=int, default=4)
+    p.add_argument("--surface_branch_min_score", type=float, default=2.0)
+    p.add_argument("--surface_branch_track_min_hits", type=int, default=6)
+    p.add_argument("--surface_branch_track_min_score", type=float, default=24.0)
+    p.add_argument("--surface_branch_track_rate", type=float, default=0.55)
     p.add_argument(
         "--surface_ranker_scope",
         choices=("all", "surface_backed"),
@@ -995,6 +1003,10 @@ def hybrid_coast_candidates(
     for st in ranked_states[: args.hybrid_coast_top_k]:
         if st.misses > args.hybrid_coast_max_misses:
             continue
+        if st.hit_count() < args.hybrid_coast_min_hits:
+            continue
+        if tbd.verified_score(st) < args.hybrid_coast_min_verified_score:
+            continue
         base_bbox = warp_bbox(st.bbox, frame_h, w_img, h_img)
         bx, by, bw, bh = base_bbox
         for dx, dy in offsets:
@@ -1042,9 +1054,11 @@ def scenario_balanced_candidates(
     cands: list[base.Candidate],
     args: argparse.Namespace,
     use_router: bool = False,
+    max_n: int | None = None,
 ) -> list[base.Candidate]:
     if not args.scenario_balance:
-        return dedupe_candidates(cands, args.top_k_candidates)
+        return dedupe_candidates(cands, max_n or args.top_k_candidates)
+    limit = max(1, max_n or args.top_k_candidates)
     quotas = {
         "sky": max(0, args.scenario_sky_top_k),
         "surface": max(0, args.scenario_surface_top_k),
@@ -1052,18 +1066,35 @@ def scenario_balanced_candidates(
         "large": max(0, args.scenario_large_top_k),
         "coast": max(0, args.scenario_coast_top_k),
     }
+    quota_sum = sum(quotas.values())
+    if quota_sum > limit:
+        scaled: dict[str, int] = {}
+        remainder: list[tuple[float, str]] = []
+        for bucket, quota in quotas.items():
+            raw = quota * limit / quota_sum if quota > 0 else 0.0
+            scaled[bucket] = int(math.floor(raw))
+            remainder.append((raw - scaled[bucket], bucket))
+        remaining = limit - sum(scaled.values())
+        for _, bucket in sorted(remainder, reverse=True):
+            if remaining <= 0:
+                break
+            if quotas[bucket] > 0:
+                scaled[bucket] += 1
+                remaining -= 1
+        quotas = scaled
     kept: list[base.Candidate] = []
     by_bucket: dict[str, list[base.Candidate]] = {k: [] for k in quotas}
-    for cand in sorted(cands, key=lambda c: c.score, reverse=True):
+    sort_key = (lambda c: candidate_obs(c, args)) if use_router else (lambda c: c.score)
+    for cand in sorted(cands, key=sort_key, reverse=True):
         by_bucket.setdefault(candidate_scenario(cand, use_router), []).append(cand)
     for bucket, quota in quotas.items():
         for cand in by_bucket.get(bucket, [])[:quota]:
-            if len(kept) >= args.top_k_candidates:
+            if len(kept) >= limit:
                 return kept
             if not candidate_duplicate(cand, kept):
                 kept.append(cand)
-    for cand in sorted(cands, key=lambda c: c.score, reverse=True):
-        if len(kept) >= args.top_k_candidates:
+    for cand in sorted(cands, key=sort_key, reverse=True):
+        if len(kept) >= limit:
             break
         if not candidate_duplicate(cand, kept):
             kept.append(cand)
@@ -1232,15 +1263,61 @@ def router_is_active(args: argparse.Namespace) -> bool:
 
 
 def router_applies(args: argparse.Namespace) -> bool:
-    if args.candidate_router == "apply":
-        return True
-    if args.candidate_router == "log":
-        return False
-    return args.runtime_mode in {"clean_sky", "boundary", "surface"}
+    return args.candidate_router == "apply"
+
+
+def runtime_budget_applies(args: argparse.Namespace) -> bool:
+    return args.candidate_router == "apply" or args.runtime_mode in {"clean_sky", "boundary", "surface"}
 
 
 def candidate_surface_source(cand: base.Candidate) -> bool:
-    return cand.source in {"temporal_stack", "hybrid_coast"}
+    return cand.source == "temporal_stack"
+
+
+def existing_surface_track(states: list[PathState], args: argparse.Namespace) -> bool:
+    for st in states[: max(1, args.beam_width // 3)]:
+        if st.misses > args.max_selected_misses:
+            continue
+        if st.hit_count() < args.surface_branch_track_min_hits:
+            continue
+        if st.score() < args.surface_branch_track_min_score:
+            continue
+        features = tube_features(st)
+        if features.get("router_surface_backed_rate", 0.0) >= args.surface_branch_track_rate:
+            return True
+    return False
+
+
+def surface_branch_needed(
+    cands: list[base.Candidate],
+    states: list[PathState],
+    frame_decision: FrameRouterDecision,
+    args: argparse.Namespace,
+) -> bool:
+    if not router_applies(args):
+        return True
+    if args.runtime_mode == "clean_sky" or args.runtime_mode == "boundary":
+        return False
+    if args.runtime_mode == "surface":
+        return True
+    has_surface_track = existing_surface_track(states, args)
+    if frame_decision.mode != "surface" and not has_surface_track:
+        return False
+    if has_surface_track:
+        return True
+    if args.runtime_mode == "auto" and not args.surface_branch_allow_acquisition:
+        return False
+    if not args.surface_branch_allow_acquisition and not has_surface_track:
+        return False
+    strong_surface = [
+        cand
+        for cand in cands
+        if getattr(cand, "router_state", "unknown") == "surface_backed"
+        and cand.score >= args.surface_branch_min_score
+    ]
+    if len(strong_surface) >= args.surface_branch_min_candidates:
+        return True
+    return existing_surface_track(states, args)
 
 
 def frame_router_decision(cur_g: np.ndarray, args: argparse.Namespace) -> FrameRouterDecision:
@@ -1435,6 +1512,14 @@ def assign_candidate_router_states(cands: list[base.Candidate], cur_g: np.ndarra
         cand.router_close_texture = close["texture"]
         cand.router_far_sky_like = far["sky_like"]
         cand.router_far_texture = far["texture"]
+        counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
+def candidate_router_state_counts(cands: list[base.Candidate]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for cand in cands:
+        state = getattr(cand, "router_state", "unrouted")
         counts[state] = counts.get(state, 0) + 1
     return counts
 
@@ -1704,7 +1789,8 @@ def scoped_tube_verifier_score(features: dict[str, float], args: argparse.Namesp
     if args.tube_verifier == "off":
         return 0.0
     if (
-        args.surface_ranker_scope == "surface_backed"
+        router_applies(args)
+        and args.surface_ranker_scope == "surface_backed"
         and features.get("router_surface_backed_rate", 0.0) < args.surface_ranker_min_rate
     ):
         return 0.0
@@ -1795,6 +1881,35 @@ class BeamTBD:
         cands = sorted(cands, key=lambda c: c.score, reverse=True)[: self.args.top_k_candidates]
         new_states: list[PathState] = []
         cand_density = float(len(cands))
+        state_refs: list[
+            tuple[
+                PathState,
+                tuple[int, int, int, int],
+                tuple[int, int, int, int],
+                tuple[int, int, int, int],
+                tuple[float, float, int, int],
+            ]
+        ] = []
+        need_extra_pair_features = self.args.tube_verifier == "likelihood" or self.args.export_top_tubes > 0
+        for st in self.states:
+            dt = max(1, frame_no - st.last_frame)
+            if dt > self.args.max_misses + 1:
+                continue
+            transition_ref_bbox = (
+                warp_bbox(st.bbox, frame_h, w_img, h_img)
+                if self.args.bg_motion_transition
+                else st.bbox
+            )
+            pair_ref_bbox = (
+                warp_bbox(st.bbox, frame_h, w_img, h_img)
+                if self.args.bg_motion_transition or self.args.bg_pair_geometry
+                else st.bbox
+            )
+            bg_ref_bbox = warp_bbox(st.bbox, frame_h, w_img, h_img)
+            x0, y0, bw, bh = st.bbox
+            dt_f = max(1, frame_no - st.last_frame)
+            cv_pred = (x0 + st.vx * dt_f, y0 + st.vy * dt_f, bw, bh)
+            state_refs.append((st, transition_ref_bbox, pair_ref_bbox, bg_ref_bbox, cv_pred))
 
         for cand in cands:
             obs = candidate_obs(cand, self.args)
@@ -1828,55 +1943,13 @@ class BeamTBD:
             best_state = birth
             best_score = birth.score()
 
-            for st in self.states:
-                dt = max(1, frame_no - st.last_frame)
-                if dt > self.args.max_misses + 1:
-                    continue
-                transition_ref_bbox = (
-                    warp_bbox(st.bbox, frame_h, w_img, h_img)
-                    if self.args.bg_motion_transition
-                    else st.bbox
-                )
-                pair_ref_bbox = (
-                    warp_bbox(st.bbox, frame_h, w_img, h_img)
-                    if self.args.bg_motion_transition or self.args.bg_pair_geometry
-                    else st.bbox
-                )
-                bg_ref_bbox = warp_bbox(st.bbox, frame_h, w_img, h_img)
-                dt_f = max(1, frame_no - st.last_frame)
-                x0, y0, bw, bh = st.bbox
-                cv_pred = (x0 + st.vx * dt_f, y0 + st.vy * dt_f, bw, bh)
+            for st, transition_ref_bbox, pair_ref_bbox, bg_ref_bbox, cv_pred in state_refs:
                 bg_dist = center_distance(cand.bbox, bg_ref_bbox)
                 cv_resid = center_distance(cand.bbox, cv_pred)
                 bg_minus_cv = bg_dist - cv_resid
                 cost, vx, vy, speed, accel = self._transition_cost(st, cand, frame_no, transition_ref_bbox)
                 if cost > 30.0:
                     continue
-                pair_raw = dark_dipole_score(
-                    signed_diff,
-                    st.bbox,
-                    cand.bbox,
-                    signed_sigma,
-                    self.args.pair_radius,
-                    self.args.pair_min_step_px,
-                )
-                pair_bg = dark_dipole_score(
-                    signed_diff,
-                    bg_ref_bbox,
-                    cand.bbox,
-                    signed_sigma,
-                    self.args.pair_radius,
-                    self.args.pair_min_step_px,
-                )
-                pair_bg_local = dark_dipole_score(
-                    signed_diff,
-                    bg_ref_bbox,
-                    cand.bbox,
-                    signed_sigma,
-                    self.args.pair_radius,
-                    self.args.pair_min_step_px,
-                    True,
-                )
                 pair = dark_dipole_score(
                     signed_diff,
                     pair_ref_bbox,
@@ -1887,7 +1960,38 @@ class BeamTBD:
                     self.args.local_pair_norm,
                     self.args.pair_search_penalty,
                 )
-                align_gain = alignment_gain_score(cand, bg_ref_bbox, residual_blur, app_resp)
+                if need_extra_pair_features:
+                    pair_raw = dark_dipole_score(
+                        signed_diff,
+                        st.bbox,
+                        cand.bbox,
+                        signed_sigma,
+                        self.args.pair_radius,
+                        self.args.pair_min_step_px,
+                    )
+                    pair_bg = dark_dipole_score(
+                        signed_diff,
+                        bg_ref_bbox,
+                        cand.bbox,
+                        signed_sigma,
+                        self.args.pair_radius,
+                        self.args.pair_min_step_px,
+                    )
+                    pair_bg_local = dark_dipole_score(
+                        signed_diff,
+                        bg_ref_bbox,
+                        cand.bbox,
+                        signed_sigma,
+                        self.args.pair_radius,
+                        self.args.pair_min_step_px,
+                        True,
+                    )
+                    align_gain = alignment_gain_score(cand, bg_ref_bbox, residual_blur, app_resp)
+                else:
+                    pair_raw = pair
+                    pair_bg = 0.0
+                    pair_bg_local = 0.0
+                    align_gain = 0.0
                 contrib = obs + self.args.pair_weight * pair - cost
                 contribs, hits = self._trim(st.contribs + [contrib], st.hit_flags + [True])
                 ns = PathState(
@@ -2177,7 +2281,6 @@ def run(args: argparse.Namespace) -> None:
             if router_is_active(args)
             else FrameRouterDecision("baseline", True, args.top_k_candidates, 0.0, {})
         )
-        frame_mode_counts[frame_decision.mode] = frame_mode_counts.get(frame_decision.mode, 0) + 1
         t_frame_router = time.perf_counter()
 
         feature_mask = base.make_feature_mask(prev_g.shape[:2], [])
@@ -2256,9 +2359,33 @@ def run(args: argparse.Namespace) -> None:
             cur_g,
             args,
         )
-        surface_extras_allowed = (not router_applies(args)) or frame_decision.allow_surface_extras
-        stack_cands = (
-            temporal_stack_candidates(
+        t_cheap_proposals = time.perf_counter()
+        cheap_cands = motion_cands + app_cands + map_cands + native_cands + large_dark_cands
+        stack_cands: list[base.Candidate] = []
+        hybrid_coast_cands: list[base.Candidate] = []
+        cheap_limit = (
+            max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
+            if args.scenario_balance
+            else args.top_k_candidates
+        )
+        surface_extras_allowed = not runtime_budget_applies(args) or args.runtime_mode == "surface"
+        surface_branch_reason = (
+            "explicit_surface_or_legacy"
+            if surface_extras_allowed
+            else "disabled_by_frame_mode"
+        )
+
+        if router_applies(args):
+            routed_cheap = dedupe_candidates(cheap_cands, cheap_limit)
+            assign_attached_support(routed_cheap, cur_g)
+            if args.native_roi_score:
+                assign_native_roi_scores(routed_cheap, cur_full, args.downscale)
+            assign_candidate_router_states(routed_cheap, cur_g)
+            surface_extras_allowed = surface_branch_needed(routed_cheap, tbd.states, frame_decision, args)
+            surface_branch_reason = "candidate_local_or_track" if surface_extras_allowed else "not_candidate_local_surface"
+
+        if surface_extras_allowed:
+            stack_cands = temporal_stack_candidates(
                 cur_full,
                 args.downscale,
                 temporal_history,
@@ -2267,11 +2394,8 @@ def run(args: argparse.Namespace) -> None:
                 cur_g,
                 args,
             )
-            if surface_extras_allowed
-            else []
-        )
-        hybrid_coast_cands = (
-            hybrid_coast_candidates(
+        if args.hybrid_coast_proposals and (surface_extras_allowed or runtime_budget_applies(args)):
+            hybrid_coast_cands = hybrid_coast_candidates(
                 tbd.states,
                 tbd,
                 chosen["h"],
@@ -2282,11 +2406,8 @@ def run(args: argparse.Namespace) -> None:
                 cur_g,
                 args,
             )
-            if surface_extras_allowed
-            else []
-        )
         t_proposals = time.perf_counter()
-        raw_cands = motion_cands + app_cands + map_cands + native_cands + large_dark_cands + stack_cands + hybrid_coast_cands
+        raw_cands = cheap_cands + stack_cands + hybrid_coast_cands
         if args.scenario_balance:
             pool_n = max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
             cands = dedupe_candidates(raw_cands, pool_n)
@@ -2297,18 +2418,26 @@ def run(args: argparse.Namespace) -> None:
             assign_native_roi_scores(cands, cur_full, args.downscale)
         candidate_router_counts: dict[str, int] = {}
         if router_is_active(args):
-            candidate_router_counts = assign_candidate_router_states(cands, cur_g)
-            for state, count in candidate_router_counts.items():
-                candidate_router_counts_total[state] = candidate_router_counts_total.get(state, 0) + count
+            assign_candidate_router_states(cands, cur_g)
             if not router_applies(args):
                 assign_sky_context(cands, cur_g)
         else:
             assign_sky_context(cands, cur_g)
         t_context_router = time.perf_counter()
+        effective_max_candidates = (
+            frame_decision.max_candidates
+            if runtime_budget_applies(args)
+            else args.top_k_candidates
+        )
         if args.scenario_balance:
-            cands = scenario_balanced_candidates(cands, args, router_applies(args))
-        elif router_applies(args) and frame_decision.max_candidates < len(cands):
-            cands = cands[: frame_decision.max_candidates]
+            cands = scenario_balanced_candidates(cands, args, router_applies(args), effective_max_candidates)
+        elif effective_max_candidates < len(cands):
+            sort_key = (lambda cand: candidate_obs(cand, args)) if router_applies(args) else (lambda cand: cand.score)
+            cands = sorted(cands, key=sort_key, reverse=True)[:effective_max_candidates]
+        if router_is_active(args):
+            candidate_router_counts = candidate_router_state_counts(cands)
+            for state, count in candidate_router_counts.items():
+                candidate_router_counts_total[state] = candidate_router_counts_total.get(state, 0) + count
         t_scenario = time.perf_counter()
 
         states = tbd.update(fno, cands, signed_diff, signed_sigma, w_img, h_img, chosen["h"], residual_blur, app_resp)
@@ -2377,13 +2506,15 @@ def run(args: argparse.Namespace) -> None:
             "frame_router": round((t_frame_router - t_preprocess) * 1000.0, 3),
             "motion_model": round((t_motion_model - t_frame_router) * 1000.0, 3),
             "residual_masks": round((t_residual - t_motion_model) * 1000.0, 3),
-            "proposals": round((t_proposals - t_residual) * 1000.0, 3),
+            "cheap_proposals": round((t_cheap_proposals - t_residual) * 1000.0, 3),
+            "surface_extra_proposals": round((t_proposals - t_cheap_proposals) * 1000.0, 3),
             "context_router": round((t_context_router - t_proposals) * 1000.0, 3),
             "scenario_balance": round((t_scenario - t_context_router) * 1000.0, 3),
             "tbd_update": round((t_tbd - t_scenario) * 1000.0, 3),
             "export_selection": round((t_export - t_tbd) * 1000.0, 3),
         }
         dt_ms = (t_export - frame_start) * 1000.0
+        frame_mode_counts[frame_decision.mode] = frame_mode_counts.get(frame_decision.mode, 0) + 1
 
         frame_rec = {
             "frame": fno,
@@ -2391,6 +2522,8 @@ def run(args: argparse.Namespace) -> None:
             "runtime_mode_confidence": round(frame_decision.confidence, 3),
             "runtime_mode_features": {k: round(float(v), 3) for k, v in frame_decision.features.items()},
             "surface_extras_allowed": surface_extras_allowed,
+            "surface_branch_reason": surface_branch_reason,
+            "effective_max_candidates": effective_max_candidates,
             "model": chosen["name"],
             "n_features": int(len(g0)),
             "inlier_ratio": round(chosen["inlier_ratio"], 3),
