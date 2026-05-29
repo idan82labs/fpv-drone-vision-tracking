@@ -1160,6 +1160,37 @@ ranker everywhere it is affordable, but use HMM/no-box behavior only when the
 candidate-local router says surface/null-risk/low-confidence; keep continuous
 visible shots on the permissive score/Viterbi branch unless null evidence rises.
 
+Crop-stack pairwise-ranking check:
+
+- Added `pairwise_logistic` to `scripts/train_crop_stack_verifier.py`. It trains
+  on same-frame positive-minus-negative crop-stack feature differences, then
+  scores candidates with the learned decision function. This directly tests the
+  professor's pairwise top-alternative ranking recommendation without changing
+  proposals or labels.
+- Added `score_mode` metadata to crop-stack model bundles and updated
+  `scripts/apply_crop_stack_verifier.py` so diff-trained models are scored with
+  `decision_function` instead of a misleading binary probability.
+- Full nine-clip hard-alternative run:
+  `artifacts/crop_stack_verifier_multiclip_pairwise_v1`.
+- Result:
+  - `hist_gbdt`: AUC `0.900`, pairwise win rate `0.920`;
+  - `logistic`: AUC `0.806`, pairwise win rate `0.810`;
+  - `pairwise_logistic`: AUC `0.754`, pairwise win rate `0.803`.
+- Per-clip read:
+  - pairwise is strong on easy transfer clips (`1c1258a1` `0.954`,
+    `529a6584` `1.000`, `7bd296cd` `0.976`, `e6` `0.991`);
+  - it collapses on the hard transfer clips we care about most:
+    `aaf1` `0.190`, `e271` `0.635`;
+  - it improves `d129` over HGBDT (`0.765` vs `0.578`) but not enough to offset
+    the aaf1/e271 regression.
+
+Interpretation: pairwise training is the right objective shape, but not with
+the current linear crop-stack representation. HGBDT remains the best offline
+crop-stack verifier. The next high-value move is not another pairwise loss; it
+is either richer target/background observation features, typed hard-negative
+labels for aaf1/e271/d129, or a nonlinear pairwise/listwise ranker once the
+feature/label set supports it.
+
 Current crop-ranker / HMM router check:
 
 - Fixed the router/disagreement harnesses to read both historical

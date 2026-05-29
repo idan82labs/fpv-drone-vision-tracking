@@ -58,6 +58,25 @@ class CropStackVerifierTests(unittest.TestCase):
 
         self.assertEqual(negatives_sorted[0][1]["selected"], "1")
 
+    def test_pairwise_training_data_builds_symmetric_differences(self):
+        rows = [
+            {"clip": "c", "frame": "1", "hard_label": "1"},
+            {"clip": "c", "frame": "1", "hard_label": "0"},
+            {"clip": "c", "frame": "2", "hard_label": "0"},
+        ]
+        x = np.asarray([[3.0, 1.0], [1.0, 2.0], [9.0, 9.0]], dtype=np.float32)
+
+        diffs, labels = crop.pairwise_training_data(rows, x)
+
+        self.assertEqual(diffs.shape, (2, 2))
+        np.testing.assert_array_equal(diffs[0], np.asarray([2.0, -1.0], dtype=np.float32))
+        np.testing.assert_array_equal(diffs[1], np.asarray([-2.0, 1.0], dtype=np.float32))
+        np.testing.assert_array_equal(labels, np.asarray([1, 0], dtype=np.int32))
+
+    def test_pairwise_model_uses_decision_function_scores(self):
+        self.assertEqual(crop.score_mode_for_model("pairwise_logistic"), "decision_function")
+        self.assertEqual(crop.score_mode_for_model("hist_gbdt"), "auto")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -19,6 +19,14 @@ router; they trade visible recall for null suppression and leave aaf1 false
 specks mostly unsolved. This confirms the calibration shape is useful only
 after the candidate score is a better target-vs-clutter likelihood.
 
+Additional pairwise-ranking update: `scripts/train_crop_stack_verifier.py` now
+includes a `pairwise_logistic` mode trained on same-frame positive-minus-negative
+hard alternatives. On the nine-clip crop-stack hard-example set it underperforms
+the existing HGBDT verifier overall (`0.803` vs `0.920` pairwise win rate) and
+collapses on held-out aaf1 (`0.190`) and e271 (`0.635`). This closes the simple
+linear pairwise-loss branch for now; the pairwise objective remains sensible,
+but it needs richer observation features or more representative typed labels.
+
 This checks the project against the professor's CLBA-1 recommendation:
 
 > candidate-local target-aligned minus background-aligned tube likelihood,
@@ -74,6 +82,7 @@ What is still missing:
 | Soft physical motion prior over range bins | Not implemented | Current code uses max-jump, transition cost, static/jump penalties. | We have image-plane gates, not the recommended range-bin Student-t prior. |
 | Candidate-local router | Implemented infrastructure | `tbd_motion_detector.py` candidate router states; runtime mode logging/apply flags. | Good infrastructure, but not calibrated enough for production decisions. |
 | Tiny CNN/TCN only after labels | Deferred intentionally | We stayed with engineered features / logistic / GBDT. | Correct deferral; label volume is not enough for a safe CNN. |
+| Pairwise ranking over top-K alternatives | Tried, negative simple form | `pairwise_logistic` crop-stack verifier; artifact `crop_stack_verifier_multiclip_pairwise_v1`. | Objective is right, but linear pairwise crop-stack features transfer worse than HGBDT on aaf1/e271. |
 | Full-frame temporal stack as teacher, not runtime | Tried and rejected as runtime | aaf1 full-stack oracle high, runtime 107-146 ms/frame; candidate-local versions did not recover oracle. | The professor's warning was correct. Keep full-stack as offline teacher/miner. |
 | Sequential log-odds / null calibration | Partial | Acquisition/null gates, HMM, hysteresis, mode supervisor, router max-null threshold probe. | We tested many forms; current score is not calibrated enough for thresholds to solve the problem. |
 | Per-router thresholds/null distributions | Tried, not validated | `evaluate_router_null_calibration.py` estimates router-bucket thresholds from train-clip null maxima. | Correct shape, wrong score: visible recall collapses before null suppression is production useful. |

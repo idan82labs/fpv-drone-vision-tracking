@@ -24,6 +24,7 @@ from typing import Any
 
 import joblib
 import numpy as np
+from sklearn.base import clone
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LogisticRegression
@@ -85,7 +86,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--detector_scale", type=float, default=0.5)
     p.add_argument("--orb_features", type=int, default=900)
     p.add_argument("--min_matches", type=int, default=18)
-    p.add_argument("--models", nargs="+", choices=("logistic", "hist_gbdt"), default=["logistic", "hist_gbdt"])
+    p.add_argument(
+        "--models",
+        nargs="+",
+        choices=("logistic", "hist_gbdt", "pairwise_logistic"),
+        default=["logistic", "hist_gbdt", "pairwise_logistic"],
+    )
     p.add_argument("--max_examples", type=int, default=0)
     p.add_argument("--random_state", type=int, default=19)
     return p.parse_args()
@@ -370,13 +376,64 @@ def make_models(seed: int) -> dict[str, Pipeline]:
                 ("model", HistGradientBoostingClassifier(max_iter=120, learning_rate=0.035, max_leaf_nodes=7, min_samples_leaf=10, l2_regularization=1.0, random_state=seed)),
             ]
         ),
+        "pairwise_logistic": Pipeline(
+            [
+                ("impute", SimpleImputer(strategy="median")),
+                ("scale", StandardScaler()),
+                ("model", LogisticRegression(C=0.08, max_iter=2000, solver="liblinear", random_state=seed)),
+            ]
+        ),
     }
 
 
-def predict_score(model: Pipeline, x: np.ndarray) -> np.ndarray:
+def predict_model_score(model: Pipeline, x: np.ndarray, score_mode: str = "auto") -> np.ndarray:
+    if score_mode == "decision_function":
+        return model.decision_function(x)
+    if score_mode == "probability":
+        return model.predict_proba(x)[:, 1]
     if hasattr(model, "predict_proba"):
         return model.predict_proba(x)[:, 1]
     return model.decision_function(x)
+
+
+def predict_score(model: Pipeline, x: np.ndarray) -> np.ndarray:
+    return predict_model_score(model, x)
+
+
+def pairwise_training_data(rows: list[dict[str, Any]], x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    by_frame: dict[tuple[str, int], list[int]] = defaultdict(list)
+    for idx, row in enumerate(rows):
+        by_frame[(str(row.get("clip", "")), safe_int(row.get("frame"), -1))].append(idx)
+    diffs: list[np.ndarray] = []
+    labels: list[int] = []
+    for idxs in by_frame.values():
+        pos = [i for i in idxs if safe_int(rows[i].get("hard_label"), 0) == 1]
+        neg = [i for i in idxs if safe_int(rows[i].get("hard_label"), 0) == 0]
+        for p_idx in pos:
+            for n_idx in neg:
+                diffs.append(x[p_idx] - x[n_idx])
+                labels.append(1)
+                diffs.append(x[n_idx] - x[p_idx])
+                labels.append(0)
+    if not diffs:
+        return np.empty((0, x.shape[1]), dtype=np.float32), np.empty((0,), dtype=np.int32)
+    return np.vstack(diffs).astype(np.float32), np.asarray(labels, dtype=np.int32)
+
+
+def fit_verifier_model(model_name: str, model: Pipeline, x_train: np.ndarray, y_train: np.ndarray, train_rows: list[dict[str, Any]]) -> Pipeline:
+    if model_name != "pairwise_logistic":
+        model.fit(x_train, y_train)
+        return model
+    x_pair, y_pair = pairwise_training_data(train_rows, x_train)
+    if x_pair.shape[0] == 0 or len(set(y_pair.tolist())) < 2:
+        model.fit(x_train, y_train)
+        return model
+    model.fit(x_pair, y_pair)
+    return model
+
+
+def score_mode_for_model(model_name: str) -> str:
+    return "decision_function" if model_name == "pairwise_logistic" else "auto"
 
 
 def auc_score(y: np.ndarray, score: np.ndarray) -> float:
@@ -569,9 +626,10 @@ def main() -> None:
             test_idx = np.asarray([i for i, row in enumerate(rows) if row.get("clip") == held_clip], dtype=int)
             if train_idx.size == 0 or test_idx.size == 0 or len(set(y[train_idx])) < 2:
                 continue
-            model = Pipeline(models[model_name].steps)
-            model.fit(x[train_idx], y[train_idx])
-            scores = predict_score(model, x[test_idx])
+            model = clone(models[model_name])
+            train_rows = [rows[int(idx)] for idx in train_idx]
+            model = fit_verifier_model(model_name, model, x[train_idx], y[train_idx], train_rows)
+            scores = predict_model_score(model, x[test_idx], score_mode_for_model(model_name))
             for idx, score in zip(test_idx, scores):
                 out = dict(rows[int(idx)])
                 out["crop_stack_score"] = round(float(score), 6)
@@ -581,8 +639,8 @@ def main() -> None:
         summary.append(summarize_predictions(model_rows, "crop_stack_score", model_name))
 
     best_model_name = max(summary, key=lambda r: (r["pairwise_win_rate"], r["auc"]))["model"] if summary else args.models[0]
-    final_model = Pipeline(models[best_model_name].steps)
-    final_model.fit(x, y)
+    final_model = clone(models[best_model_name])
+    final_model = fit_verifier_model(best_model_name, final_model, x, y, rows)
     model_path = out_dir / f"{best_model_name}_crop_stack_verifier.joblib"
     joblib.dump(
         {
@@ -593,6 +651,7 @@ def main() -> None:
             "patch_size": args.patch_size,
             "detector_scale": args.detector_scale,
             "scalar_columns": SCALAR_COLUMNS,
+            "score_mode": score_mode_for_model(best_model_name),
         },
         model_path,
     )
@@ -617,6 +676,7 @@ def main() -> None:
         "video_dir": args.video_dir,
         "best_model_loco": best_model_name,
         "model_path": str(model_path),
+        "score_mode": score_mode_for_model(best_model_name),
         "metric_caveat": "hard-alternative separation only; not full selected-box tracking accuracy",
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")

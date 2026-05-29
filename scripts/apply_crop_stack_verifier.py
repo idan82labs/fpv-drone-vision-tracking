@@ -74,7 +74,11 @@ def safe_int(value: Any, default: int = 0) -> int:
     return crop.safe_int(value, default)
 
 
-def predict_score(model: Any, x: np.ndarray) -> np.ndarray:
+def predict_score(model: Any, x: np.ndarray, score_mode: str = "auto") -> np.ndarray:
+    if hasattr(crop, "predict_model_score"):
+        return crop.predict_model_score(model, x, score_mode)
+    if score_mode == "decision_function":
+        return model.decision_function(x)
     if hasattr(model, "predict_proba"):
         return model.predict_proba(x)[:, 1]
     return model.decision_function(x)
@@ -100,6 +104,7 @@ def score_rows(
     overwrite_learned_score: bool,
 ) -> list[dict[str, Any]]:
     model = bundle["model"]
+    score_mode = str(bundle.get("score_mode", "auto"))
     out_rows: list[dict[str, Any]] = []
     vectors: list[np.ndarray] = []
     vector_indexes: list[int] = []
@@ -124,7 +129,7 @@ def score_rows(
         vectors.append(vector)
         vector_indexes.append(len(out_rows) - 1)
     if vectors:
-        scores = predict_score(model, np.vstack(vectors).astype(np.float32))
+        scores = predict_score(model, np.vstack(vectors).astype(np.float32), score_mode)
         for idx, score in zip(vector_indexes, scores):
             out = out_rows[idx]
             out["crop_stack_score"] = round(float(score), 6)
@@ -212,6 +217,7 @@ def main() -> None:
             "crop_size": bundle["crop_size"],
             "patch_size": bundle["patch_size"],
             "detector_scale": bundle["detector_scale"],
+            "score_mode": bundle.get("score_mode", "auto"),
         }
         out_root.mkdir(parents=True, exist_ok=True)
         (out_root / "crop_stack_score_metadata.json").write_text(json.dumps(meta, indent=2) + "\n")
