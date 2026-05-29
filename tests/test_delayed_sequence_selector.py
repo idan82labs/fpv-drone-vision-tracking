@@ -7,22 +7,42 @@ from scripts.tbd_motion_detector import DelayedSequenceSelector, PathState, writ
 
 
 class FakeTBD:
+    surface_ranker = None
+
     def verified_score(self, st):
         return st.score()
+
+
+class FakeSurfaceRanker:
+    def scores(self, rows):
+        return [0.9 if int(row["track_id"]) == 2 else 0.1 for row in rows]
+
+
+class FakeRankerTBD(FakeTBD):
+    surface_ranker = FakeSurfaceRanker()
 
 
 def args():
     return argparse.Namespace(
         delayed_sequence_top_n=20,
+        delayed_sequence_score_source="verified",
         delayed_sequence_min_hits=1,
         delayed_sequence_window=1,
         delayed_sequence_max_jump_px=5.0,
         delayed_sequence_transition_weight=1.5,
         delayed_sequence_threshold=0.0,
+        delayed_sequence_acquire_threshold=None,
+        delayed_sequence_acquire_hits=1,
+        delayed_sequence_keep_threshold=None,
+        delayed_sequence_lost_patience=0,
         max_selected_misses=1,
         min_path_hits=1,
         selected_score=0.0,
         tube_verifier="off",
+        surface_ranker_policy="confidence_fallback",
+        surface_ranker_scope="all",
+        surface_ranker_min_rate=0.0,
+        surface_ranker_gate="none",
         delayed_sequence_require_floor=False,
         delayed_sequence_commit_prefix=False,
     )
@@ -87,6 +107,72 @@ class DelayedSequenceSelectorTest(unittest.TestCase):
         self.assertIsNotNone(selected1)
         self.assertIsNotNone(selected2)
         self.assertLessEqual(abs(selected2.bbox[0] - selected1.bbox[0]), 5)
+
+    def test_hysteresis_waits_for_acquire_score_then_keeps_lower_score(self):
+        a = args()
+        a.delayed_sequence_acquire_threshold = 9.0
+        a.delayed_sequence_keep_threshold = 6.0
+        selector = DelayedSequenceSelector(a)
+        selector.add_frame(1, [state(1, 1, 0, 0, 8.0)], FakeTBD())
+        selector.add_frame(2, [state(1, 2, 2, 0, 10.0)], FakeTBD())
+        selector.add_frame(3, [state(1, 3, 4, 0, 7.0)], FakeTBD())
+
+        _frame1, selected1 = selector.pop_ready()
+        _frame2, selected2 = selector.pop_ready()
+
+        self.assertIsNone(selected1)
+        self.assertIsNotNone(selected2)
+
+    def test_hysteresis_can_require_multiple_acquire_hits(self):
+        a = args()
+        a.delayed_sequence_acquire_threshold = 7.5
+        a.delayed_sequence_acquire_hits = 2
+        a.delayed_sequence_keep_threshold = 6.0
+        selector = DelayedSequenceSelector(a)
+        selector.add_frame(1, [state(1, 1, 0, 0, 8.0)], FakeTBD())
+        selector.add_frame(2, [state(1, 2, 2, 0, 8.0)], FakeTBD())
+        selector.add_frame(3, [state(1, 3, 4, 0, 7.0)], FakeTBD())
+
+        _frame1, selected1 = selector.pop_ready()
+        _frame2, selected2 = selector.pop_ready()
+
+        self.assertIsNone(selected1)
+        self.assertIsNotNone(selected2)
+
+    def test_hysteresis_rejects_keep_jump_and_drops_lock(self):
+        a = args()
+        a.delayed_sequence_acquire_threshold = 7.5
+        a.delayed_sequence_keep_threshold = 6.0
+        selector = DelayedSequenceSelector(a)
+        selector.add_frame(1, [state(1, 1, 0, 0, 8.0)], FakeTBD())
+        selector.add_frame(2, [state(1, 2, 2, 0, 9.0)], FakeTBD())
+        _frame1, selected1 = selector.pop_ready()
+        selector.add_frame(3, [state(2, 3, 100, 0, 9.0)], FakeTBD())
+
+        _frame2, selected2 = selector.pop_ready()
+
+        self.assertIsNotNone(selected1)
+        self.assertIsNone(selected2)
+
+    def test_surface_ranker_score_source_can_choose_lower_verified_state(self):
+        a = args()
+        a.delayed_sequence_score_source = "surface_ranker"
+        selector = DelayedSequenceSelector(a)
+        selector.add_frame(
+            1,
+            [state(1, 1, 0, 0, 20.0), state(2, 1, 50, 0, 5.0)],
+            FakeRankerTBD(),
+        )
+        selector.add_frame(
+            2,
+            [state(1, 2, 2, 0, 20.0), state(2, 2, 52, 0, 5.0)],
+            FakeRankerTBD(),
+        )
+
+        _frame, selected = selector.pop_ready()
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected.sid, 2)
 
     def test_telemetry_emits_null_and_selected_records(self):
         sink = io.StringIO()

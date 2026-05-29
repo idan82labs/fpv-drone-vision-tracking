@@ -253,11 +253,31 @@ def parse_args() -> argparse.Namespace:
         help="Use a lightweight delayed Viterbi selector over recent top states for selected_tracks.csv.",
     )
     p.add_argument("--delayed_sequence_top_n", type=int, default=20)
+    p.add_argument(
+        "--delayed_sequence_score_source",
+        choices=("verified", "surface_ranker"),
+        default="verified",
+        help="Score used inside delayed sequence selection. surface_ranker requires --surface_ranker_model.",
+    )
     p.add_argument("--delayed_sequence_min_hits", type=int, default=1)
     p.add_argument("--delayed_sequence_window", type=int, default=15)
     p.add_argument("--delayed_sequence_max_jump_px", type=float, default=10.0)
     p.add_argument("--delayed_sequence_transition_weight", type=float, default=1.5)
     p.add_argument("--delayed_sequence_threshold", type=float, default=0.0)
+    p.add_argument(
+        "--delayed_sequence_acquire_threshold",
+        type=float,
+        default=None,
+        help="Optional score required to acquire delayed-sequence output. Enables acquire/keep hysteresis.",
+    )
+    p.add_argument("--delayed_sequence_acquire_hits", type=int, default=1)
+    p.add_argument(
+        "--delayed_sequence_keep_threshold",
+        type=float,
+        default=None,
+        help="Optional score required to keep delayed-sequence output after acquisition. Defaults to --delayed_sequence_threshold.",
+    )
+    p.add_argument("--delayed_sequence_lost_patience", type=int, default=0)
     p.add_argument(
         "--delayed_sequence_require_floor",
         action="store_true",
@@ -2430,13 +2450,50 @@ class DelayedSequenceSelector:
     def __init__(self, args: argparse.Namespace):
         self.args = args
         self.layers: list[dict[str, object]] = []
+        self.active = False
+        self.pending_hits = 0
+        self.pending_frame: int | None = None
+        self.pending_bbox: tuple[int, int, int, int] | None = None
+        self.last_frame: int | None = None
+        self.last_bbox: tuple[int, int, int, int] | None = None
+        self.lost = 0
 
-    def add_frame(self, frame_no: int, states: list[PathState], tbd: BeamTBD) -> None:
-        ranked = sorted(
+    def _ranked_states(self, states: list[PathState], tbd: BeamTBD) -> list[tuple[float, PathState]]:
+        verified_ranked = sorted(
             [(float(tbd.verified_score(st)), st) for st in states if state_is_sequence_candidate(st, tbd, self.args)],
             key=lambda item: item[0],
             reverse=True,
         )[: max(1, self.args.delayed_sequence_top_n)]
+        if self.args.delayed_sequence_score_source != "surface_ranker" or tbd.surface_ranker is None:
+            return verified_ranked
+
+        rows: list[dict[str, object]] = []
+        ranked_states: list[PathState] = []
+        for rank, (baseline_score, st) in enumerate(verified_ranked, start=1):
+            features = tube_features(st)
+            if not surface_ranker_applies(features, self.args):
+                continue
+            tube_score = scoped_tube_verifier_score(features, self.args)
+            next_score = verified_ranked[rank][0] if rank < len(verified_ranked) else None
+            margin = (baseline_score - next_score) if next_score is not None else None
+            row = state_feature_row(st, self.args, rank, baseline_score, tube_score, margin)
+            if not surface_ranker_gate_allows(row, self.args.surface_ranker_gate):
+                continue
+            rows.append(row)
+            ranked_states.append(st)
+        if not rows:
+            return verified_ranked
+        scores = tbd.surface_ranker.scores(rows)
+        if len(scores) == 0:
+            return verified_ranked
+        return sorted(
+            [(float(score), st) for score, st in zip(scores, ranked_states)],
+            key=lambda item: item[0],
+            reverse=True,
+        )[: max(1, self.args.delayed_sequence_top_n)]
+
+    def add_frame(self, frame_no: int, states: list[PathState], tbd: BeamTBD) -> None:
+        ranked = self._ranked_states(states, tbd)
         path_scores: list[float] = []
         backptrs: list[int | None] = []
         prev = self.layers[-1] if self.layers else None
@@ -2480,10 +2537,11 @@ class DelayedSequenceSelector:
     def pop_ready(self) -> tuple[int, PathState | None]:
         if not self.layers:
             raise RuntimeError("no delayed sequence layers")
-        frame_no, selected, path_indices = self._select_path()
+        frame_no, selected, selected_score, path_indices = self._select_path()
         self.layers.pop(0)
         if selected is not None and path_indices and self.args.delayed_sequence_commit_prefix:
             self._commit_remaining_path(path_indices[1:])
+        selected = self._apply_hysteresis(frame_no, selected, selected_score)
         return frame_no, selected
 
     def flush(self) -> list[tuple[int, PathState | None]]:
@@ -2492,31 +2550,100 @@ class DelayedSequenceSelector:
             out.append(self.pop_ready())
         return out
 
-    def _select_path(self) -> tuple[int, PathState | None, list[int]]:
+    def _hysteresis_enabled(self) -> bool:
+        return self.args.delayed_sequence_acquire_threshold is not None
+
+    def _apply_hysteresis(self, frame_no: int, selected: PathState | None, score: float | None) -> PathState | None:
+        if not self._hysteresis_enabled():
+            return selected
+        if selected is None or score is None:
+            self.pending_hits = 0
+            self.pending_frame = None
+            self.pending_bbox = None
+            if self.active:
+                self.lost += 1
+                if self.lost > max(0, self.args.delayed_sequence_lost_patience):
+                    self.active = False
+                    self.last_frame = None
+                    self.last_bbox = None
+            return None
+
+        acquire_threshold = float(self.args.delayed_sequence_acquire_threshold)
+        keep_threshold = (
+            float(self.args.delayed_sequence_keep_threshold)
+            if self.args.delayed_sequence_keep_threshold is not None
+            else float(self.args.delayed_sequence_threshold)
+        )
+        if not self.active:
+            if score < acquire_threshold:
+                self.pending_hits = 0
+                self.pending_frame = None
+                self.pending_bbox = None
+                return None
+            gap = max(1, frame_no - self.pending_frame) if self.pending_frame is not None else 1
+            jump_ok = (
+                self.pending_bbox is None
+                or center_distance(self.pending_bbox, selected.bbox)
+                <= self.args.delayed_sequence_max_jump_px * gap
+            )
+            self.pending_hits = self.pending_hits + 1 if jump_ok else 1
+            self.pending_frame = frame_no
+            self.pending_bbox = selected.bbox
+            if self.pending_hits < max(1, int(self.args.delayed_sequence_acquire_hits)):
+                return None
+            self.active = True
+            self.lost = 0
+            self.last_frame = frame_no
+            self.last_bbox = selected.bbox
+            return selected
+
+        gap = max(1, frame_no - self.last_frame) if self.last_frame is not None else 1
+        jump_ok = (
+            self.last_bbox is None
+            or center_distance(self.last_bbox, selected.bbox)
+            <= self.args.delayed_sequence_max_jump_px * gap
+        )
+        if score >= keep_threshold and jump_ok:
+            self.lost = 0
+            self.last_frame = frame_no
+            self.last_bbox = selected.bbox
+            return selected
+
+        self.lost += 1
+        if self.lost > max(0, self.args.delayed_sequence_lost_patience):
+            self.active = False
+            self.pending_hits = 0
+            self.pending_frame = None
+            self.pending_bbox = None
+            self.last_frame = None
+            self.last_bbox = None
+        return None
+
+    def _select_path(self) -> tuple[int, PathState | None, float | None, list[int]]:
         first_frame = int(self.layers[0]["frame"])
         if not self.layers or not self.layers[-1]["path_scores"]:
-            return first_frame, None, []
+            return first_frame, None, None, []
 
         last_scores = self.layers[-1]["path_scores"]
         idx: int | None = max(range(len(last_scores)), key=lambda i: float(last_scores[i]))
         path_indices: list[int] = []
         for li in range(len(self.layers) - 1, 0, -1):
             if idx is None:
-                return first_frame, None, []
+                return first_frame, None, None, []
             path_indices.append(idx)
             backptrs = self.layers[li]["backptrs"]
             idx = backptrs[idx]
         if idx is None:
-            return first_frame, None, []
+            return first_frame, None, None, []
         path_indices.append(idx)
         path_indices.reverse()
         rows = self.layers[0]["rows"]
         if not rows:
-            return first_frame, None, []
+            return first_frame, None, None, []
         score, st = rows[idx]
         if score < self.args.delayed_sequence_threshold:
-            return first_frame, None, path_indices
-        return first_frame, st, path_indices
+            return first_frame, None, float(score), path_indices
+        return first_frame, st, float(score), path_indices
 
     def _commit_remaining_path(self, path_indices: list[int]) -> None:
         if not path_indices:
@@ -2809,6 +2936,12 @@ class RunningWindowStats:
 def run(args: argparse.Namespace) -> None:
     if args.surface_ranker_policy != "off" and not args.surface_ranker_model:
         raise SystemExit("--surface_ranker_model is required when --surface_ranker_policy is not off")
+    if args.delayed_sequence_score_source == "surface_ranker" and (
+        args.surface_ranker_policy == "off" or not args.surface_ranker_model
+    ):
+        raise SystemExit(
+            "--delayed_sequence_score_source surface_ranker requires --surface_ranker_policy and --surface_ranker_model"
+        )
     if (
         args.surface_ranker_policy != "off"
         and args.surface_ranker_scope == "surface_backed"

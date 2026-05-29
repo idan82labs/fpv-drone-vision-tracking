@@ -590,10 +590,34 @@ and sequence/CLBA should not be forced. This supports a router/state-machine
 direction: sequence mode should be applied only when the local background state
 needs it, not globally.
 
+Runtime delayed-sequence integration:
+
+- Added non-default `tbd_motion_detector.py` delayed-sequence acquire/keep
+  hysteresis flags:
+  - `--delayed_sequence_acquire_threshold`
+  - `--delayed_sequence_acquire_hits`
+  - `--delayed_sequence_keep_threshold`
+  - `--delayed_sequence_lost_patience`
+- Added `--delayed_sequence_score_source surface_ranker`, so delayed sequence
+  can use learned surface-ranker probabilities instead of only detector
+  `verified_score`.
+- Guardrail: `surface_ranker` scoring now fails fast unless a surface-ranker
+  model/policy is explicitly configured.
+- Smoke-tested aaf1 first 360 frames:
+  - pair-rescue baseline: 32.37 ms/frame average, 45.09 ms p90.
+  - delayed verified-score hysteresis: 36.94 ms/frame average, 50.56 ms p90.
+  - surface-extras + learned-ranker delayed sequence: 161.87 ms/frame average,
+    197.36 ms p95.
+
+Interpretation: the runtime plumbing is now present and tested, but the heavy
+surface/temporal-stack runtime path is much too slow as a global mode. The
+offline aaf1 gain still needs a bounded, router-gated implementation before it
+is a Pi candidate.
+
 ## Next Meaningful Work
 
-1. Implement the sequence selector inside `tbd_motion_detector.py` behind an
-   explicit non-default delayed-window flag, then benchmark runtime and accuracy.
+1. Bound the runtime delayed-sequence path: only score top-K surface-backed
+   candidates, avoid full surface extras globally, and benchmark p95/p99.
 2. Reproduce the CLBA+hysteresis sequence result on at least one more true
    tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
    unless visually verified.
