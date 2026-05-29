@@ -18,6 +18,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 import cv2
 import numpy as np
@@ -977,9 +978,14 @@ def candidate_duplicate(cand: base.Candidate, kept: list[base.Candidate]) -> boo
     return False
 
 
-def dedupe_candidates(cands: list[base.Candidate], max_n: int) -> list[base.Candidate]:
+def dedupe_candidates(
+    cands: list[base.Candidate],
+    max_n: int,
+    score_fn: Callable[[base.Candidate], float] | None = None,
+) -> list[base.Candidate]:
     deduped: list[base.Candidate] = []
-    for cand in sorted(cands, key=lambda c: c.score, reverse=True):
+    key = score_fn if score_fn is not None else (lambda c: c.score)
+    for cand in sorted(cands, key=key, reverse=True):
         if not candidate_duplicate(cand, deduped):
             deduped.append(cand)
         if len(deduped) >= max_n:
@@ -1089,7 +1095,11 @@ def scenario_balanced_candidates(
         quotas = scaled
     kept: list[base.Candidate] = []
     by_bucket: dict[str, list[base.Candidate]] = {k: [] for k in quotas}
-    sort_key = (lambda c: candidate_obs(c, args)) if use_router else (lambda c: c.score)
+    sort_key = (
+        (lambda c: candidate_obs(c, args))
+        if candidate_obs_sort_needed(args, use_router)
+        else (lambda c: c.score)
+    )
     for cand in sorted(cands, key=sort_key, reverse=True):
         by_bucket.setdefault(candidate_scenario(cand, use_router), []).append(cand)
     for bucket, quota in quotas.items():
@@ -1104,6 +1114,16 @@ def scenario_balanced_candidates(
         if not candidate_duplicate(cand, kept):
             kept.append(cand)
     return kept
+
+
+def candidate_obs_sort_needed(args: argparse.Namespace, use_router: bool) -> bool:
+    return bool(
+        use_router
+        or args.native_roi_score
+        or args.line_weight > 0
+        or args.support_penalty_weight > 0
+        or args.app_low_residual_penalty > 0
+    )
 
 
 def candidate_obs(c: base.Candidate, args: argparse.Namespace) -> float:
@@ -2400,10 +2420,14 @@ def run(args: argparse.Namespace) -> None:
         )
 
         if router_applies(args):
-            routed_cheap = dedupe_candidates(cheap_cands, cheap_limit)
-            assign_attached_support(routed_cheap, cur_g)
             if args.native_roi_score:
-                assign_native_roi_scores(routed_cheap, cur_full, args.downscale)
+                assign_native_roi_scores(cheap_cands, cur_full, args.downscale)
+            routed_cheap = dedupe_candidates(
+                cheap_cands,
+                cheap_limit,
+                (lambda cand: candidate_obs(cand, args)) if candidate_obs_sort_needed(args, True) else None,
+            )
+            assign_attached_support(routed_cheap, cur_g)
             assign_candidate_router_states(routed_cheap, cur_g)
             surface_extras_allowed = surface_branch_needed(routed_cheap, tbd.states, frame_decision, args)
             surface_branch_reason = "candidate_local_or_track" if surface_extras_allowed else "not_candidate_local_surface"
@@ -2432,11 +2456,18 @@ def run(args: argparse.Namespace) -> None:
             )
         t_proposals = time.perf_counter()
         raw_cands = cheap_cands + stack_cands + hybrid_coast_cands
+        if args.native_roi_score:
+            assign_native_roi_scores(raw_cands, cur_full, args.downscale)
+        preselect_score = (
+            (lambda cand: candidate_obs(cand, args))
+            if candidate_obs_sort_needed(args, router_applies(args))
+            else None
+        )
         if args.scenario_balance:
             pool_n = max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
-            cands = dedupe_candidates(raw_cands, pool_n)
+            cands = dedupe_candidates(raw_cands, pool_n, preselect_score)
         else:
-            cands = dedupe_candidates(raw_cands, args.top_k_candidates)
+            cands = dedupe_candidates(raw_cands, args.top_k_candidates, preselect_score)
         assign_attached_support(cands, cur_g)
         if args.native_roi_score:
             assign_native_roi_scores(cands, cur_full, args.downscale)
@@ -2456,7 +2487,11 @@ def run(args: argparse.Namespace) -> None:
         if args.scenario_balance:
             cands = scenario_balanced_candidates(cands, args, router_applies(args), effective_max_candidates)
         elif effective_max_candidates < len(cands):
-            sort_key = (lambda cand: candidate_obs(cand, args)) if router_applies(args) else (lambda cand: cand.score)
+            sort_key = (
+                (lambda cand: candidate_obs(cand, args))
+                if candidate_obs_sort_needed(args, router_applies(args))
+                else (lambda cand: cand.score)
+            )
             cands = sorted(cands, key=sort_key, reverse=True)[:effective_max_candidates]
         if router_is_active(args):
             candidate_router_counts = candidate_router_state_counts(cands)

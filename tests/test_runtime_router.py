@@ -99,6 +99,27 @@ class RuntimeRouterTests(unittest.TestCase):
             )
         )
 
+    def test_native_roi_score_can_affect_preselection_without_router(self):
+        plain = cand(10.0, bbox=(10, 10, 3, 3))
+        native_confirmed = cand(9.0, bbox=(30, 10, 3, 3))
+        native_confirmed.native_dark_score = 5.0
+        opts = args(native_roi_score=True, native_roi_weight=1.0, native_roi_neutral=1.0)
+
+        kept = tbd.dedupe_candidates(
+            [plain, native_confirmed],
+            1,
+            lambda item: tbd.candidate_obs(item, opts),
+        )
+        self.assertIs(kept[0], native_confirmed)
+
+        balanced = tbd.scenario_balanced_candidates(
+            [plain, native_confirmed],
+            opts,
+            use_router=False,
+            max_n=1,
+        )
+        self.assertIs(balanced[0], native_confirmed)
+
 
 if __name__ == "__main__":
     unittest.main()
