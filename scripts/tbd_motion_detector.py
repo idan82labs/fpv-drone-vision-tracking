@@ -103,6 +103,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--large_dark_box_full", type=float, default=28.0)
     p.add_argument("--large_dark_bg_sigma", type=float, default=5.0)
     p.add_argument("--large_dark_score_weight", type=float, default=0.08)
+    p.add_argument("--hybrid_coast_proposals", action="store_true")
+    p.add_argument("--hybrid_coast_top_k", type=int, default=18)
+    p.add_argument("--hybrid_coast_max_misses", type=int, default=8)
+    p.add_argument("--hybrid_coast_offsets", default="0:0,-4:0,4:0,0:-4,0:4,-7:0,7:0,0:-7,0:7")
+    p.add_argument("--hybrid_coast_score_weight", type=float, default=0.18)
+    p.add_argument("--scenario_balance", action="store_true")
+    p.add_argument("--scenario_pool_factor", type=float, default=3.0)
+    p.add_argument("--scenario_sky_top_k", type=int, default=24)
+    p.add_argument("--scenario_surface_top_k", type=int, default=34)
+    p.add_argument("--scenario_boundary_top_k", type=int, default=20)
+    p.add_argument("--scenario_large_top_k", type=int, default=20)
+    p.add_argument("--scenario_coast_top_k", type=int, default=18)
     p.add_argument("--temporal_stack_peaks", action="store_true")
     p.add_argument("--temporal_stack_offsets", default="-8,-5,-3,-2,-1")
     p.add_argument("--temporal_stack_radii", default="2,3,4,5,7")
@@ -506,7 +518,7 @@ def map_peak_candidates(
             peaks.append((float(vals[idx]), int(xs[idx]), int(ys[idx]), radius))
 
     cands: list[base.Candidate] = []
-    occupied: list[tuple[float, float]] = []
+    occupied: list[tuple[int, int, int, int]] = []
     for score, x, y, radius in sorted(peaks, reverse=True):
         if len(cands) >= args.map_top_k:
             break
@@ -912,21 +924,107 @@ def temporal_stack_candidates(
     return cands
 
 
+def candidate_duplicate(cand: base.Candidate, kept: list[base.Candidate]) -> bool:
+    ccx, ccy = base.bbox_center(cand.bbox)
+    for other in kept:
+        ocx, ocy = base.bbox_center(other.bbox)
+        if math.hypot(ccx - ocx, ccy - ocy) <= 2.5 or base.bbox_iou(cand.bbox, other.bbox) > 0.25:
+            return True
+    return False
+
+
 def dedupe_candidates(cands: list[base.Candidate], max_n: int) -> list[base.Candidate]:
     deduped: list[base.Candidate] = []
     for cand in sorted(cands, key=lambda c: c.score, reverse=True):
-        ccx, ccy = base.bbox_center(cand.bbox)
-        duplicate = False
-        for kept in deduped:
-            kcx, kcy = base.bbox_center(kept.bbox)
-            if math.hypot(ccx - kcx, ccy - kcy) <= 2.5 or base.bbox_iou(cand.bbox, kept.bbox) > 0.25:
-                duplicate = True
-                break
-        if not duplicate:
+        if not candidate_duplicate(cand, deduped):
             deduped.append(cand)
         if len(deduped) >= max_n:
             break
     return deduped
+
+
+def hybrid_coast_candidates(
+    states: list[PathState],
+    tbd: BeamTBD,
+    frame_h: np.ndarray | None,
+    w_img: int,
+    h_img: int,
+    residual_blur: np.ndarray,
+    app_resp: np.ndarray,
+    cur_g: np.ndarray,
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    """Use current beam states as cheap predicted proposals, not decisions."""
+    if not args.hybrid_coast_proposals or not states:
+        return []
+    offsets = parse_xy_offsets(args.hybrid_coast_offsets)
+    cands: list[base.Candidate] = []
+    occupied: list[base.Candidate] = []
+    ranked_states = sorted(states, key=lambda st: tbd.verified_score(st), reverse=True)
+    for st in ranked_states[: args.hybrid_coast_top_k]:
+        if st.misses > args.hybrid_coast_max_misses:
+            continue
+        base_bbox = warp_bbox(st.bbox, frame_h, w_img, h_img)
+        bx, by, bw, bh = base_bbox
+        for dx, dy in offsets:
+            bbox = base.clip_bbox_float((bx + st.vx + dx, by + st.vy + dy, bw, bh), w_img, h_img)
+            mask = np.zeros_like(cur_g, dtype=np.uint8)
+            x, y, w, h = bbox
+            mask[y : y + h, x : x + w] = 255
+            cand = base.candidate_score("hybrid_coast", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+            state_score = max(0.0, min(12.0, tbd.verified_score(st)))
+            cand.map_score = float(state_score)
+            cand.score = 0.70 * cand.score + args.hybrid_coast_score_weight * state_score
+            if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
+                continue
+            occupied.append(cand)
+            cands.append(cand)
+            if len(cands) >= args.hybrid_coast_top_k:
+                return sorted(cands, key=lambda c: c.score, reverse=True)
+    return sorted(cands, key=lambda c: c.score, reverse=True)
+
+
+def candidate_scenario(cand: base.Candidate) -> str:
+    if cand.source == "hybrid_coast":
+        return "coast"
+    if cand.source == "large_dark" or max(cand.bbox[2], cand.bbox[3]) >= 10:
+        return "large"
+    sky = float(getattr(cand, "sky_like", 0.0))
+    texture = float(getattr(cand, "texture", 0.0))
+    line = float(getattr(cand, "line_context", 0.0))
+    if sky >= 0.25 and texture < 45.0 and line < 0.55:
+        return "sky"
+    if sky < 0.10 or texture >= 45.0:
+        return "surface"
+    return "boundary"
+
+
+def scenario_balanced_candidates(cands: list[base.Candidate], args: argparse.Namespace) -> list[base.Candidate]:
+    if not args.scenario_balance:
+        return dedupe_candidates(cands, args.top_k_candidates)
+    quotas = {
+        "sky": max(0, args.scenario_sky_top_k),
+        "surface": max(0, args.scenario_surface_top_k),
+        "boundary": max(0, args.scenario_boundary_top_k),
+        "large": max(0, args.scenario_large_top_k),
+        "coast": max(0, args.scenario_coast_top_k),
+    }
+    kept: list[base.Candidate] = []
+    by_bucket: dict[str, list[base.Candidate]] = {k: [] for k in quotas}
+    for cand in sorted(cands, key=lambda c: c.score, reverse=True):
+        by_bucket.setdefault(candidate_scenario(cand), []).append(cand)
+    for bucket, quota in quotas.items():
+        for cand in by_bucket.get(bucket, [])[:quota]:
+            if len(kept) >= args.top_k_candidates:
+                return kept
+            if not candidate_duplicate(cand, kept):
+                kept.append(cand)
+    for cand in sorted(cands, key=lambda c: c.score, reverse=True):
+        if len(kept) >= args.top_k_candidates:
+            break
+        if not candidate_duplicate(cand, kept):
+            kept.append(cand)
+    return kept
 
 
 def candidate_obs(c: base.Candidate, args: argparse.Namespace) -> float:
@@ -1873,14 +1971,29 @@ def run(args: argparse.Namespace) -> None:
             cur_g,
             args,
         )
-        cands = dedupe_candidates(
-            motion_cands + app_cands + map_cands + native_cands + large_dark_cands + stack_cands,
-            args.top_k_candidates,
+        hybrid_coast_cands = hybrid_coast_candidates(
+            tbd.states,
+            tbd,
+            chosen["h"],
+            w_img,
+            h_img,
+            residual_blur,
+            app_resp,
+            cur_g,
+            args,
         )
+        raw_cands = motion_cands + app_cands + map_cands + native_cands + large_dark_cands + stack_cands + hybrid_coast_cands
+        if args.scenario_balance:
+            pool_n = max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
+            cands = dedupe_candidates(raw_cands, pool_n)
+        else:
+            cands = dedupe_candidates(raw_cands, args.top_k_candidates)
         assign_attached_support(cands, cur_g)
         if args.native_roi_score:
             assign_native_roi_scores(cands, cur_full, args.downscale)
         assign_sky_context(cands, cur_g)
+        if args.scenario_balance:
+            cands = scenario_balanced_candidates(cands, args)
 
         states = tbd.update(fno, cands, signed_diff, signed_sigma, w_img, h_img, chosen["h"], residual_blur, app_resp)
         selected = tbd.best()
@@ -1959,6 +2072,7 @@ def run(args: argparse.Namespace) -> None:
             "n_native_candidates": len(native_cands),
             "n_large_dark_candidates": len(large_dark_cands),
             "n_temporal_stack_candidates": len(stack_cands),
+            "n_hybrid_coast_candidates": len(hybrid_coast_cands),
             "n_tracks": len(states),
             "selected": selected_json,
             "kinematic_reject": None,

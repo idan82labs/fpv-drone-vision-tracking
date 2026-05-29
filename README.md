@@ -74,6 +74,14 @@ artifacts/surface_xy_ranker_v2/
 
 It contains split summaries and the first leave-one-clip-out surface-ranker result. Current read: the harness is useful, but the v2 model should not replace the selector yet because it does not generalize cleanly to aaf1 when held out.
 
+The latest hybrid proposal/coast experiment is:
+
+```text
+artifacts/hybrid_surface_v1/
+```
+
+It adds experimental `--hybrid_coast_proposals` and `--scenario_balance` flags. The current result is mixed: it improves aaf1 textured/non-sky frames but hurts clean-sky and e271, so it is not a default pipeline.
+
 ## Fly.io Deployment
 
 Use the example config, set secrets, then deploy:

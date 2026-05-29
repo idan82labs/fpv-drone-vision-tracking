@@ -56,6 +56,16 @@ From the surface-background harness:
 
 Interpretation: do not blindly replace the selector with the surface ranker yet. Keep the harness, collect more true tree/grass labels, and use a background-conditioned selector.
 
+From the hybrid proposal/coast experiment:
+
+- Added experimental `--hybrid_coast_proposals` and `--scenario_balance` flags.
+- On aaf1 textured/non-sky frames, strict improved from 86.7% to 93.3%.
+- On aaf1 clean sky frames, strict dropped from 98.9% to 93.2%.
+- On e271 large-dark textured/non-sky frames, strict dropped from 59.9% to 57.5%.
+- Runtime also worsened materially.
+
+Interpretation: keep hybrid as an explicit surface-mode experiment only. It is not ready as a global default.
+
 ## Next Meaningful Work
 
 1. Train a tube-level ranker on hard top-tube alternatives.

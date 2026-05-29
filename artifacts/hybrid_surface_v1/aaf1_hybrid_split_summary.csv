@@ -1,0 +1,6 @@
+bg_split,frames,selected_frames,oracle_hit,oracle_recall,strict_hit,strict_recall,loose_hit,loose_recall
+ALL,493,493,493,1.0,458,0.929,478,0.9696
+boundary_mixed,65,65,65,1.0,59,0.9077,64,0.9846
+clean_sky,351,351,351,1.0,327,0.9316,338,0.963
+textured_non_sky,75,75,75,1.0,70,0.9333,74,0.9867
+unknown,2,2,2,1.0,2,1.0,2,1.0
