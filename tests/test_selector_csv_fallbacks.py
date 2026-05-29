@@ -5,6 +5,7 @@ from pathlib import Path
 
 from scripts import analyze_selector_disagreements as disagreements
 from scripts import evaluate_mode_supervisor as supervisor
+from scripts import seed_selector_disagreement_review_labels as seed_review
 
 
 def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
@@ -16,6 +17,20 @@ def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 class SelectorCsvFallbackTests(unittest.TestCase):
+    def test_seed_review_labels_map_binary_router_targets(self):
+        self.assertEqual(
+            seed_review.router_label({"category": "a_visible_hit_b_miss", "visible": "1"}),
+            "protect_continuous_visible",
+        )
+        self.assertEqual(seed_review.binary_mode_target("protect_continuous_visible"), "viterbi")
+        self.assertEqual(seed_review.router_label({"category": "a_false_b_suppressed", "visible": "0"}), "hard_null_use_hmm")
+        self.assertEqual(seed_review.binary_mode_target("hard_null_use_hmm"), "hmm")
+        self.assertEqual(
+            seed_review.router_label({"category": "both_null_false_box", "visible": "0"}),
+            "hard_null_needs_override",
+        )
+        self.assertEqual(seed_review.binary_mode_target("hard_null_needs_override"), "")
+
     def test_supervisor_crop_features_are_explicit(self):
         self.assertNotIn("crop_stack_score", supervisor.active_base_features(False))
         self.assertIn("crop_stack_score", supervisor.active_base_features(True))
@@ -74,6 +89,61 @@ class SelectorCsvFallbackTests(unittest.TestCase):
 
             self.assertEqual(sorted(selected), [10])
             self.assertEqual(selected[10]["x"], "20")
+
+    def test_supervisor_reviewed_examples_use_binary_mode_target(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "review.csv"
+            with path.open("w", newline="") as f:
+                writer = csv.DictWriter(
+                    f,
+                    fieldnames=[
+                        "clip",
+                        "frame",
+                        "binary_mode_target",
+                        "router_label",
+                        "false_lock_kind",
+                        "review_confidence",
+                    ],
+                )
+                writer.writeheader()
+                writer.writerows(
+                    [
+                        {
+                            "clip": "clip_a",
+                            "frame": "1",
+                            "binary_mode_target": "hmm",
+                            "router_label": "hard_null_use_hmm",
+                            "false_lock_kind": "cloud_sky_speck",
+                            "review_confidence": "high",
+                        },
+                        {
+                            "clip": "clip_a",
+                            "frame": "2",
+                            "binary_mode_target": "viterbi",
+                            "router_label": "protect_continuous_visible",
+                            "false_lock_kind": "visible_mode_error",
+                            "review_confidence": "high",
+                        },
+                        {
+                            "clip": "clip_a",
+                            "frame": "3",
+                            "binary_mode_target": "",
+                            "router_label": "hard_null_needs_override",
+                            "false_lock_kind": "tree_edge",
+                            "review_confidence": "medium_high",
+                        },
+                    ]
+                )
+
+            examples, y, clips, frames = supervisor.reviewed_examples(
+                path,
+                {("clip_a", 1): {}, ("clip_a", 2): {}, ("clip_a", 3): {}},
+            )
+
+            self.assertEqual([row["category"] for row in examples], ["hard_null_use_hmm", "protect_continuous_visible"])
+            self.assertEqual(y.tolist(), [1, 0])
+            self.assertEqual(clips.tolist(), ["clip_a", "clip_a"])
+            self.assertEqual(frames.tolist(), [1, 2])
 
     def test_supervisor_reader_accepts_sequence_selected_tracks(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -1246,3 +1246,53 @@ from this loop is the disagreement packet plus a reproducible router harness.
 The next real gain likely requires new labels/features from that packet,
 especially false-lock taxonomy and candidate-local visual context, rather than
 reusing the same scalar top-tube fields in different combinations.
+
+Seeded router review labels:
+
+- Added `scripts/seed_selector_disagreement_review_labels.py` to convert the
+  rendered selector-disagreement packet into conservative first-pass training
+  labels. These are not a substitute for human review; they are a reproducible
+  seed from the contact-sheet inspection pass.
+- Generated:
+  `artifacts/selector_disagreement_review_packet_crop_score_vs_hmm_s9b70_v1/selector_disagreement_review_index_codex_seed_v1.csv`.
+- Seeded packet counts:
+  - `255` rows total;
+  - `router_label`: `139` hard-null-use-HMM, `68`
+    protect-continuous-visible, `31` hard-null-needs-override, `12`
+    visible-reselect-needed, `4` HMM-can-track-visible, `1`
+    visible-acquisition-miss;
+  - `false_lock_kind`: `90` cloud/sky speck, `85` visible-mode error,
+    `28` tree/terrain edge, `14` skyline/cloud edge, `13`
+    terrain/tree edge, `10` terrain/horizon texture, `8` sky-haze speck,
+    `7` horizon/field texture;
+  - binary router targets: `143` HMM, `68` Viterbi, `44` intentionally
+    blank because both selector families were wrong or the case needs a
+    no-box/reselect policy rather than a binary HMM-vs-Viterbi choice.
+- `scripts/evaluate_mode_supervisor.py` now accepts `--review_labels` and
+  trains the HMM/Viterbi router only on rows with `binary_mode_target`.
+- Review-label logistic supervisor:
+  - examples: `211`;
+  - OOF AUC: `0.8252`;
+  - OOF accuracy at 0.5: `0.8199`;
+  - OOF balanced accuracy at 0.5: `0.8054`.
+- Full-frame routed operating points:
+  - threshold `0.1`: `77.39%` strict / `82.52%` loose / `83.55%`
+    invisible no-box;
+  - threshold `0.2`: `77.46%` strict / `82.64%` loose / `79.93%`
+    invisible no-box;
+  - threshold `0.9`: `77.27%` strict / `82.83%` loose / `43.42%`
+    invisible no-box.
+- Per-clip threshold `0.1` read:
+  - strong: `1c`, `529`, `59e`, `7bd`, `b96`, `d129`, `e6`;
+  - still weak: `e271` continuous-visible recall (`58.94%` strict,
+    `63.09%` loose) and aaf1 invisible no-box (`21.43%`).
+
+Interpretation: seeded review labels produce a real but moderate Pareto
+improvement over the previous plain logistic router (`76.84%` strict /
+`82.21%` loose / `80.59%` invisible no-box at threshold `0.2`). The best
+practical point from this pass is threshold `0.1`: it preserves more recall
+than the conservative HMM branch while restoring much more no-box behavior than
+the permissive crop-score branch. It is still not production-safe. The next
+algorithmic work should focus on the two explicit remaining failures: e271
+continuous-visible protection and aaf1 hard-null override, not global threshold
+tuning.

@@ -132,6 +132,7 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--labels", required=True)
     p.add_argument("--disagreements", required=True)
+    p.add_argument("--review_labels", default="", help="Optional reviewed packet CSV with binary_mode_target=hmm/viterbi.")
     p.add_argument("--results_dir", required=True)
     p.add_argument("--viterbi_dir", required=True)
     p.add_argument("--hmm_dir", required=True)
@@ -517,6 +518,39 @@ def disagreement_examples(
     return examples, y_arr, clips, frames
 
 
+def reviewed_examples(
+    path: Path,
+    features: dict[tuple[str, int], dict[str, float]],
+) -> tuple[list[dict[str, Any]], np.ndarray, np.ndarray, np.ndarray]:
+    examples: list[dict[str, Any]] = []
+    for row in read_csv(path):
+        raw_target = row.get("binary_mode_target", "").strip().lower()
+        if raw_target == "hmm":
+            y = 1
+        elif raw_target == "viterbi":
+            y = 0
+        else:
+            continue
+        clip = row["clip"]
+        frame = int(float(row["frame"]))
+        if (clip, frame) not in features:
+            continue
+        examples.append(
+            {
+                "clip": clip,
+                "frame": frame,
+                "category": row.get("router_label", row.get("category", "")),
+                "false_lock_kind": row.get("false_lock_kind", ""),
+                "review_confidence": row.get("review_confidence", ""),
+                "y": y,
+            }
+        )
+    y_arr = np.asarray([int(row["y"]) for row in examples], dtype=np.int32)
+    clips = np.asarray([str(row["clip"]) for row in examples])
+    frames = np.asarray([int(row["frame"]) for row in examples], dtype=np.int32)
+    return examples, y_arr, clips, frames
+
+
 def vectorize(keys: list[tuple[str, int]], features: dict[tuple[str, int], dict[str, float]], feature_names: list[str]) -> np.ndarray:
     x = np.zeros((len(keys), len(feature_names)), dtype=np.float32)
     for i, key in enumerate(keys):
@@ -628,7 +662,10 @@ def main() -> None:
         base_features=base_features,
         include_branch_context=args.include_branch_context,
     )
-    examples, y, example_clips, _ = disagreement_examples(Path(args.disagreements), features)
+    if args.review_labels:
+        examples, y, example_clips, _ = reviewed_examples(Path(args.review_labels), features)
+    else:
+        examples, y, example_clips, _ = disagreement_examples(Path(args.disagreements), features)
     if len(set(y.tolist())) < 2:
         raise SystemExit("need both HMM-positive and Viterbi-positive disagreement examples")
 
@@ -739,6 +776,7 @@ def main() -> None:
             {
                 "labels": args.labels,
                 "disagreements": args.disagreements,
+                "review_labels": args.review_labels,
                 "results_dir": args.results_dir,
                 "viterbi_dir": args.viterbi_dir,
                 "hmm_dir": args.hmm_dir,
