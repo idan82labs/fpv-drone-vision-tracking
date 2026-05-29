@@ -653,20 +653,68 @@ not switch when the true target appears in nearby top alternatives. Next work
 should be explicit false-lock/null state handling or retraining on current
 top-tube hard alternatives, not more broad threshold/runtime tuning.
 
+Current-runtime top-tube retrain and aaf1 proposal-recovery pass:
+
+- Exported current bounded-runtime top tubes for all 9 dense-labeled clips to
+  `artifacts/current_runtime_top_tubes_v2`.
+- Aggregate current-top-tube audit, high/medium-high labels:
+  - oracle@80: 92.5%;
+  - baseline `verified_score` strict: 69.6%, loose: 74.5%;
+  - best direct LOCO ranker (`hist_gbdt`) strict: 70.7%, loose: 76.8%.
+- Per-clip result shows the aggregate hides the real blocker:
+  - e6 is now healthy enough as a top-tube/ranking problem:
+    oracle@80 100%, baseline strict 90.3%, loose 93.1%.
+  - aaf1 is not healthy under bounded candidate-local stack:
+    oracle@80 61.7%, baseline strict/loose 11.7%.
+  - d129 and e271 have good-to-moderate oracle but poor selection, so they are
+    still selector/null-calibration problems.
+- aaf1 proposal-recovery sweep:
+  - bounded candidate-local stack variants did not recover aaf1 oracle
+    (roughly 60-62% oracle@80).
+  - full-frame temporal stack + large-dark proposals recovers aaf1 oracle:
+    old all-stack reference oracle@80 98.3%, but avg runtime 146 ms/frame.
+  - bounded full-stack + large-dark top60/beam70 gives oracle@20 96.7% and
+    baseline loose 60.0%, but is still too slow at 125.8 ms/frame average.
+  - candidate-local stack seeded by large-dark did not recover the same oracle
+    and was slower than expected.
+- Ranker transfer result:
+  - A ranker trained on other clips does not transfer to aaf1 even when the
+    full-stack candidates are present.
+  - The same `hist_gbdt` feature set trained including aaf1 ranks the recovered
+    aaf1 candidates well: 83.3% strict and 100% loose on labeled aaf1 frames
+    when selecting from top candidates.
+  - Running the detector with that all-fit ranker gives 86.7% strict and 100%
+    loose on the labeled aaf1 frames, but this is explicitly not a held-out
+    result and the runtime is not deployable (194 ms/frame average with
+    delayed sequence and ranker scoring).
+
+Interpretation: the next jump is not more generic thresholding. aaf1 needs more
+aaf1-like surface labels or an explicit target-vs-background alignment feature
+that transfers; current scalar features can rank the clip once trained on it,
+but they do not generalize from other videos. Runtime-wise, the useful oracle
+source is full-frame temporal stack + large-dark proposals, and the next code
+task is to convert that into a cheaper candidate/local/teacher pathway without
+losing the recovered oracle.
+
 ## Next Meaningful Work
 
 1. Add explicit false-lock/null state handling or train a current-top-tube
    ranker on the aaf1/e6 hard alternatives; verify it can switch away from the
    early aaf1 false map tube when the true target appears.
-2. Reproduce the CLBA+hysteresis sequence result on at least one more true
+2. Turn the aaf1 full-stack + large-dark oracle source into a cheaper path:
+   first as an offline teacher/hard-negative miner, then as a candidate-local
+   or low-confidence surface branch. Do not make the 125-194 ms/frame path a
+   runtime default.
+3. Add more true surface labels from clips that resemble aaf1, not just skyline
+   or clean-sky cases. The transfer failure says the current training set does
+   not cover this domain.
+4. Reproduce the CLBA+hysteresis sequence result on at least one more true
    tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
    unless visually verified.
-3. Keep improving the frame/candidate router so delayed sequence selection only
+5. Keep improving the frame/candidate router so delayed sequence selection only
    pays the extra cost in surface-backed states.
-4. Reproduce the full-video OOF state-ranker harness on at least one more
+6. Reproduce the full-video OOF state-ranker harness on at least one more
    complete clip, then integrate null handling only if the null/visible tradeoff
    survives.
-5. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
-   d129-like frames to human review.
-6. Train null-aware tube rankers with explicit no-target/hallucination
+7. Train null-aware tube rankers with explicit no-target/hallucination
    negatives.
