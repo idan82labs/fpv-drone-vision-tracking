@@ -69,18 +69,20 @@ Interpretation: keep hybrid as an explicit surface-mode experiment only. It is n
 From the first GPT vision surface-label expansion:
 
 - Added `scripts/make_surface_continuity_packet.py` to build continuous non-sky review packets with full-frame and crop sheets.
+- Added `scripts/profile_target_background_router.py` to split immediate target background from wider scene context.
 - Visually reviewed aaf1/e6/1c/7bd/529/b96/59e/d129 packets.
 - Important correction: the automatic `textured_non_sky` split is over-broad. Many "textured" labels are still sky/cloud/horizon-backed, not true tree/grass/terrain-backed.
 - Promoted 23 high-confidence b96/59e horizon-surface labels.
 - Held out d129 tree-line candidates for human review because visual confidence was below 0.8.
 - Apples-to-apples LOCO against `surface_ranker_top_tubes_v1`: baseline strict = 80.4%, best learned strict = 79.4%.
+- A conservative state-machine selector, using ExtraTrees only for `surface_backed` router frames and baseline elsewhere, improved strict to 81.0% and loose to 88.6%.
 
-Interpretation: the new labels improve coverage, but they do not justify integrating the learned surface selector. The dataset gap is still real: we need more true target-over-tree/grass/terrain labels, not broader horizon/skyline labels.
+Interpretation: the new labels improve coverage, but they do not justify a global learned selector. A state-conditioned selector is more promising: learned ranking helps true surface-backed frames and hurts skyline-adjacent sky frames.
 
 ## Next Meaningful Work
 
 1. Collect or generate true target-over-tree/grass/terrain labels; route ambiguous d129-like frames to human review.
-2. Tighten the background router so `textured_non_sky` does not mix clean sky, skyline, cloud, and true surface cases.
-3. Train a tube-level ranker on hard top-tube alternatives after the surface-positive dataset is less biased.
-4. Add target-aligned versus background-aligned crop-stack features.
-5. Calibrate thresholds from null-window max-score distributions.
+2. Improve the background router until it cleanly separates sky, skyline, cloud texture, and true surface-backed targets.
+3. Keep the state-machine selector path: learned ranker only in states where LOCO shows benefit.
+4. Train a tube-level ranker on hard top-tube alternatives after the surface-positive dataset is less biased.
+5. Add target-aligned versus background-aligned crop-stack features.
