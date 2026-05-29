@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 from collections import defaultdict
 from pathlib import Path
 from typing import Any
@@ -33,7 +34,17 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--labels", required=True)
     p.add_argument("--results_dir", required=True)
-    p.add_argument("--model", required=True)
+    p.add_argument("--model", default="", help="Surface ranker .joblib. Omit when --pre_scored is set.")
+    p.add_argument(
+        "--pre_scored",
+        action="store_true",
+        help="Use score columns already present in top_tubes.csv instead of applying --model.",
+    )
+    p.add_argument(
+        "--score_column",
+        default="learned_score",
+        help="Column to copy into learned_score when --pre_scored is set.",
+    )
     p.add_argument("--out_dir", required=True)
     p.add_argument("--max_rank", type=int, default=20)
     p.add_argument("--max_jump_px", type=float, default=12.0)
@@ -99,6 +110,18 @@ def parse_modes(raw: str) -> list[dict[str, Any]]:
     if not modes:
         raise SystemExit("no modes parsed")
     return modes
+
+
+def validate_score_value(value: Any, column: str, top_path: Path) -> str:
+    if value in (None, ""):
+        raise SystemExit(f"--score_column {column!r} is blank in {top_path}")
+    try:
+        numeric = float(value)
+    except Exception as exc:
+        raise SystemExit(f"--score_column {column!r} is non-numeric in {top_path}: {value!r}") from exc
+    if not math.isfinite(numeric):
+        raise SystemExit(f"--score_column {column!r} is non-finite in {top_path}: {value!r}")
+    return str(value)
 
 
 def labels_by_clip(path: Path) -> dict[str, list[dict[str, str]]]:
@@ -305,7 +328,9 @@ def main() -> None:
     modes = parse_modes(args.modes)
     grouped_labels = labels_by_clip(Path(args.labels))
     results_dir = Path(args.results_dir)
-    model_path = Path(args.model)
+    model_path = Path(args.model) if args.model else None
+    if not args.pre_scored and model_path is None:
+        raise SystemExit("--model is required unless --pre_scored is set")
     per_clip: list[dict[str, Any]] = []
     aggregate_by_mode: dict[str, list[dict[str, Any]]] = defaultdict(list)
 
@@ -316,7 +341,22 @@ def main() -> None:
         rows = selector.load_ranked_rows(top_path, args.max_rank)
         if not rows:
             continue
-        scored, _meta = selector.score_rows(rows, model_path)
+        if args.pre_scored:
+            scored = []
+            for row in rows:
+                out = dict(row)
+                if args.score_column not in out:
+                    raise SystemExit(f"--score_column {args.score_column!r} not found in {top_path}")
+                if args.score_column != "learned_score":
+                    out["base_learned_score"] = out.get("learned_score", "")
+                    out["learned_score"] = validate_score_value(out.get(args.score_column), args.score_column, top_path)
+                else:
+                    out["learned_score"] = validate_score_value(out.get("learned_score"), "learned_score", top_path)
+                scored.append(out)
+            _meta = {"pre_scored": True, "score_column": args.score_column}
+        else:
+            assert model_path is not None
+            scored, _meta = selector.score_rows(rows, model_path)
         by_frame = selector.group_by_frame(scored)
         write_csv(out_dir / "scored" / f"{clip}.csv", scored)
         for mode in modes:
@@ -348,6 +388,8 @@ def main() -> None:
                 "labels": args.labels,
                 "results_dir": args.results_dir,
                 "model": args.model,
+                "pre_scored": args.pre_scored,
+                "score_column": args.score_column,
                 "max_rank": args.max_rank,
                 "modes": modes,
                 "strict_tol_px": args.strict_tol_px,

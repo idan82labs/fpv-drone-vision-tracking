@@ -1097,3 +1097,55 @@ data step should target the exported `hist_gbdt_pair_failures.csv` frames,
 especially aaf1/d129 false competitors. The next algorithm step is to score
 top-tube alternatives with this crop-stack verifier and test it as an
 observation/ranker input, still offline before any runtime integration.
+
+Crop-stack top-tube integration probe:
+
+- Added `scripts/apply_crop_stack_verifier.py` to apply a trained crop-stack
+  verifier to exported `top_tubes.csv` alternatives. The first run scored the
+  top-20 alternatives from all 9 CLBA top-tube clips:
+  - artifact: `artifacts/crop_stack_scored_top20_v1`;
+  - rows scored: `37,274`;
+  - model: `artifacts/crop_stack_verifier_multiclip_v2/hist_gbdt_crop_stack_verifier.joblib`;
+  - window radius: `4`, crop size: `31`, patch size: `11`.
+- Direct replacement of `learned_score` with `crop_stack_score` was negative:
+  - `crop_viterbi_w9`: `72.82%` strict / `78.57%` loose / `3.29%`
+    invisible no-box;
+  - `crop_score`: `66.89%` strict / `72.02%` loose / `3.29%` invisible
+    no-box;
+  - `crop_hmm`: `65.10%` strict / `71.96%` loose / `61.84%` invisible
+    no-box.
+- Training the normal surface ranker with crop-stack fields included was
+  positive under leave-one-clip-out evaluation:
+  - artifact: `artifacts/surface_xy_ranker_with_crop_stack_top20_v1`;
+  - examples: `32,062`, with `3,217` positives and `28,845` negatives;
+  - direct HGBDT LOCO: `77.74%` strict / `85.07%` loose;
+  - prior comparable CLBA-null ranker: `73.08%` strict / `82.12%` loose;
+  - prior mixed CLBA top-60 ranker: `75.63%` strict / `82.63%` loose.
+- Deployment-model selector probe, using the all-fit crop-stack-feature ranker
+  and therefore optimistic:
+  - `crop_ranker_score`: `77.70%` strict / `83.38%` loose / `3.29%`
+    invisible no-box;
+  - `crop_ranker_viterbi_w9`: `74.92%` strict / `80.36%` loose / `3.29%`
+    invisible no-box;
+  - `crop_ranker_hmm`: `68.56%` strict / `77.27%` loose / `92.76%`
+    invisible no-box.
+- A bounded HMM sweep found a better null-risk operating point:
+  - best useful mode:
+    `hmm_s9_b70_m40_c0`
+    (`score_scale=0.9`, `birth=0.7`, `miss=0.4`,
+    `track_bonus=0.15`, `clutter=0.0`);
+  - aggregate: `74.61%` strict / `79.43%` loose / `89.80%` invisible
+    no-box;
+  - same strict recall was also seen at slightly lower birth penalties, with
+    `88.82-89.47%` invisible no-box.
+
+Interpretation: crop-stack is not a standalone selector score. It is useful as
+an additional feature family inside the existing surface ranker. The tuned HMM
+is the best current null-risk/surface selector mode because it keeps most of the
+Viterbi recall while suppressing almost 90% of invisible frames. It is not a
+global default: per-clip results still show e271 continuous-visible recall around
+`52.79%` strict under the HMM route, while aaf1/e6/d129 improve materially. In
+production terms, this supports a routed design: use the crop-stack-feature
+ranker everywhere it is affordable, but use HMM/no-box behavior only when the
+candidate-local router says surface/null-risk/low-confidence; keep continuous
+visible shots on the permissive score/Viterbi branch unless null evidence rises.

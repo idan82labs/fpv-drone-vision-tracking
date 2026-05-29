@@ -37,6 +37,8 @@ bundle.
 - `train_surface_xy_ranker.py` - train/check surface candidate rankers.
 - `train_crop_stack_verifier.py` - offline hard-alternative target/background
   crop-stack verifier probe.
+- `apply_crop_stack_verifier.py` - apply a trained crop-stack verifier to
+  exported top-tube rows for offline selector evaluation.
 - `train_acquisition_null_ranker.py` - train/check acquisition/null filtering.
 - `augment_top_tubes_alignment_features.py` - add offline candidate-local
   background-alignment (`clba_*`) columns to exported top tubes.
