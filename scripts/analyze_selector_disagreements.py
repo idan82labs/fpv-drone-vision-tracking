@@ -76,6 +76,8 @@ def labels_by_clip(path: Path) -> dict[str, list[dict[str, str]]]:
 def selected_by_frame(selector_dir: Path, clip: str) -> dict[int, dict[str, str]]:
     path = selector_dir / clip / "selected_tracks.csv"
     if not path.exists():
+        path = selector_dir / clip / "sequence_selected_tracks.csv"
+    if not path.exists():
         return {}
     out: dict[int, dict[str, str]] = {}
     for row in read_csv(path):

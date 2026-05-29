@@ -1159,3 +1159,66 @@ production terms, this supports a routed design: use the crop-stack-feature
 ranker everywhere it is affordable, but use HMM/no-box behavior only when the
 candidate-local router says surface/null-risk/low-confidence; keep continuous
 visible shots on the permissive score/Viterbi branch unless null evidence rises.
+
+Current crop-ranker / HMM router check:
+
+- Fixed the router/disagreement harnesses to read both historical
+  `selected_tracks.csv` and current `sequence_selected_tracks.csv` outputs.
+  Without this fallback, current sequence-selector artifacts can be silently
+  counted as empty selections.
+- New disagreement artifact:
+  `artifacts/selector_disagreements_crop_score_vs_hmm_s9b70_v1`.
+- Current selector-family split:
+  - permissive crop-ranker score branch:
+    `77.70%` strict / `83.38%` loose / `3.29%` invisible no-box;
+  - conservative HMM branch `hmm_s9_b70_m40_c0`:
+    `74.61%` strict / `79.43%` loose / `89.80%` invisible no-box.
+- Logistic mode-supervisor trained on disagreement rows:
+  - examples: `331`;
+  - OOF AUC: `0.822`;
+  - balanced accuracy at 0.5: `0.786`.
+- Routed operating points:
+  - threshold `0.2`: `76.84%` strict / `82.21%` loose / `80.59%`
+    invisible no-box;
+  - threshold `0.4`: `77.02%` strict / `82.40%` loose / `76.64%`
+    invisible no-box;
+  - threshold `0.9`: `77.33%` strict / `82.71%` loose / `51.97%`
+    invisible no-box.
+- HGBDT supervisor was rejected: OOF AUC `0.180`, indicating inversion/overfit
+  on the current disagreement set.
+- Continuous-streak Viterbi protection was tested at streaks `60`, `90`, `120`,
+  and `150`. It only added a small recall lift and gave back too much null
+  suppression. Best practical read remains the plain logistic router, not
+  streak forcing.
+- Per-clip read at threshold `0.2`:
+  - healthy: `1c`, `529`, `59e`, `7bd`, `b96`, `d129`, `e6`;
+  - still weak: `e271` continuous-visible recall (`58.37%` strict,
+    `62.52%` loose) and aaf1 invisible no-box (`21.43%`).
+
+Interpretation: this is the first useful Pareto router between the permissive
+branch and the conservative HMM branch, but it is not production-safe yet. It
+recovers most of the permissive recall while preserving much of the HMM null
+suppression. The remaining blocker is exactly the production router problem:
+e271-style continuous-visible shots still need protection from HMM/no-box
+behavior, while aaf1-style near-null hard-surface clutter still needs stronger
+suppression. The next useful work is targeted router features/labels for those
+two disagreement regimes, not another broad threshold sweep.
+
+Router-disagreement review packet:
+
+- Added `scripts/make_selector_disagreement_review_packet.py`.
+- Built
+  `artifacts/selector_disagreement_review_packet_crop_score_vs_hmm_s9b70_v1/`.
+- Packet contents:
+  - `255` rendered disagreement frames;
+  - `46` contact sheets;
+  - biggest buckets: `80` d129 permissive false boxes suppressed by HMM,
+    `57` e271 visible hits suppressed by HMM, `27` e6 hard nulls, `22` aaf1
+    both-branch null false boxes.
+- This packet is the right next annotation/training target because it directly
+  captures the production router conflict instead of sampling random frames.
+
+Interpretation: the next label pass should not be broad manual tagging. It
+should fill this packet's `false_lock_kind`, `router_label`, and target fields.
+That data can train a router on exactly the two bad regimes: e271
+continuous-visible protection and aaf1/d129 hard-surface null suppression.
