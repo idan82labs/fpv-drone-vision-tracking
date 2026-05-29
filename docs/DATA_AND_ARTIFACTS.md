@@ -18,6 +18,16 @@ This repository includes only curated data.
   - A few diagnostic sheets used to justify vision-assisted gap filling.
 - `artifacts/state_machine_selector_d129_v1/`
   - Complete-video d129 acquisition/null selector sweep and its input CSVs.
+- `artifacts/surface_training_v2_vision_checked/`
+  - Strictly promoted non-sky/surface-backed labels from visual review. This is
+    intentionally smaller than the router `surface_backed` set.
+- `artifacts/surface_e271_631_698_xy_ranker_v1/`
+  - e271 terrain-tail candidate-ranker cross-validation artifact.
+- `artifacts/surface_e271_631_698_sequence_ranker_v1/`
+  - e271 terrain-tail learned-score plus continuity/Viterbi selector artifact.
+- `artifacts/runtime_e271_router_surface_tail_v1/`
+  - e271 full-clip runtime benchmark for baseline, auto router, and forced
+    surface mode.
 
 ## Excluded
 

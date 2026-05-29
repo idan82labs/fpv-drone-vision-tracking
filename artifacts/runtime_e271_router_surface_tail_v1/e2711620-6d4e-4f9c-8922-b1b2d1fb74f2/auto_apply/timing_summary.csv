@@ -1,0 +1,11 @@
+block,avg_ms,p90_ms
+preprocess,0.049,0.052
+frame_router,0.159,0.175
+motion_model,1.55,1.946
+residual_masks,1.857,2.257
+cheap_proposals,4.117,5.811
+surface_extra_proposals,1.785,3.405
+context_router,1.723,3.309
+scenario_balance,0.006,0.009
+tbd_update,5.664,10.146
+export_selection,0.064,0.239

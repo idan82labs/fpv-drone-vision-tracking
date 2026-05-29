@@ -1,0 +1,11 @@
+{
+  "accepted_rows": 74,
+  "accepted_e271_rows": 68,
+  "accepted_7bd_rows": 6,
+  "source_profile": "/tmp/next_batch_router_profile_v3/background_router_profile.csv",
+  "notes": [
+    "This is a strict promoted surface set from explicit visual inspection, not every router surface_backed row.",
+    "1c router-surface ranges were excluded after visual check because they are mostly skyline/near-horizon, not true surface-backed.",
+    "e271 frames 631-698 are the main usable terrain/road/grass-backed continuity segment for this pass."
+  ]
+}

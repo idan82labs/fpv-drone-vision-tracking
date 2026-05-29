@@ -169,18 +169,48 @@ From the first full-video OOF state-ranker harness:
   strong evidence that null-aware candidate scores are the right selector input,
   but it should not become a default until reproduced on another complete clip.
 
+From the second vision-checked surface pass:
+
+- Re-profiled the next-batch labels with the target-local router.
+- Strictly promoted only visually checked surface-backed labels:
+  - e271 frames 631-698: 68 terrain/road/grass-backed visible frames.
+  - 7bd frames 583-588: 6 short close surface-backed frames.
+- Rejected the 1c router-surface ranges for this pass because visual review
+  showed they are mostly skyline/near-horizon, not true tree/grass/terrain
+  training data.
+- On e271 631-698, top-80 oracle was 68/68 = 100%.
+- Native `verified_score` selected only 20/68 strict = 29.4%.
+- OOF logistic framewise ranker selected 64/68 strict = 94.1%.
+- The four remaining misses were continuity/ranking failures, including two
+  road/texture jumps while the correct target tube was still present.
+- Added `scripts/evaluate_xy_sequence_ranker.py`.
+- OOF logistic scores plus a simple Viterbi continuity selector reached
+  68/68 strict = 100% on that segment.
+- Runtime over the full e271 clip, including the hard tail:
+  - baseline pair-rescue: 15.70 ms/frame average, 24.55 ms p90.
+  - auto router/apply: 16.97 ms/frame average, 26.27 ms p90.
+  - forced surface mode: 17.14 ms/frame average, 26.81 ms p90.
+
+Interpretation: this is the strongest evidence so far that the surface problem
+is not just proposal recovery. In the checked e271 terrain segment, the target
+is already in the top-tube pool; the failure is selecting a coherent target
+sequence over intermittent road/terrain clutter. The result is still
+single-segment and should not be promoted as a global default until repeated on
+another true tree/grass clip with no-target frames.
+
 ## Next Meaningful Work
 
-1. Reproduce the full-video OOF state-ranker harness on at least one more
+1. Reproduce the surface sequence-ranker result on at least one more true
+   tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
+   unless visually verified.
+2. Integrate the acquisition/null selector and the surface continuity selector
+   behind explicit flags in `tbd_motion_detector.py`, driven by learned/OOF
+   scores rather than native detector scores.
+3. Reproduce the full-video OOF state-ranker harness on at least one more
    complete clip, then integrate only if the null/visible tradeoff survives.
-2. Integrate the acquisition/null selector behind explicit flags in
-   `tbd_motion_detector.py`, driven by learned/OOF scores rather than native
-   detector scores.
-3. Improve the frame router so it does not over-classify e271/aaf1-like ridge
-   or horizon clips as surface.
-4. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
+4. Improve the frame router so it does not over-classify ridge or horizon clips
+   as surface.
+5. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
    d129-like frames to human review.
-5. Keep the state-machine selector path: learned ranker only in states where
-   LOCO shows benefit.
 6. Train null-aware tube rankers with explicit no-target/hallucination
    negatives.
