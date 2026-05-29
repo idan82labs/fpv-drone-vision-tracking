@@ -12,6 +12,13 @@ suppression but loses too much visible target recall, while soft quarantine does
 not beat the sidecar baseline. The main open issue remains observation
 calibration, not state bookkeeping.
 
+Additional calibration update: `scripts/evaluate_router_null_calibration.py`
+now tests per-router max-null thresholds from out-of-fold candidate scores. On
+the current OOF score, router-specific null thresholds do not beat the seeded
+router; they trade visible recall for null suppression and leave aaf1 false
+specks mostly unsolved. This confirms the calibration shape is useful only
+after the candidate score is a better target-vs-clutter likelihood.
+
 This checks the project against the professor's CLBA-1 recommendation:
 
 > candidate-local target-aligned minus background-aligned tube likelihood,
@@ -68,8 +75,8 @@ What is still missing:
 | Candidate-local router | Implemented infrastructure | `tbd_motion_detector.py` candidate router states; runtime mode logging/apply flags. | Good infrastructure, but not calibrated enough for production decisions. |
 | Tiny CNN/TCN only after labels | Deferred intentionally | We stayed with engineered features / logistic / GBDT. | Correct deferral; label volume is not enough for a safe CNN. |
 | Full-frame temporal stack as teacher, not runtime | Tried and rejected as runtime | aaf1 full-stack oracle high, runtime 107-146 ms/frame; candidate-local versions did not recover oracle. | The professor's warning was correct. Keep full-stack as offline teacher/miner. |
-| Sequential log-odds / null calibration | Partial | Acquisition/null gates, HMM, hysteresis, mode supervisor. | We tested many forms, but not per-router max-null-window calibration. |
-| Per-router thresholds/null distributions | Not complete | Router metrics exist; no calibrated `P(max_window_score>x | no target)` by router. | Needed before production router. |
+| Sequential log-odds / null calibration | Partial | Acquisition/null gates, HMM, hysteresis, mode supervisor, router max-null threshold probe. | We tested many forms; current score is not calibrated enough for thresholds to solve the problem. |
+| Per-router thresholds/null distributions | Tried, not validated | `evaluate_router_null_calibration.py` estimates router-bucket thresholds from train-clip null maxima. | Correct shape, wrong score: visible recall collapses before null suppression is production useful. |
 | Evaluation protocol | Mostly done | Full-video strict/loose/no-box, oracle@K, LOCO, timing, demos, worst cases in docs/artifacts. | Missing consistent per-router metrics, ECE/reliability, and worst-case sheets for every idea. |
 | Pi/Rust path after algorithm moves | Followed | Rust deferred; Pi/runtime profiling done. | Correct: algorithm still blocks production more than implementation language. |
 

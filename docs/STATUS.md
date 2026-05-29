@@ -1410,3 +1410,31 @@ real target again. Hard quarantine suppresses too much target evidence; soft
 quarantine recovers some recall but still does not beat the sidecar baseline.
 This reinforces the current read: the missing piece is better
 target-vs-background observation calibration, not another lock-state rule.
+
+Router max-null calibration probe:
+
+- Added `scripts/evaluate_router_null_calibration.py` to test the professor's
+  per-router null calibration idea on existing out-of-fold candidate scores.
+- The harness uses leave-one-clip-out thresholds: for the held-out clip, it
+  estimates per-router thresholds from other clips' invisible/no-target frames
+  by taking the maximum candidate score in each router bucket.
+- Tested on the top-20 OOF candidate scores from
+  `multiclip_candidate_ranker_top20_loco_pos16_v1`.
+- Best broad operating points were still far below the current seeded router:
+  - no floor, `hist_gbdt`, null quantile `0.50`: `61.46%` strict /
+    `68.75%` loose / `11.18%` invisible no-box;
+  - no floor, `hist_gbdt`, null quantile `0.90`: `59.91%` strict /
+    `66.77%` loose / `52.96%` invisible no-box;
+  - floor `0.02`, `hist_gbdt`, null quantile `0.90`: `59.91%` strict /
+    `66.77%` loose / `52.96%` invisible no-box;
+  - floor `0.05`, `hist_gbdt`, null quantile `0.90`: `59.91%` strict /
+    `66.77%` loose / `53.95%` invisible no-box.
+- The failure is visible in per-clip readouts:
+  - aaf1 no-box remains bad at low quantiles (`1/28`) because false specks get
+    low clean/boundary thresholds;
+  - d129 no-box improves at high quantiles, but e271 visible recall collapses.
+
+Interpretation: per-router max-null calibration is the right calibration shape,
+but not with the current candidate score. It cannot recover production behavior
+when the score itself is not a calibrated target-vs-clutter likelihood. Keep the
+harness; do not route runtime decisions from these thresholds yet.
