@@ -1296,3 +1296,53 @@ the permissive crop-score branch. It is still not production-safe. The next
 algorithmic work should focus on the two explicit remaining failures: e271
 continuous-visible protection and aaf1 hard-null override, not global threshold
 tuning.
+
+Current-best failure packet and killed shortcuts:
+
+- `scripts/evaluate_mode_supervisor.py` now writes `det_*` and `selected_*`
+  coordinates in `mode_supervisor_frame_eval.csv`. This is required for
+  accurate miss/null review packets; previous rows only had hit/miss flags.
+- Re-ran the review-label supervisor into
+  `artifacts/mode_supervisor_review_seed_v2/`. Metrics match v1:
+  - threshold `0.1`: `77.39%` strict / `82.52%` loose / `83.55%`
+    invisible no-box;
+  - threshold `0.2`: `77.46%` strict / `82.64%` loose / `79.93%`
+    invisible no-box.
+- Tested a third-state no-box suppressor trained from the seeded packet's
+  visible-vs-invisible review rows. Rejected:
+  - no-box OOF AUC was only about `0.783`;
+  - applying it at high thresholds raised no-box but collapsed visible recall,
+    e.g. mode threshold `0.1`, no-box threshold `0.8` gave only `64.92%`
+    strict / `67.88%` loose / `93.09%` invisible no-box.
+  - This is too blunt; aaf1 hard-null override cannot be a generic
+    visible/invisible classifier over current scalar features.
+- Retested continuous Viterbi protection with a learned-score floor:
+  - pure streak protection gives back too much null suppression;
+  - the best conservative points are only small tradeoffs, e.g.
+    streak `90`, min score `0.4`, threshold `0.1`: `77.64%` strict /
+    `82.58%` loose / `81.58%` invisible no-box.
+  - This does not beat the threshold `0.1` seeded router point as a default.
+- Generated focused current-router failure packets under
+  `artifacts/current_router_failure_packets_v1/`:
+  - `e271_visible_strict_misses.csv`: `287` strict misses from the current
+    threshold `0.1` router; rendered packet keeps `96` sampled frames.
+  - `aaf1_null_false_boxes.csv`: `22` selected false boxes in no-target frames.
+  - top-tube review packets were generated for both:
+    `e271_visible_miss_top_tubes_review/` and
+    `aaf1_null_false_top_tubes_review/`.
+- Visual read:
+  - e271 misses are frequently not proposal failures. The target or a near
+    target candidate often exists in the top alternatives, but the selected box
+    is absent, offset, or on nearby field/edge clutter. This is mostly
+    selector/ranker calibration and box-centering, not raw proposal absence.
+  - aaf1 hard-null false boxes are mostly cloud/sky specks and edge/tree
+    clutter with no visible drone. HMM reduces these but still emits false
+    boxes in 22 sampled no-target frames, so the remaining aaf1 problem needs
+    an explicit null/false-lock state or richer target-vs-background evidence,
+    not binary HMM/Viterbi routing.
+
+Interpretation: this pass avoided promoting two unsafe shortcuts and produced
+better review/training artifacts for the real failures. The next implementation
+should use the current failure packets to train/evaluate explicit reselect and
+no-box states, or add richer target-aligned/background-aligned features. A
+global no-box classifier and raw continuity guard are killed for now.

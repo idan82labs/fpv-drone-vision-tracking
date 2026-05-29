@@ -617,6 +617,14 @@ def evaluate_routed_frame(
         "strict_hit": int(strict),
         "loose_hit": int(loose),
         "dist_px": "" if dist is None else round(dist, 3),
+        "det_x": "" if label_box is None else round(label_box[0], 3),
+        "det_y": "" if label_box is None else round(label_box[1], 3),
+        "det_w": "" if label_box is None else round(label_box[2], 3),
+        "det_h": "" if label_box is None else round(label_box[3], 3),
+        "selected_x": "" if selected_box is None else round(selected_box[0], 3),
+        "selected_y": "" if selected_box is None else round(selected_box[1], 3),
+        "selected_w": "" if selected_box is None else round(selected_box[2], 3),
+        "selected_h": "" if selected_box is None else round(selected_box[3], 3),
     }
 
 

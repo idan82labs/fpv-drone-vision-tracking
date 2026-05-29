@@ -145,6 +145,20 @@ class SelectorCsvFallbackTests(unittest.TestCase):
             self.assertEqual(clips.tolist(), ["clip_a", "clip_a"])
             self.assertEqual(frames.tolist(), [1, 2])
 
+    def test_supervisor_eval_rows_include_label_and_selected_boxes(self):
+        out = supervisor.evaluate_routed_frame(
+            {"visible": "1", "det_x": "10", "det_y": "20", "det_w": "4", "det_h": "6"},
+            {"x": "11", "y": "21", "w": "4", "h": "6"},
+            strict_tol=8.0,
+            loose_tol=16.0,
+        )
+
+        self.assertEqual(out["strict_hit"], 1)
+        self.assertEqual(out["det_x"], 10.0)
+        self.assertEqual(out["det_y"], 20.0)
+        self.assertEqual(out["selected_x"], 11.0)
+        self.assertEqual(out["selected_y"], 21.0)
+
     def test_supervisor_reader_accepts_sequence_selected_tracks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
