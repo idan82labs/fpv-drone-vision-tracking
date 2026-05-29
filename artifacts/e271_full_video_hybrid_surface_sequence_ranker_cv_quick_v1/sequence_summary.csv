@@ -1,0 +1,7 @@
+selector,frames,strict_hit,strict_recall,loose_hit,loose_recall,max_jump_px,transition_weight,accel_weight,sequence_beam,state_beam
+viterbi_jump10_w0.75,699,547,0.7825,648,0.927,10.0,0.75,,,
+cv_viterbi_jump10_w0.75_a1,699,512,0.7325,598,0.8555,10.0,0.75,1.0,40,96
+cv_viterbi_jump10_w0.75_a8,699,511,0.731,554,0.7926,10.0,0.75,8.0,40,96
+cv_viterbi_jump10_w0.75_a4,699,505,0.7225,576,0.824,10.0,0.75,4.0,40,96
+cv_viterbi_jump10_w0.75_a2,699,501,0.7167,576,0.824,10.0,0.75,2.0,40,96
+framewise_learned,699,457,0.6538,594,0.8498,,,,,

@@ -41,6 +41,26 @@ class XYSequenceRankerTests(unittest.TestCase):
         self.assertEqual(summary["strict_hit"], 1)
         self.assertEqual(summary["loose_hit"], 2)
 
+    def test_constant_velocity_selector_rejects_smooth_score_lure(self):
+        by_frame = {
+            1: [{"frame": "1", "x": "0", "y": "10", "w": "4", "h": "4", "learned_score": 0.9}],
+            2: [{"frame": "2", "x": "10", "y": "10", "w": "4", "h": "4", "learned_score": 0.9}],
+            3: [
+                {"frame": "3", "x": "20", "y": "10", "w": "4", "h": "4", "learned_score": 0.6, "rank": "2"},
+                {"frame": "3", "x": "10", "y": "10", "w": "4", "h": "4", "learned_score": 0.99, "rank": "1"},
+            ],
+        }
+
+        selected = seq.viterbi_select_constant_velocity(
+            by_frame,
+            max_jump_px=20.0,
+            transition_weight=0.0,
+            accel_weight=10.0,
+            state_beam=32,
+        )
+
+        self.assertEqual(selected[3]["x"], "20")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,6 +38,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--folds", type=int, default=5)
     p.add_argument("--max_jump_px", default="10,12,16,20,24,32")
     p.add_argument("--transition_weight", default="0.05,0.1,0.2,0.35,0.5,0.75,1.0")
+    p.add_argument("--cv_accel_weight", default="", help="Optional comma-separated acceleration weights for second-order CV Viterbi.")
+    p.add_argument("--sequence_beam", type=int, default=50)
+    p.add_argument("--state_beam", type=int, default=512)
     p.add_argument("--random_state", type=int, default=11)
     return p.parse_args()
 
@@ -263,6 +266,124 @@ def viterbi_select(
     return {frame: layers[fi][idx] for fi, (frame, idx) in enumerate(zip(frames, selected_idx))}
 
 
+def row_score(row: dict[str, Any], score_name: str = "learned_score") -> float:
+    return float(row.get(score_name, 0.0) or 0.0)
+
+
+def prune_frame_rows(
+    by_frame: dict[int, list[dict[str, Any]]],
+    beam: int,
+    score_name: str = "learned_score",
+) -> dict[int, list[dict[str, Any]]]:
+    if beam <= 0:
+        return by_frame
+    return {
+        frame: sorted(rows, key=lambda row: row_score(row, score_name), reverse=True)[:beam]
+        for frame, rows in by_frame.items()
+    }
+
+
+def viterbi_select_constant_velocity(
+    by_frame: dict[int, list[dict[str, Any]]],
+    max_jump_px: float,
+    transition_weight: float,
+    accel_weight: float,
+    state_beam: int,
+) -> dict[int, dict[str, Any]]:
+    """Second-order Viterbi selector with a constant-velocity prior.
+
+    The first-order selector only penalizes large per-frame displacement. That
+    still allows a smooth switch to a nearby terrain branch. This selector keeps
+    pair states `(t-1, t)` and penalizes acceleration away from the previous
+    velocity, while still using a max-jump guard.
+    """
+
+    frames = sorted(by_frame)
+    if len(frames) <= 2:
+        return viterbi_select(by_frame, max_jump_px, transition_weight)
+
+    layers = [by_frame[frame] for frame in frames]
+    if any(not layer for layer in layers):
+        return viterbi_select(by_frame, max_jump_px, transition_weight)
+
+    def frame_gap(fi: int) -> int:
+        if fi <= 0:
+            return 1
+        return max(1, frames[fi] - frames[fi - 1])
+
+    def transition_cost(prev: dict[str, Any], cur: dict[str, Any], allowed: float) -> float | None:
+        jump = center_dist(bbox(prev), bbox(cur))
+        if jump > allowed:
+            return None
+        return transition_weight * (jump / max(1e-6, allowed)) ** 2
+
+    # State at frame index 1 is (idx_at_0, idx_at_1).
+    states: dict[tuple[int, int], float] = {}
+    first_allowed = max_jump_px * frame_gap(1)
+    for i, prev in enumerate(layers[0]):
+        for j, cur in enumerate(layers[1]):
+            cost = transition_cost(prev, cur, first_allowed)
+            if cost is None:
+                continue
+            states[(i, j)] = row_score(prev) + row_score(cur) - cost
+    if not states:
+        return viterbi_select(by_frame, max_jump_px, transition_weight)
+    if state_beam > 0 and len(states) > state_beam:
+        states = dict(sorted(states.items(), key=lambda item: item[1], reverse=True)[:state_beam])
+
+    backptrs: list[dict[tuple[int, int], tuple[int, int]]] = [{} for _ in frames]
+    for fi in range(2, len(frames)):
+        cur_rows = layers[fi]
+        prev_rows = layers[fi - 1]
+        prev_prev_rows = layers[fi - 2]
+        allowed = max_jump_px * frame_gap(fi)
+        cur_gap = frame_gap(fi)
+        prev_gap = frame_gap(fi - 1)
+        new_states: dict[tuple[int, int], float] = {}
+        new_backptrs: dict[tuple[int, int], tuple[int, int]] = {}
+        for (h, i), prev_score in states.items():
+            ppx, ppy = center(bbox(prev_prev_rows[h]))
+            px, py = center(bbox(prev_rows[i]))
+            pred = (px + (px - ppx) * (cur_gap / prev_gap), py + (py - ppy) * (cur_gap / prev_gap))
+            for j, cur in enumerate(cur_rows):
+                jump_cost = transition_cost(prev_rows[i], cur, allowed)
+                if jump_cost is None:
+                    continue
+                cx, cy = center(bbox(cur))
+                accel = math.hypot(cx - pred[0], cy - pred[1])
+                accel_cost = accel_weight * (accel / max(1e-6, allowed)) ** 2
+                score = prev_score + row_score(cur) - jump_cost - accel_cost
+                state = (i, j)
+                if state not in new_states or score > new_states[state]:
+                    new_states[state] = score
+                    new_backptrs[state] = (h, i)
+        if not new_states:
+            return viterbi_select(by_frame, max_jump_px, transition_weight)
+        if state_beam > 0 and len(new_states) > state_beam:
+            keep = {
+                state
+                for state, _ in sorted(new_states.items(), key=lambda item: item[1], reverse=True)[:state_beam]
+            }
+            new_states = {state: score for state, score in new_states.items() if state in keep}
+            new_backptrs = {state: prev for state, prev in new_backptrs.items() if state in keep}
+        states = new_states
+        backptrs[fi] = new_backptrs
+
+    state = max(states, key=lambda key: states[key])
+    selected_idx: list[int | None] = [None] * len(frames)
+    selected_idx[-2], selected_idx[-1] = state
+    for fi in range(len(frames) - 1, 1, -1):
+        prev_state = backptrs[fi].get(state)
+        if prev_state is None:
+            break
+        selected_idx[fi - 2] = prev_state[0]
+        state = prev_state
+
+    if any(idx is None for idx in selected_idx):
+        return viterbi_select(by_frame, max_jump_px, transition_weight)
+    return {frame: layers[fi][int(idx)] for fi, (frame, idx) in enumerate(zip(frames, selected_idx))}
+
+
 def prediction_rows(labels: list[dict[str, str]], selected: dict[int, dict[str, Any]], center_tol: float, loose_tol: float) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for lab in labels:
@@ -340,6 +461,34 @@ def main() -> None:
             ):
                 best_summary = summary
                 best_rows = prediction_rows(labels, selected, args.center_tol_px, args.loose_tol_px)
+            cv_by_frame = prune_frame_rows(by_frame, args.sequence_beam)
+            for accel_weight in parse_float_list(args.cv_accel_weight):
+                selected = viterbi_select_constant_velocity(
+                    cv_by_frame,
+                    max_jump,
+                    weight,
+                    accel_weight,
+                    args.state_beam,
+                )
+                summary = summarize_selection(
+                    labels,
+                    selected,
+                    args.center_tol_px,
+                    args.loose_tol_px,
+                    f"cv_viterbi_jump{max_jump:g}_w{weight:g}_a{accel_weight:g}",
+                )
+                summary["max_jump_px"] = max_jump
+                summary["transition_weight"] = weight
+                summary["accel_weight"] = accel_weight
+                summary["sequence_beam"] = args.sequence_beam
+                summary["state_beam"] = args.state_beam
+                summaries.append(summary)
+                if (summary["strict_recall"], summary["loose_recall"]) > (
+                    best_summary["strict_recall"],
+                    best_summary["loose_recall"],
+                ):
+                    best_summary = summary
+                    best_rows = prediction_rows(labels, selected, args.center_tol_px, args.loose_tol_px)
 
     summaries.sort(key=lambda r: (r["strict_recall"], r["loose_recall"]), reverse=True)
     write_csv(out_dir / "sequence_summary.csv", summaries)
