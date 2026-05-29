@@ -217,6 +217,12 @@ class Candidate:
     attached_support: float = 0.0
     native_dark_score: float = 0.0
     sky_like: float = 0.0
+    router_state: str = "unrouted"
+    router_confidence: float = 0.0
+    router_close_sky_like: float = 0.0
+    router_close_texture: float = 0.0
+    router_far_sky_like: float = 0.0
+    router_far_texture: float = 0.0
 
     def to_json(self) -> dict:
         return {
@@ -247,6 +253,12 @@ class Candidate:
             "attached_support": round(self.attached_support, 3),
             "native_dark_score": round(self.native_dark_score, 3),
             "sky_like": round(self.sky_like, 3),
+            "router_state": self.router_state,
+            "router_confidence": round(self.router_confidence, 3),
+            "router_close_sky_like": round(self.router_close_sky_like, 4),
+            "router_close_texture": round(self.router_close_texture, 3),
+            "router_far_sky_like": round(self.router_far_sky_like, 4),
+            "router_far_texture": round(self.router_far_texture, 3),
         }
 
 

@@ -108,6 +108,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hybrid_coast_max_misses", type=int, default=8)
     p.add_argument("--hybrid_coast_offsets", default="0:0,-4:0,4:0,0:-4,0:4,-7:0,7:0,0:-7,0:7")
     p.add_argument("--hybrid_coast_score_weight", type=float, default=0.18)
+    p.add_argument(
+        "--runtime_mode",
+        choices=("baseline", "clean_sky", "boundary", "surface", "auto"),
+        default="baseline",
+        help="Experimental state-conditioned runtime mode. baseline preserves the old behavior.",
+    )
+    p.add_argument(
+        "--candidate_router",
+        choices=("off", "log", "apply"),
+        default="off",
+        help="Candidate-local background router. auto mode logs by default; apply changes candidate selection.",
+    )
+    p.add_argument("--router_surface_source_penalty", type=float, default=2.5)
+    p.add_argument("--router_line_penalty", type=float, default=1.5)
+    p.add_argument("--router_surface_bonus", type=float, default=0.0)
+    p.add_argument(
+        "--surface_ranker_scope",
+        choices=("all", "surface_backed"),
+        default="all",
+        help="When using a tube verifier/ranker, optionally apply it only to surface-backed tubes.",
+    )
+    p.add_argument("--surface_ranker_min_rate", type=float, default=0.45)
     p.add_argument("--scenario_balance", action="store_true")
     p.add_argument("--scenario_pool_factor", type=float, default=3.0)
     p.add_argument("--scenario_sky_top_k", type=int, default=24)
@@ -219,6 +241,15 @@ class PathState:
 class TemporalStackFrame:
     gray_full: np.ndarray
     h_to_current_full: np.ndarray
+
+
+@dataclass
+class FrameRouterDecision:
+    mode: str
+    allow_surface_extras: bool
+    max_candidates: int
+    confidence: float
+    features: dict[str, float]
 
 
 def robust_sigma(img: np.ndarray) -> float:
@@ -984,11 +1015,19 @@ def hybrid_coast_candidates(
     return sorted(cands, key=lambda c: c.score, reverse=True)
 
 
-def candidate_scenario(cand: base.Candidate) -> str:
+def candidate_scenario(cand: base.Candidate, use_router: bool = False) -> str:
     if cand.source == "hybrid_coast":
         return "coast"
     if cand.source == "large_dark" or max(cand.bbox[2], cand.bbox[3]) >= 10:
         return "large"
+    if use_router:
+        state = getattr(cand, "router_state", "unknown")
+        if state == "clean_sky":
+            return "sky"
+        if state == "surface_backed":
+            return "surface"
+        if state in {"boundary_mixed", "sky_target_near_surface", "line_attached"}:
+            return "boundary"
     sky = float(getattr(cand, "sky_like", 0.0))
     texture = float(getattr(cand, "texture", 0.0))
     line = float(getattr(cand, "line_context", 0.0))
@@ -999,7 +1038,11 @@ def candidate_scenario(cand: base.Candidate) -> str:
     return "boundary"
 
 
-def scenario_balanced_candidates(cands: list[base.Candidate], args: argparse.Namespace) -> list[base.Candidate]:
+def scenario_balanced_candidates(
+    cands: list[base.Candidate],
+    args: argparse.Namespace,
+    use_router: bool = False,
+) -> list[base.Candidate]:
     if not args.scenario_balance:
         return dedupe_candidates(cands, args.top_k_candidates)
     quotas = {
@@ -1012,7 +1055,7 @@ def scenario_balanced_candidates(cands: list[base.Candidate], args: argparse.Nam
     kept: list[base.Candidate] = []
     by_bucket: dict[str, list[base.Candidate]] = {k: [] for k in quotas}
     for cand in sorted(cands, key=lambda c: c.score, reverse=True):
-        by_bucket.setdefault(candidate_scenario(cand), []).append(cand)
+        by_bucket.setdefault(candidate_scenario(cand, use_router), []).append(cand)
     for bucket, quota in quotas.items():
         for cand in by_bucket.get(bucket, [])[:quota]:
             if len(kept) >= args.top_k_candidates:
@@ -1032,6 +1075,14 @@ def candidate_obs(c: base.Candidate, args: argparse.Namespace) -> float:
     # penalties for line/texture contexts that repeatedly produce false boxes.
     line = getattr(c, "line_context", 0.0)
     obs = args.obs_weight * c.score - args.line_weight * line
+    if router_applies(args):
+        router_state = getattr(c, "router_state", "unknown")
+        if candidate_surface_source(c) and router_state != "surface_backed":
+            obs -= args.router_surface_source_penalty
+        if router_state == "line_attached":
+            obs -= args.router_line_penalty * max(0.5, getattr(c, "router_confidence", 0.5))
+        if router_state == "surface_backed":
+            obs += args.router_surface_bonus
     if args.support_penalty_weight > 0:
         excess_support = max(0.0, getattr(c, "attached_support", 0.0) - args.support_penalty_threshold)
         obs -= args.support_penalty_weight * excess_support
@@ -1176,6 +1227,218 @@ def assign_sky_context(cands: list[base.Candidate], cur_g: np.ndarray) -> None:
         cand.sky_like = sky_like_score(cur_g, grad_mag, cand.bbox)
 
 
+def router_is_active(args: argparse.Namespace) -> bool:
+    return args.candidate_router != "off" or args.runtime_mode != "baseline"
+
+
+def router_applies(args: argparse.Namespace) -> bool:
+    if args.candidate_router == "apply":
+        return True
+    if args.candidate_router == "log":
+        return False
+    return args.runtime_mode in {"clean_sky", "boundary", "surface"}
+
+
+def candidate_surface_source(cand: base.Candidate) -> bool:
+    return cand.source in {"temporal_stack", "hybrid_coast"}
+
+
+def frame_router_decision(cur_g: np.ndarray, args: argparse.Namespace) -> FrameRouterDecision:
+    gray = cur_g.astype(np.float32)
+    mean = float(np.mean(gray))
+    std = float(np.std(gray))
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx * gx + gy * gy)
+    grad_mean = float(np.mean(grad))
+    edge_density = float(np.mean(grad > 42.0))
+    bright_frac = float(np.mean(gray > 220.0))
+    texture = 0.55 * std + 0.45 * grad_mean
+    bright = np.clip((mean - 95.0) / 75.0, 0.0, 1.0)
+    smooth = np.clip((38.0 - std) / 32.0, 0.0, 1.0)
+    low_grad = np.clip((38.0 - grad_mean) / 38.0, 0.0, 1.0)
+    sky_like = float(bright * smooth * low_grad)
+    features = {
+        "mean": mean,
+        "std": std,
+        "grad": grad_mean,
+        "edge_density": edge_density,
+        "texture": texture,
+        "bright_frac": bright_frac,
+        "sky_like": sky_like,
+    }
+
+    if args.runtime_mode in {"clean_sky", "boundary", "surface"}:
+        mode = args.runtime_mode
+        conf = 1.0
+    elif sky_like >= 0.22 and texture < 36.0 and edge_density < 0.20:
+        mode = "clean_sky"
+        conf = min(1.0, 0.55 + sky_like)
+    elif texture >= 56.0 or edge_density >= 0.34:
+        mode = "surface"
+        conf = min(1.0, 0.45 + texture / 120.0)
+    elif 0.08 <= sky_like < 0.24 or 0.20 <= edge_density < 0.34:
+        mode = "boundary"
+        conf = 0.62
+    else:
+        mode = "unknown"
+        conf = 0.35
+
+    if mode == "clean_sky":
+        max_candidates = min(args.top_k_candidates, max(24, args.scenario_sky_top_k + args.scenario_large_top_k))
+    elif mode == "surface":
+        max_candidates = args.top_k_candidates
+    elif mode == "boundary":
+        max_candidates = min(args.top_k_candidates, max(40, args.scenario_boundary_top_k + args.scenario_sky_top_k))
+    else:
+        max_candidates = args.top_k_candidates
+    return FrameRouterDecision(
+        mode=mode,
+        allow_surface_extras=(mode == "surface"),
+        max_candidates=max_candidates,
+        confidence=float(conf),
+        features=features,
+    )
+
+
+def _router_ring_stats(
+    cur_g: np.ndarray,
+    grad: np.ndarray,
+    bbox: tuple[int, int, int, int],
+    inner_mult: float,
+    outer_mult: float,
+) -> dict[str, float]:
+    x, y, w, h = bbox
+    h_img, w_img = cur_g.shape[:2]
+    cx = int(round(x + 0.5 * w))
+    cy = int(round(y + 0.5 * h))
+    radius = max(4.0, float(max(w, h)))
+    inner = inner_mult * radius
+    outer = outer_mult * radius
+    x0 = max(0, int(math.floor(cx - outer)))
+    x1 = min(w_img, int(math.ceil(cx + outer + 1)))
+    y0 = max(0, int(math.floor(cy - outer)))
+    y1 = min(h_img, int(math.ceil(cy + outer + 1)))
+    if x1 <= x0 or y1 <= y0:
+        return {"mean": 0.0, "std": 0.0, "grad": 0.0, "texture": 0.0, "sky_like": 0.0}
+    yy, xx = np.ogrid[y0:y1, x0:x1]
+    dist2 = (xx - cx) * (xx - cx) + (yy - cy) * (yy - cy)
+    mask = (dist2 >= inner * inner) & (dist2 <= outer * outer)
+    if not np.any(mask):
+        return {"mean": 0.0, "std": 0.0, "grad": 0.0, "texture": 0.0, "sky_like": 0.0}
+    patch = cur_g[y0:y1, x0:x1].astype(np.float32)
+    gpatch = grad[y0:y1, x0:x1]
+    vals = patch[mask]
+    gvals = gpatch[mask]
+    mean = float(np.mean(vals))
+    std = float(np.std(vals))
+    grad_mean = float(np.mean(gvals))
+    texture = 0.55 * std + 0.45 * grad_mean
+    bright = np.clip((mean - 95.0) / 75.0, 0.0, 1.0)
+    smooth = np.clip((38.0 - std) / 32.0, 0.0, 1.0)
+    low_grad = np.clip((38.0 - grad_mean) / 38.0, 0.0, 1.0)
+    sky_like = float(bright * smooth * low_grad)
+    return {"mean": mean, "std": std, "grad": grad_mean, "texture": texture, "sky_like": sky_like}
+
+
+def _integral_rect_sum(integ: np.ndarray, x0: int, y0: int, x1: int, y1: int) -> float:
+    return float(integ[y1, x1] - integ[y0, x1] - integ[y1, x0] + integ[y0, x0])
+
+
+def _router_box_ring_stats(
+    gray_i: np.ndarray,
+    gray2_i: np.ndarray,
+    grad_i: np.ndarray,
+    shape: tuple[int, int],
+    bbox: tuple[int, int, int, int],
+    inner_mult: float,
+    outer_mult: float,
+) -> dict[str, float]:
+    h_img, w_img = shape
+    x, y, w, h = bbox
+    cx = int(round(x + 0.5 * w))
+    cy = int(round(y + 0.5 * h))
+    radius = max(4.0, float(max(w, h)))
+    inner = int(round(inner_mult * radius))
+    outer = int(round(outer_mult * radius))
+    ox0 = max(0, cx - outer)
+    ox1 = min(w_img, cx + outer + 1)
+    oy0 = max(0, cy - outer)
+    oy1 = min(h_img, cy + outer + 1)
+    ix0 = max(0, cx - inner)
+    ix1 = min(w_img, cx + inner + 1)
+    iy0 = max(0, cy - inner)
+    iy1 = min(h_img, cy + inner + 1)
+    outer_n = max(0, ox1 - ox0) * max(0, oy1 - oy0)
+    inner_n = max(0, ix1 - ix0) * max(0, iy1 - iy0)
+    n = outer_n - inner_n
+    if n <= 0:
+        return {"mean": 0.0, "std": 0.0, "grad": 0.0, "texture": 0.0, "sky_like": 0.0}
+
+    sum_g = _integral_rect_sum(gray_i, ox0, oy0, ox1, oy1) - _integral_rect_sum(gray_i, ix0, iy0, ix1, iy1)
+    sum_g2 = _integral_rect_sum(gray2_i, ox0, oy0, ox1, oy1) - _integral_rect_sum(gray2_i, ix0, iy0, ix1, iy1)
+    sum_grad = _integral_rect_sum(grad_i, ox0, oy0, ox1, oy1) - _integral_rect_sum(grad_i, ix0, iy0, ix1, iy1)
+    mean = sum_g / n
+    var = max(0.0, sum_g2 / n - mean * mean)
+    std = math.sqrt(var)
+    grad_mean = sum_grad / n
+    texture = 0.55 * std + 0.45 * grad_mean
+    bright = np.clip((mean - 95.0) / 75.0, 0.0, 1.0)
+    smooth = np.clip((38.0 - std) / 32.0, 0.0, 1.0)
+    low_grad = np.clip((38.0 - grad_mean) / 38.0, 0.0, 1.0)
+    sky_like = float(bright * smooth * low_grad)
+    return {"mean": mean, "std": std, "grad": grad_mean, "texture": texture, "sky_like": sky_like}
+
+
+def classify_candidate_router_state(
+    cand: base.Candidate,
+    close: dict[str, float],
+    far: dict[str, float],
+) -> tuple[str, float]:
+    close_sky = close["sky_like"] >= 0.22 and close["texture"] < 32.0
+    far_sky = far["sky_like"] >= 0.18 and far["texture"] < 38.0
+    close_surface = close["sky_like"] < 0.08 and close["texture"] >= 38.0
+    far_surface = far["sky_like"] < 0.12 and far["texture"] >= 42.0
+    line = float(getattr(cand, "line_context", 0.0))
+    support = float(getattr(cand, "attached_support", 0.0))
+
+    if support >= 5.5 or (line >= 0.85 and support >= 2.5):
+        return "line_attached", min(1.0, 0.55 + 0.08 * support + 0.25 * line)
+    if close_sky and far_sky:
+        return "clean_sky", min(1.0, 0.45 + 0.5 * close["sky_like"] + 0.35 * far["sky_like"])
+    if close_sky and far_surface:
+        return "sky_target_near_surface", min(1.0, 0.55 + 0.4 * close["sky_like"])
+    if close_surface:
+        return "surface_backed", min(1.0, 0.45 + close["texture"] / 120.0)
+    if far_surface or abs(close["texture"] - far["texture"]) >= 18.0:
+        return "boundary_mixed", 0.62
+    return "unknown", 0.35
+
+
+def assign_candidate_router_states(cands: list[base.Candidate], cur_g: np.ndarray) -> dict[str, int]:
+    gray = cur_g.astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    grad = np.sqrt(gx * gx + gy * gy)
+    gray_i = cv2.integral(gray)
+    gray2_i = cv2.integral(gray * gray)
+    grad_i = cv2.integral(grad)
+    counts: dict[str, int] = {}
+    for cand in cands:
+        close = _router_box_ring_stats(gray_i, gray2_i, grad_i, cur_g.shape[:2], cand.bbox, 1.4, 3.2)
+        far = _router_box_ring_stats(gray_i, gray2_i, grad_i, cur_g.shape[:2], cand.bbox, 3.8, 7.0)
+        state, confidence = classify_candidate_router_state(cand, close, far)
+        cand.router_state = state
+        cand.router_confidence = confidence
+        cand.sky_like = close["sky_like"]
+        cand.router_close_sky_like = close["sky_like"]
+        cand.router_close_texture = close["texture"]
+        cand.router_far_sky_like = far["sky_like"]
+        cand.router_far_texture = far["texture"]
+        counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
 def _mean(vals: list[float]) -> float:
     return float(np.mean(vals)) if vals else 0.0
 
@@ -1186,6 +1449,7 @@ def tube_features(st: PathState) -> dict[str, float]:
     n = max(1, len(hist))
     hits = len(cands)
     source_vals = [c.get("source", "") for c in cands]
+    router_vals = [str(c.get("router_state", "unrouted")) for c in cands]
     map_scores = [float(c.get("map_score", 0.0)) for c in cands]
     line_vals = [float(c.get("line_context", 0.0)) for c in cands]
     support_vals = [float(c.get("attached_support", 0.0)) for c in cands]
@@ -1229,6 +1493,12 @@ def tube_features(st: PathState) -> dict[str, float]:
         "mean_map_score": _mean(map_scores),
         "map_hit_rate": sum(1 for v in map_scores if v > 0.0) / max(1, hits),
         "appearance_only_rate": len(app_only) / max(1, hits),
+        "surface_source_rate": sum(1 for v in source_vals if v in {"temporal_stack", "hybrid_coast"}) / max(1, hits),
+        "router_surface_backed_rate": sum(1 for v in router_vals if v == "surface_backed") / max(1, hits),
+        "router_clean_sky_rate": sum(1 for v in router_vals if v == "clean_sky") / max(1, hits),
+        "router_boundary_rate": sum(1 for v in router_vals if v in {"boundary_mixed", "sky_target_near_surface"}) / max(1, hits),
+        "router_line_attached_rate": sum(1 for v in router_vals if v == "line_attached") / max(1, hits),
+        "router_unknown_rate": sum(1 for v in router_vals if v in {"unknown", "unrouted"}) / max(1, hits),
         "tiny_rate": len(tiny_vals) / max(1, hits),
         "mean_line_context": _mean(line_vals),
         "max_line_context": max(line_vals) if line_vals else 0.0,
@@ -1430,6 +1700,17 @@ def tube_verifier_score(features: dict[str, float], mode: str) -> float:
     return heuristic_tube_verifier_score(features)
 
 
+def scoped_tube_verifier_score(features: dict[str, float], args: argparse.Namespace) -> float:
+    if args.tube_verifier == "off":
+        return 0.0
+    if (
+        args.surface_ranker_scope == "surface_backed"
+        and features.get("router_surface_backed_rate", 0.0) < args.surface_ranker_min_rate
+    ):
+        return 0.0
+    return tube_verifier_score(features, args.tube_verifier)
+
+
 class BeamTBD:
     def __init__(self, args: argparse.Namespace, px_per_frame: float):
         self.args = args
@@ -1441,7 +1722,7 @@ class BeamTBD:
         if self.args.tube_verifier == "off":
             return st.score()
         features = tube_features(st)
-        tube_score = tube_verifier_score(features, self.args.tube_verifier)
+        tube_score = scoped_tube_verifier_score(features, self.args)
         sky_bonus = self.args.sky_bonus_weight * (
             features.get("max_sky_like", 0.0) + 0.5 * features.get("sky_hit_rate", 0.0)
         )
@@ -1711,7 +1992,8 @@ class BeamTBD:
 
         scored: list[tuple[float, PathState]] = []
         for st in eligible:
-            tube_score = tube_verifier_score(tube_features(st), self.args.tube_verifier)
+            features = tube_features(st)
+            tube_score = scoped_tube_verifier_score(features, self.args)
             if tube_score < self.args.tube_verifier_floor:
                 continue
             scored.append((self.verified_score(st), st))
@@ -1777,7 +2059,7 @@ def tube_state_payload(
     competitor_margin: float | None = None,
 ) -> tuple[dict, dict]:
     features = tube_features(st)
-    tube_score = tube_verifier_score(features, args.tube_verifier) if args.tube_verifier != "off" else 0.0
+    tube_score = scoped_tube_verifier_score(features, args)
     verified = tbd.verified_score(st)
     raw = st.score()
     eligible = st.misses <= args.max_selected_misses and st.hit_count() >= args.min_path_hits
@@ -1875,6 +2157,8 @@ def run(args: argparse.Namespace) -> None:
     temporal_history: list[TemporalStackFrame] = []
     temporal_max_age = max(abs(v) for v in parse_int_offsets(args.temporal_stack_offsets))
     fno = 1
+    frame_mode_counts: dict[str, int] = {}
+    candidate_router_counts_total: dict[str, int] = {}
 
     while True:
         if args.max_frames is not None and fno >= args.max_frames:
@@ -1882,11 +2166,19 @@ def run(args: argparse.Namespace) -> None:
         ok, cur = cap.read()
         if not ok:
             break
+        frame_start = time.perf_counter()
         cur_full = cur
         if args.downscale != 1.0:
             cur = cv2.resize(cur, None, fx=args.downscale, fy=args.downscale, interpolation=cv2.INTER_AREA)
         cur_g = base.ensure_gray(cur)
-        t0 = time.perf_counter()
+        t_preprocess = time.perf_counter()
+        frame_decision = (
+            frame_router_decision(cur_g, args)
+            if router_is_active(args)
+            else FrameRouterDecision("baseline", True, args.top_k_candidates, 0.0, {})
+        )
+        frame_mode_counts[frame_decision.mode] = frame_mode_counts.get(frame_decision.mode, 0) + 1
+        t_frame_router = time.perf_counter()
 
         feature_mask = base.make_feature_mask(prev_g.shape[:2], [])
         g0, g1 = base.lk_tracks(prev_g, cur_g, feature_mask, args)
@@ -1905,6 +2197,7 @@ def run(args: argparse.Namespace) -> None:
             fno += 1
             continue
         model_counts[chosen["name"]] = model_counts.get(chosen["name"], 0) + 1
+        t_motion_model = time.perf_counter()
         temporal_history = update_temporal_stack_history(
             temporal_history,
             base.ensure_gray(prev_full),
@@ -1941,6 +2234,7 @@ def run(args: argparse.Namespace) -> None:
         else:
             motion_mask = mask
 
+        t_residual = time.perf_counter()
         motion_cands = base.extract_candidates("motion", motion_mask, residual_blur, app_resp, cur_g, args)
         app_cands: list[base.Candidate] = []
         if args.appearance != "off":
@@ -1962,26 +2256,36 @@ def run(args: argparse.Namespace) -> None:
             cur_g,
             args,
         )
-        stack_cands = temporal_stack_candidates(
-            cur_full,
-            args.downscale,
-            temporal_history,
-            residual_blur,
-            app_resp,
-            cur_g,
-            args,
+        surface_extras_allowed = (not router_applies(args)) or frame_decision.allow_surface_extras
+        stack_cands = (
+            temporal_stack_candidates(
+                cur_full,
+                args.downscale,
+                temporal_history,
+                residual_blur,
+                app_resp,
+                cur_g,
+                args,
+            )
+            if surface_extras_allowed
+            else []
         )
-        hybrid_coast_cands = hybrid_coast_candidates(
-            tbd.states,
-            tbd,
-            chosen["h"],
-            w_img,
-            h_img,
-            residual_blur,
-            app_resp,
-            cur_g,
-            args,
+        hybrid_coast_cands = (
+            hybrid_coast_candidates(
+                tbd.states,
+                tbd,
+                chosen["h"],
+                w_img,
+                h_img,
+                residual_blur,
+                app_resp,
+                cur_g,
+                args,
+            )
+            if surface_extras_allowed
+            else []
         )
+        t_proposals = time.perf_counter()
         raw_cands = motion_cands + app_cands + map_cands + native_cands + large_dark_cands + stack_cands + hybrid_coast_cands
         if args.scenario_balance:
             pool_n = max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
@@ -1991,22 +2295,30 @@ def run(args: argparse.Namespace) -> None:
         assign_attached_support(cands, cur_g)
         if args.native_roi_score:
             assign_native_roi_scores(cands, cur_full, args.downscale)
-        assign_sky_context(cands, cur_g)
+        candidate_router_counts: dict[str, int] = {}
+        if router_is_active(args):
+            candidate_router_counts = assign_candidate_router_states(cands, cur_g)
+            for state, count in candidate_router_counts.items():
+                candidate_router_counts_total[state] = candidate_router_counts_total.get(state, 0) + count
+            if not router_applies(args):
+                assign_sky_context(cands, cur_g)
+        else:
+            assign_sky_context(cands, cur_g)
+        t_context_router = time.perf_counter()
         if args.scenario_balance:
-            cands = scenario_balanced_candidates(cands, args)
+            cands = scenario_balanced_candidates(cands, args, router_applies(args))
+        elif router_applies(args) and frame_decision.max_candidates < len(cands):
+            cands = cands[: frame_decision.max_candidates]
+        t_scenario = time.perf_counter()
 
         states = tbd.update(fno, cands, signed_diff, signed_sigma, w_img, h_img, chosen["h"], residual_blur, app_resp)
         selected = tbd.best()
-        dt_ms = (time.perf_counter() - t0) * 1000.0
+        t_tbd = time.perf_counter()
 
         selected_json = None
         if selected is not None:
             selected_tube_features = tube_features(selected)
-            selected_tube_score = (
-                tube_verifier_score(selected_tube_features, args.tube_verifier)
-                if args.tube_verifier != "off"
-                else 0.0
-            )
+            selected_tube_score = scoped_tube_verifier_score(selected_tube_features, args)
             selected_json = {
                 "track_id": selected.sid,
                 "bbox": list(selected.bbox),
@@ -2059,8 +2371,26 @@ def run(args: argparse.Namespace) -> None:
                 top_tubes_json.append(payload)
                 top_tube_rows.append(row)
 
+        t_export = time.perf_counter()
+        timing_ms = {
+            "preprocess": round((t_preprocess - frame_start) * 1000.0, 3),
+            "frame_router": round((t_frame_router - t_preprocess) * 1000.0, 3),
+            "motion_model": round((t_motion_model - t_frame_router) * 1000.0, 3),
+            "residual_masks": round((t_residual - t_motion_model) * 1000.0, 3),
+            "proposals": round((t_proposals - t_residual) * 1000.0, 3),
+            "context_router": round((t_context_router - t_proposals) * 1000.0, 3),
+            "scenario_balance": round((t_scenario - t_context_router) * 1000.0, 3),
+            "tbd_update": round((t_tbd - t_scenario) * 1000.0, 3),
+            "export_selection": round((t_export - t_tbd) * 1000.0, 3),
+        }
+        dt_ms = (t_export - frame_start) * 1000.0
+
         frame_rec = {
             "frame": fno,
+            "runtime_mode": frame_decision.mode,
+            "runtime_mode_confidence": round(frame_decision.confidence, 3),
+            "runtime_mode_features": {k: round(float(v), 3) for k, v in frame_decision.features.items()},
+            "surface_extras_allowed": surface_extras_allowed,
             "model": chosen["name"],
             "n_features": int(len(g0)),
             "inlier_ratio": round(chosen["inlier_ratio"], 3),
@@ -2073,10 +2403,12 @@ def run(args: argparse.Namespace) -> None:
             "n_large_dark_candidates": len(large_dark_cands),
             "n_temporal_stack_candidates": len(stack_cands),
             "n_hybrid_coast_candidates": len(hybrid_coast_cands),
+            "candidate_router_counts": candidate_router_counts,
             "n_tracks": len(states),
             "selected": selected_json,
             "kinematic_reject": None,
             "process_ms": round(dt_ms, 3),
+            "timing_ms": timing_ms,
             "top_candidates": [c.to_json() for c in cands[: args.top_k_debug]],
         }
         if args.export_top_tubes > 0:
@@ -2112,6 +2444,19 @@ def run(args: argparse.Namespace) -> None:
     selected_frames = sum(1 for r in report if r["selected"] is not None)
     selected_rate = selected_frames / len(report)
     noisy_frames = sum(1 for r in report if r["n_candidates"] > 10)
+    timing_keys: list[str] = []
+    for rec in report:
+        for key in rec.get("timing_ms", {}):
+            if key not in timing_keys:
+                timing_keys.append(key)
+    avg_timing_ms = {
+        key: round(float(np.mean([r.get("timing_ms", {}).get(key, 0.0) for r in report])), 3)
+        for key in timing_keys
+    }
+    p90_timing_ms = {
+        key: round(float(np.percentile([r.get("timing_ms", {}).get(key, 0.0) for r in report], 90)), 3)
+        for key in timing_keys
+    }
 
     result = {
         "video": args.video,
@@ -2135,6 +2480,10 @@ def run(args: argparse.Namespace) -> None:
             "multi_candidate_frames": sum(1 for r in report if r["n_candidates"] > 1),
             "noisy_frames_gt10_candidates": noisy_frames,
             "model_counts": model_counts,
+            "runtime_mode_counts": frame_mode_counts,
+            "candidate_router_counts": candidate_router_counts_total,
+            "avg_timing_ms": avg_timing_ms,
+            "p90_timing_ms": p90_timing_ms,
         },
         "frames": report,
     }
@@ -2163,6 +2512,12 @@ def run(args: argparse.Namespace) -> None:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(top_tube_rows)
+    if timing_keys:
+        with (out_dir / "timing_summary.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=["block", "avg_ms", "p90_ms"])
+            writer.writeheader()
+            for key in timing_keys:
+                writer.writerow({"block": key, "avg_ms": avg_timing_ms[key], "p90_ms": p90_timing_ms[key]})
     (out_dir / "summary.md").write_text(
         f"""# candidate TBD summary
 
@@ -2179,6 +2534,9 @@ Processed: {len(report)} frame pairs at downscale {args.downscale}
 | P90 candidates / frame | {p90_candidates:.1f} |
 | Frames with selected box | {selected_frames}/{len(report)} ({selected_rate:.1%}) |
 | Kinematic gate | {px_per_frame:.1f} px/frame |
+
+Runtime mode counts: `{frame_mode_counts}`
+Candidate router counts: `{candidate_router_counts_total}`
 
 This is candidate-level track-before-detect: selected_frame_rate is not accuracy.
 """

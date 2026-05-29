@@ -91,6 +91,14 @@ docs/EMBEDDED_RUNTIME_PLAN.md
 
 Current direction: cheap frame router, cheap baseline proposals, candidate-local router, then specialized surface proposal/ranker branches only when the router says they are useful. Rust is a deployment option for stable hot paths later, not the next algorithm step.
 
+The first runtime-mode benchmark is:
+
+```text
+artifacts/runtime_mode_benchmark_v1/
+```
+
+It adds candidate-local router logging/application flags and per-frame timing. Current read: the router is cheap enough to keep testing, but the Python beam update dominates when candidate count is high.
+
 ## Fly.io Deployment
 
 Use the example config, set secrets, then deploy:

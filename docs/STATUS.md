@@ -91,10 +91,27 @@ From the first complete-video non-sky benchmark:
 
 Interpretation: d129 is now a useful complete-video benchmark. The target is in the candidate pool, and learned ranking can pick it when visible. The blocker is acquisition/null logic: the current tracker hallucinates before target appearance, while a blunt learned threshold suppresses too much target recall.
 
+From the embedded runtime candidate-router implementation:
+
+- Added explicit runtime modes and candidate-local routing inside `scripts/tbd_motion_detector.py`.
+- Default remains conservative: `--runtime_mode baseline --candidate_router off`.
+- `auto` can log frame/candidate router decisions without changing behavior.
+- Candidate-local router states are now exported in candidates and tube features.
+- Per-frame timing is exported in `report.json` and `timing_summary.csv`.
+- Added `scripts/benchmark_runtime_modes.py`.
+- Pair-rescue profile, 89-frame slices:
+  - d129 baseline 51.77 ms/frame, auto_apply 43.82 ms/frame, clean_sky 37.89 ms/frame.
+  - aaf1 baseline 61.46 ms/frame, clean_sky 43.83 ms/frame.
+  - e271 baseline 33.42 ms/frame, clean_sky 27.23 ms/frame.
+- Candidate-local router cost after integral-image rewrite is roughly 1.6-3.3 ms/frame in these runs; the Python TBD beam update is the dominant cost when candidate count approaches 90.
+- Heavy surface extras remain too slow globally: 120-140 ms/frame when enabled broadly.
+
+Interpretation: the router infrastructure is now in the detector and cheap enough to continue testing. The frame router still over-classifies some clips as surface, so `auto_apply` is not ready as default. Candidate caps and state-conditioned surface branches are the right runtime direction; beam update is now a clear hot-path candidate after behavior stabilizes.
+
 ## Next Meaningful Work
 
-1. Collect or generate true target-over-tree/grass/terrain labels; route ambiguous d129-like frames to human review.
-2. Improve the background router until it cleanly separates sky, skyline, cloud texture, and true surface-backed targets.
-3. Implement/evaluate acquisition versus tracking state: high threshold before lock, lower continuity-backed threshold after lock.
+1. Evaluate acquisition versus tracking state on complete videos: high threshold before lock, lower continuity-backed threshold after lock.
+2. Improve the frame router so it does not over-classify e271/aaf1-like ridge or horizon clips as surface.
+3. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous d129-like frames to human review.
 4. Keep the state-machine selector path: learned ranker only in states where LOCO shows benefit.
 5. Train null-aware tube rankers with explicit no-target/hallucination negatives.

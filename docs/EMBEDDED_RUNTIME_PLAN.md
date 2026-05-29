@@ -213,6 +213,41 @@ would slow the algorithm work and make mistakes harder to inspect.
    into `tbd_motion_detector.py` behind explicit flags.
 5. Run a Pi 5 benchmark before any default change.
 
+## Implementation Checkpoint - 2026-05-29
+
+Implemented in `scripts/tbd_motion_detector.py`:
+
+- `--runtime_mode baseline|clean_sky|boundary|surface|auto`
+- `--candidate_router off|log|apply`
+- cheap frame router with per-frame mode logging;
+- candidate-local router states:
+  - `clean_sky`
+  - `sky_target_near_surface`
+  - `boundary_mixed`
+  - `surface_backed`
+  - `line_attached`
+  - `unknown`
+- optional router application that penalizes surface-only proposal sources
+  outside `surface_backed` candidates;
+- optional `--surface_ranker_scope surface_backed` so the tube
+  verifier/ranker can be constrained to surface-backed tubes;
+- per-frame timing breakdown in `report.json` and `timing_summary.csv`;
+- `scripts/benchmark_runtime_modes.py` for repeatable runtime-mode benchmarks.
+
+Current status:
+
+- default behavior remains `--runtime_mode baseline --candidate_router off`;
+- `auto` is still a logging/experiment path, not a default control path;
+- candidate-local routing is cheap enough for continued testing after the
+  integral-image rewrite;
+- Python beam update is now the dominant runtime bottleneck when candidate
+  count approaches 90.
+
+Benchmark artifacts:
+
+- `artifacts/runtime_mode_benchmark_v1/`
+- `artifacts/runtime_mode_benchmark_surface_extras_v1/`
+
 ## Default Policy
 
 Current default should remain the conservative baseline/pair-rescue path.
