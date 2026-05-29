@@ -48,6 +48,7 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional hysteresis acquire thresholds. When set, evaluated in addition to plain thresholds.",
     )
+    p.add_argument("--acquire_hits", default="1")
     p.add_argument("--keep_thresholds", default="", help="Optional hysteresis keep thresholds.")
     p.add_argument("--lost_patience", default="0,1")
     p.add_argument("--gain_weights", default="0,0.15,0.3")
@@ -238,12 +239,16 @@ def select_rows(
 def apply_hysteresis_gate(
     selected: dict[int, dict[str, Any]],
     acquire_threshold: float,
+    acquire_hits: int,
     keep_threshold: float,
     max_jump_px: float,
     lost_patience: int,
 ) -> dict[int, dict[str, Any]]:
     out: dict[int, dict[str, Any]] = {}
     active = False
+    pending_hits = 0
+    pending_frame: int | None = None
+    pending_row: dict[str, Any] | None = None
     lost = 0
     last_frame: int | None = None
     last_row: dict[str, Any] | None = None
@@ -253,9 +258,22 @@ def apply_hysteresis_gate(
         emit = False
         if not active:
             if row_score >= acquire_threshold:
-                active = True
-                emit = True
-                lost = 0
+                gap = max(1, frame - pending_frame) if pending_frame is not None else 1
+                jump_ok = (
+                    pending_row is None
+                    or center_dist(bbox(pending_row), bbox(row)) <= max_jump_px * gap
+                )
+                pending_hits = pending_hits + 1 if jump_ok else 1
+                pending_frame = frame
+                pending_row = row
+                if pending_hits >= max(1, acquire_hits):
+                    active = True
+                    emit = True
+                    lost = 0
+            else:
+                pending_hits = 0
+                pending_frame = None
+                pending_row = None
         else:
             gap = max(1, frame - last_frame) if last_frame is not None else 1
             jump_ok = last_row is None or center_dist(bbox(last_row), bbox(row)) <= max_jump_px * gap
@@ -266,6 +284,9 @@ def apply_hysteresis_gate(
                 lost += 1
                 if lost > max(0, lost_patience):
                     active = False
+                    pending_hits = 0
+                    pending_frame = None
+                    pending_row = None
                     last_frame = None
                     last_row = None
         if emit:
@@ -421,53 +442,55 @@ def main() -> None:
                         if args.acquire_thresholds:
                             keep_thresholds = args.keep_thresholds or args.thresholds
                             for acquire in parse_float_list(args.acquire_thresholds):
-                                for keep in parse_float_list(keep_thresholds):
-                                    for patience in parse_int_list(args.lost_patience):
-                                        gated = apply_hysteresis_gate(selected, acquire, keep, max_jump, patience)
-                                        summary, rows = evaluate_selection(
-                                            labels,
-                                            gated,
-                                            threshold=0.0,
-                                            strict_tol_px=args.strict_tol_px,
-                                            loose_tol_px=args.loose_tol_px,
-                                        )
-                                        summary.update(
-                                            {
-                                                "sequence_window": window,
-                                                "max_jump_px": max_jump,
-                                                "transition_weight": transition,
-                                                "size_jump_weight": size_weight,
-                                                "threshold": 0.0,
-                                                "sequence_beam": args.sequence_beam,
-                                                "acquire_threshold": acquire,
-                                                "keep_threshold": keep,
-                                                "lost_patience": patience,
-                                                **asdict(weights),
-                                            }
-                                        )
-                                        summaries.append(summary)
-                                        sort_key = (
-                                            summary["all_frame_accuracy"],
-                                            summary["visible_strict_recall"],
-                                            summary["invisible_no_box_rate"],
-                                            -summary["selected_frames"],
-                                        )
-                                        best_key = (
-                                            -1.0,
-                                            -1.0,
-                                            -1.0,
-                                            0,
-                                        )
-                                        if best_summary is not None:
-                                            best_key = (
-                                                best_summary["all_frame_accuracy"],
-                                                best_summary["visible_strict_recall"],
-                                                best_summary["invisible_no_box_rate"],
-                                                -best_summary["selected_frames"],
+                                for hits in parse_int_list(args.acquire_hits):
+                                    for keep in parse_float_list(keep_thresholds):
+                                        for patience in parse_int_list(args.lost_patience):
+                                            gated = apply_hysteresis_gate(selected, acquire, hits, keep, max_jump, patience)
+                                            summary, rows = evaluate_selection(
+                                                labels,
+                                                gated,
+                                                threshold=0.0,
+                                                strict_tol_px=args.strict_tol_px,
+                                                loose_tol_px=args.loose_tol_px,
                                             )
-                                        if best_summary is None or sort_key > best_key:
-                                            best_summary = summary
-                                            best_rows = rows
+                                            summary.update(
+                                                {
+                                                    "sequence_window": window,
+                                                    "max_jump_px": max_jump,
+                                                    "transition_weight": transition,
+                                                    "size_jump_weight": size_weight,
+                                                    "threshold": 0.0,
+                                                    "sequence_beam": args.sequence_beam,
+                                                    "acquire_threshold": acquire,
+                                                    "acquire_hits": hits,
+                                                    "keep_threshold": keep,
+                                                    "lost_patience": patience,
+                                                    **asdict(weights),
+                                                }
+                                            )
+                                            summaries.append(summary)
+                                            sort_key = (
+                                                summary["all_frame_accuracy"],
+                                                summary["visible_strict_recall"],
+                                                summary["invisible_no_box_rate"],
+                                                -summary["selected_frames"],
+                                            )
+                                            best_key = (
+                                                -1.0,
+                                                -1.0,
+                                                -1.0,
+                                                0,
+                                            )
+                                            if best_summary is not None:
+                                                best_key = (
+                                                    best_summary["all_frame_accuracy"],
+                                                    best_summary["visible_strict_recall"],
+                                                    best_summary["invisible_no_box_rate"],
+                                                    -best_summary["selected_frames"],
+                                                )
+                                            if best_summary is None or sort_key > best_key:
+                                                best_summary = summary
+                                                best_rows = rows
 
     summaries.sort(
         key=lambda r: (

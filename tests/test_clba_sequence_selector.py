@@ -77,12 +77,25 @@ class ClbaSequenceSelectorTests(unittest.TestCase):
             4: {"frame": 4, "x": "50", "y": "0", "w": "4", "h": "4", "learned_score": 0.95},
         }
 
-        gated = sweep.apply_hysteresis_gate(selected, 0.9, 0.7, 8.0, 0)
+        gated = sweep.apply_hysteresis_gate(selected, 0.9, 1, 0.7, 8.0, 0)
 
         self.assertNotIn(1, gated)
         self.assertIn(2, gated)
         self.assertIn(3, gated)
         self.assertNotIn(4, gated)
+
+    def test_hysteresis_gate_can_require_multiple_acquire_hits(self):
+        selected = {
+            1: {"frame": 1, "x": "0", "y": "0", "w": "4", "h": "4", "learned_score": 0.8},
+            2: {"frame": 2, "x": "1", "y": "0", "w": "4", "h": "4", "learned_score": 0.82},
+            3: {"frame": 3, "x": "2", "y": "0", "w": "4", "h": "4", "learned_score": 0.7},
+        }
+
+        gated = sweep.apply_hysteresis_gate(selected, 0.75, 2, 0.65, 8.0, 0)
+
+        self.assertNotIn(1, gated)
+        self.assertIn(2, gated)
+        self.assertIn(3, gated)
 
 
 if __name__ == "__main__":

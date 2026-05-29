@@ -560,6 +560,11 @@ CLBA sequence-selector check:
   framewise, rolling-window, and full-window Viterbi selection.
 - Added sequence-path acquisition/keep hysteresis because plain sequence
   continuity improved visible recall while hallucinating through null frames.
+- Tested lower acquisition thresholds with multi-hit acquisition. This did not
+  improve the current best aaf1 result: it preserved null safety in some
+  configs but dropped visible strict from 69/75 to 67/75. The remaining aaf1
+  misses are mostly target-birth score/ranking issues, not just acquisition
+  hysteresis issues.
 - Best aaf1 ExtraTrees OOF result:
   - 69/75 visible strict = 92.0%.
   - 28/28 invisible no-box = 100%.
