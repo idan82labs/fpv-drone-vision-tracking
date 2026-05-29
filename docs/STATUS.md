@@ -523,19 +523,47 @@ strict while excluding e271 from the ranker training set. Caveat: the selector
 is offline/deferred over exported candidates; it still needs a short sliding
 window implementation before it is a live Pi-5 candidate.
 
+CLBA score-modifier check:
+
+- Added `scripts/sweep_clba_score_adjustment.py`.
+- This keeps the proven acquire/track state machine and only sweeps direct
+  score modifiers from candidate-local background alignment features.
+- It is a narrower test than the explicit A/P/T/S/E/C selector, which is still
+  not validated.
+- Best aaf1 ExtraTrees CLBA-adjusted run:
+  - 65/75 visible strict = 86.7%.
+  - 28/28 invisible no-box = 100%.
+  - 93/103 all-frame correctness = 90.3%.
+  - Previous comparable all-stack CLBA state-machine run was 62/75 strict with
+    28/28 no-box.
+- Best e6 HistGBDT CLBA-adjusted run:
+  - 66/72 visible strict = 91.7%.
+  - 26/27 invisible no-box = 96.3%.
+  - 92/99 all-frame correctness = 92.9%.
+  - Previous comparable all-stack CLBA state-machine run was 65/72 strict with
+    26/27 no-box.
+
+Interpretation: the professor's target/background-alignment primitive has a
+measurable but modest selector benefit when used as a calibrated modifier on
+top of OOF candidate scores. Strong hand-designed clutter penalties are still
+not validated; the winning weights are small and clip/model-specific. Keep this
+as an offline calibration harness and feature source, not a runtime default yet.
+
 ## Next Meaningful Work
 
 1. Implement the sequence selector inside `tbd_motion_detector.py` behind an
    explicit non-default delayed-window flag, then benchmark runtime and accuracy.
-2. Reproduce the held-out sequence result on at least one more true
+2. Fold CLBA score-modifier evaluation into the sequence-selector comparison so
+   delayed selection is tested with and without target/background alignment.
+3. Reproduce the held-out sequence result on at least one more true
    tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
    unless visually verified.
-3. Keep improving the frame/candidate router so delayed sequence selection only
+4. Keep improving the frame/candidate router so delayed sequence selection only
    pays the extra cost in surface-backed states.
-4. Reproduce the full-video OOF state-ranker harness on at least one more
+5. Reproduce the full-video OOF state-ranker harness on at least one more
    complete clip, then integrate null handling only if the null/visible tradeoff
    survives.
-5. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
+6. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
    d129-like frames to human review.
-6. Train null-aware tube rankers with explicit no-target/hallucination
+7. Train null-aware tube rankers with explicit no-target/hallucination
    negatives.
