@@ -1222,3 +1222,27 @@ Interpretation: the next label pass should not be broad manual tagging. It
 should fill this packet's `false_lock_kind`, `router_label`, and target fields.
 That data can train a router on exactly the two bad regimes: e271
 continuous-visible protection and aaf1/d129 hard-surface null suppression.
+
+Router feature probes after the packet:
+
+- Tested a hard null-override classifier using `both_null_false_box` rows as
+  forced no-box examples. It was rejected: the best high-null-suppression
+  points collapsed visible strict recall into roughly the `59-66%` range.
+- Added explicit `evaluate_mode_supervisor.py` flags:
+  - `--include_crop_features`;
+  - `--include_branch_context`.
+- Raw crop-stack fields did not materially improve the router:
+  - default threshold `0.2`: `76.84%` strict / `82.21%` loose / `80.59%`
+    invisible no-box;
+  - with crop fields: `76.65%` strict / `82.15%` loose / `81.25%`
+    invisible no-box.
+- Branch-selected context was a clear negative:
+  - OOF AUC dropped from about `0.822` to `0.655`;
+  - threshold `0.2` fell to `74.80%` strict / `80.05%` loose, despite
+    `82.89%` invisible no-box.
+
+Interpretation: the current feature tweaks are not enough. The useful artifact
+from this loop is the disagreement packet plus a reproducible router harness.
+The next real gain likely requires new labels/features from that packet,
+especially false-lock taxonomy and candidate-local visual context, rather than
+reusing the same scalar top-tube fields in different combinations.

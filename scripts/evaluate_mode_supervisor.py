@@ -115,6 +115,18 @@ BASE_FEATURES = (
     "clba_transform_failures",
 )
 
+CROP_FEATURES = (
+    "crop_target_q",
+    "crop_bg_q",
+    "crop_gain",
+    "crop_target_stack_dark_z",
+    "crop_bg_stack_dark_z",
+    "crop_path_bg_dist_mean",
+    "crop_used_frames",
+    "crop_transform_failures",
+    "crop_stack_score",
+)
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
@@ -126,6 +138,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model", required=True, help="Surface ranker .joblib used to add learned_score to top tubes.")
     p.add_argument("--out_dir", required=True)
     p.add_argument("--classifier", choices=("logistic", "hgbdt"), default="logistic")
+    p.add_argument("--include_crop_features", action="store_true")
+    p.add_argument("--include_branch_context", action="store_true")
     p.add_argument("--thresholds", default="0.2,0.3,0.4,0.5,0.6,0.7,0.8")
     p.add_argument("--max_rank", type=int, default=20)
     p.add_argument("--rolling_window", type=int, default=9)
@@ -202,6 +216,10 @@ def parse_thresholds(raw: str) -> list[float]:
     return out
 
 
+def active_base_features(include_crop_features: bool) -> tuple[str, ...]:
+    return BASE_FEATURES + (CROP_FEATURES if include_crop_features else ())
+
+
 def fnum(value: Any, default: float = 0.0) -> float:
     if value in (None, ""):
         return default
@@ -260,12 +278,12 @@ def bg_risk(row: dict[str, Any]) -> float:
     return max(0.0, static - target, attached - target)
 
 
-def row_feature_summary(rows: list[dict[str, Any]], max_rank: int) -> dict[str, float]:
+def row_feature_summary(rows: list[dict[str, Any]], max_rank: int, base_features: tuple[str, ...]) -> dict[str, float]:
     rows = [row for row in rows if int(fnum(row.get("rank"), 999999)) <= max_rank]
     rows.sort(key=lambda r: int(fnum(r.get("rank"), 999999)))
     features: dict[str, float] = {"cand_count": float(len(rows))}
     if not rows:
-        for name in BASE_FEATURES:
+        for name in base_features:
             features[f"top_{name}"] = 0.0
         for key in ("learned_score", "bg_risk", "static_minus_target", "attached_minus_target"):
             features[f"top_{key}"] = 0.0
@@ -276,7 +294,7 @@ def row_feature_summary(rows: list[dict[str, Any]], max_rank: int) -> dict[str, 
 
     top = rows[0]
     top5 = rows[:5]
-    for name in BASE_FEATURES:
+    for name in base_features:
         features[f"top_{name}"] = fnum(top.get(name))
     learned = [fnum(row.get("learned_score")) for row in top5]
     risks = [bg_risk(row) for row in top5]
@@ -326,7 +344,61 @@ def add_rolling_features(per_frame: dict[int, dict[str, float]], window: int) ->
     return out
 
 
-def branch_features(selected: dict[int, dict[str, str]], frames: list[int], prefix: str) -> dict[int, dict[str, float]]:
+def matching_ranked_row(
+    selected_row: dict[str, str],
+    ranked_rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    selected_rank = fnum(selected_row.get("rank"), -1.0)
+    if selected_rank >= 0:
+        for row in ranked_rows:
+            if int(fnum(row.get("rank"), -999.0)) == int(selected_rank):
+                return row
+    try:
+        selected_box = selector.bbox(selected_row)
+    except Exception:
+        return None
+    best_row: dict[str, Any] | None = None
+    best_dist = 1.0e9
+    for row in ranked_rows:
+        try:
+            dist = selector.center_dist(selected_box, selector.bbox(row))
+        except Exception:
+            continue
+        if dist < best_dist:
+            best_dist = dist
+            best_row = row
+    return best_row if best_dist <= 2.0 else None
+
+
+def selected_row_feature_summary(row: dict[str, Any] | None, prefix: str, base_features: tuple[str, ...]) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for name in base_features:
+        out[f"{prefix}_sel_{name}"] = fnum(row.get(name)) if row is not None else 0.0
+    if row is None:
+        out[f"{prefix}_sel_learned_score"] = 0.0
+        out[f"{prefix}_sel_bg_risk"] = 0.0
+        out[f"{prefix}_sel_static_minus_target"] = 0.0
+        out[f"{prefix}_sel_attached_minus_target"] = 0.0
+        return out
+    out[f"{prefix}_sel_learned_score"] = fnum(row.get("learned_score"))
+    out[f"{prefix}_sel_bg_risk"] = bg_risk(row)
+    out[f"{prefix}_sel_static_minus_target"] = fnum(row.get("clba_bg_static_likelihood")) - fnum(
+        row.get("clba_target_likelihood")
+    )
+    out[f"{prefix}_sel_attached_minus_target"] = fnum(row.get("clba_attached_likelihood")) - fnum(
+        row.get("clba_target_likelihood")
+    )
+    return out
+
+
+def branch_features(
+    selected: dict[int, dict[str, str]],
+    ranked_by_frame: dict[int, list[dict[str, Any]]],
+    frames: list[int],
+    prefix: str,
+    base_features: tuple[str, ...],
+    include_context: bool,
+) -> dict[int, dict[str, float]]:
     out: dict[int, dict[str, float]] = {}
     last_row: dict[str, str] | None = None
     last_frame: int | None = None
@@ -345,6 +417,14 @@ def branch_features(selected: dict[int, dict[str, str]], frames: list[int], pref
             values[f"{prefix}_selected"] = 1.0
             values[f"{prefix}_score"] = fnum(row.get("learned_score"))
             values[f"{prefix}_rank"] = fnum(row.get("rank"), 999.0)
+            if include_context:
+                values.update(
+                    selected_row_feature_summary(
+                        matching_ranked_row(row, ranked_by_frame.get(frame, [])),
+                        prefix,
+                        base_features,
+                    )
+                )
             if last_row is not None and last_frame is not None:
                 values[f"{prefix}_jump_px"] = selector.center_dist(selector.bbox(last_row), selector.bbox(row))
                 values[f"{prefix}_gap"] = max(1.0, frame - last_frame)
@@ -352,6 +432,8 @@ def branch_features(selected: dict[int, dict[str, str]], frames: list[int], pref
             last_row = row
             last_frame = frame
         else:
+            if include_context:
+                values.update(selected_row_feature_summary(None, prefix, base_features))
             streak = 0
         values[f"{prefix}_streak"] = float(streak)
         out[frame] = values
@@ -367,6 +449,8 @@ def build_features(
     hmm_dir: Path,
     max_rank: int,
     rolling_window: int,
+    base_features: tuple[str, ...],
+    include_branch_context: bool,
 ) -> tuple[dict[tuple[str, int], dict[str, float]], list[str]]:
     all_features: dict[tuple[str, int], dict[str, float]] = {}
     feature_names: list[str] = []
@@ -374,12 +458,28 @@ def build_features(
         rows = selector.load_ranked_rows(top_tubes_path(results_dir, clip), max_rank)
         scored, _ = selector.score_rows(rows, model_path)
         by_frame = selector.group_by_frame(scored)
-        frame_features = {frame: row_feature_summary(frame_rows, max_rank) for frame, frame_rows in by_frame.items()}
+        frame_features = {
+            frame: row_feature_summary(frame_rows, max_rank, base_features) for frame, frame_rows in by_frame.items()
+        }
         frame_features = add_rolling_features(frame_features, rolling_window)
         label_frames = sorted({int(float(row["frame"])) for row in labels.get(clip, [])})
         frames = sorted(set(frame_features) | set(label_frames))
-        vit = branch_features(selected_by_frame(viterbi_dir, clip), frames, "viterbi")
-        hmm = branch_features(selected_by_frame(hmm_dir, clip), frames, "hmm")
+        vit = branch_features(
+            selected_by_frame(viterbi_dir, clip),
+            by_frame,
+            frames,
+            "viterbi",
+            base_features,
+            include_branch_context,
+        )
+        hmm = branch_features(
+            selected_by_frame(hmm_dir, clip),
+            by_frame,
+            frames,
+            "hmm",
+            base_features,
+            include_branch_context,
+        )
         for frame in frames:
             features = dict(frame_features.get(frame, {}))
             features.update(vit.get(frame, {}))
@@ -515,6 +615,7 @@ def main() -> None:
 
     labels = labels_by_clip(Path(args.labels))
     clips = sorted(labels)
+    base_features = active_base_features(args.include_crop_features)
     features, feature_names = build_features(
         clips=clips,
         labels=labels,
@@ -524,6 +625,8 @@ def main() -> None:
         hmm_dir=Path(args.hmm_dir),
         max_rank=args.max_rank,
         rolling_window=args.rolling_window,
+        base_features=base_features,
+        include_branch_context=args.include_branch_context,
     )
     examples, y, example_clips, _ = disagreement_examples(Path(args.disagreements), features)
     if len(set(y.tolist())) < 2:
@@ -643,6 +746,8 @@ def main() -> None:
                 "classifier": args.classifier,
                 "max_rank": args.max_rank,
                 "rolling_window": args.rolling_window,
+                "include_crop_features": args.include_crop_features,
+                "include_branch_context": args.include_branch_context,
                 "thresholds": thresholds,
                 "feature_names": feature_names,
                 "example_metrics": example_metrics,

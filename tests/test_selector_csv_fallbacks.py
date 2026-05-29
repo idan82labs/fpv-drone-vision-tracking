@@ -16,6 +16,49 @@ def write_rows(path: Path, rows: list[dict[str, str]]) -> None:
 
 
 class SelectorCsvFallbackTests(unittest.TestCase):
+    def test_supervisor_crop_features_are_explicit(self):
+        self.assertNotIn("crop_stack_score", supervisor.active_base_features(False))
+        self.assertIn("crop_stack_score", supervisor.active_base_features(True))
+
+    def test_supervisor_branch_context_is_explicit(self):
+        selected = {
+            7: {
+                "frame": "7",
+                "selected": "1",
+                "rank": "2",
+                "learned_score": "0.75",
+                "x": "10",
+                "y": "12",
+                "w": "4",
+                "h": "4",
+            }
+        }
+        ranked = {
+            7: [
+                {"rank": "1", "x": "1", "y": "1", "w": "4", "h": "4", "crop_stack_score": "0.1"},
+                {"rank": "2", "x": "10", "y": "12", "w": "4", "h": "4", "crop_stack_score": "0.9"},
+            ]
+        }
+        without_context = supervisor.branch_features(
+            selected,
+            ranked,
+            [7],
+            "viterbi",
+            supervisor.active_base_features(True),
+            include_context=False,
+        )
+        with_context = supervisor.branch_features(
+            selected,
+            ranked,
+            [7],
+            "viterbi",
+            supervisor.active_base_features(True),
+            include_context=True,
+        )
+
+        self.assertNotIn("viterbi_sel_crop_stack_score", without_context[7])
+        self.assertEqual(with_context[7]["viterbi_sel_crop_stack_score"], 0.9)
+
     def test_disagreement_reader_accepts_sequence_selected_tracks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
