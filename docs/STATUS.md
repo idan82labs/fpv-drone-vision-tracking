@@ -79,10 +79,22 @@ From the first GPT vision surface-label expansion:
 
 Interpretation: the new labels improve coverage, but they do not justify a global learned selector. A state-conditioned selector is more promising: learned ranking helps true surface-backed frames and hurts skyline-adjacent sky frames.
 
+From the first complete-video non-sky benchmark:
+
+- Built a full-video d129 vision-label set: 250 total frames, 38 visible target frames, 212 invisible/no-target frames.
+- Current actual pair-rescue tracker: 160/250 all-frame correctness = 64.0%.
+- Current actual visible strict hit: 29/38 = 76.3%.
+- Current actual invisible no-box rate: 131/212 = 61.8%.
+- Top-80 oracle on visible d129 frames: 38/38 = 100%.
+- HistGBDT visible-frame ranking with d129 held out: 34/38 = 89.5%.
+- Simple learned null threshold can reach 86.8% all-frame correctness, but visible strict drops to 26/38 = 68.4%.
+
+Interpretation: d129 is now a useful complete-video benchmark. The target is in the candidate pool, and learned ranking can pick it when visible. The blocker is acquisition/null logic: the current tracker hallucinates before target appearance, while a blunt learned threshold suppresses too much target recall.
+
 ## Next Meaningful Work
 
 1. Collect or generate true target-over-tree/grass/terrain labels; route ambiguous d129-like frames to human review.
 2. Improve the background router until it cleanly separates sky, skyline, cloud texture, and true surface-backed targets.
-3. Keep the state-machine selector path: learned ranker only in states where LOCO shows benefit.
-4. Train a tube-level ranker on hard top-tube alternatives after the surface-positive dataset is less biased.
-5. Add target-aligned versus background-aligned crop-stack features.
+3. Implement/evaluate acquisition versus tracking state: high threshold before lock, lower continuity-backed threshold after lock.
+4. Keep the state-machine selector path: learned ranker only in states where LOCO shows benefit.
+5. Train null-aware tube rankers with explicit no-target/hallucination negatives.
