@@ -80,6 +80,12 @@ def run(cmd: list[str]) -> None:
     subprocess.run(cmd, check=True)
 
 
+def with_optional_clip(cmd: list[str], clip: str) -> list[str]:
+    if clip:
+        return [*cmd, "--clip", clip]
+    return cmd
+
+
 def model_summary_lookup(path: Path) -> dict[str, dict[str, str]]:
     return {row["model"]: row for row in read_csv(path)}
 
@@ -120,7 +126,8 @@ def main() -> None:
 
     baseline_dir = out_dir / "state_machine_baseline_verified_score"
     run(
-        [
+        with_optional_clip(
+            [
             args.python,
             args.state_script,
             "--labels",
@@ -147,7 +154,9 @@ def main() -> None:
             args.max_jump_px,
             "--out_dir",
             str(baseline_dir),
-        ]
+            ],
+            args.clip,
+        )
     )
     baseline_cfg = json.loads((baseline_dir / "best_config.json").read_text())
     comparison.append({"model": "baseline_verified_score", **model_summary.get("baseline_verified_score", {}), **baseline_cfg})
@@ -159,7 +168,8 @@ def main() -> None:
             continue
         state_dir = out_dir / f"state_machine_{model}"
         run(
-            [
+            with_optional_clip(
+                [
                 args.python,
                 args.state_script,
                 "--labels",
@@ -186,7 +196,9 @@ def main() -> None:
                 args.max_jump_px,
                 "--out_dir",
                 str(state_dir),
-            ]
+                ],
+                args.clip,
+            )
         )
         cfg = json.loads((state_dir / "best_config.json").read_text())
         comparison.append({"model": model, **model_summary.get(model, {}), **cfg})

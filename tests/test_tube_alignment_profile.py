@@ -1,8 +1,11 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import numpy as np
 
 from scripts import profile_tube_alignment_features as align
+from scripts import augment_top_tubes_alignment_features as augment
 
 
 class TubeAlignmentProfileTests(unittest.TestCase):
@@ -33,6 +36,33 @@ class TubeAlignmentProfileTests(unittest.TestCase):
         wins, total, rate = align.pairwise_summary(rows, "score")
         self.assertEqual((wins, total), (1, 2))
         self.assertEqual(rate, 0.5)
+
+    def test_control_offsets_are_deterministic_annulus_points(self):
+        offsets = augment.sample_control_offsets(radius=10.0, count=8)
+        self.assertEqual(len(offsets), 8)
+        self.assertAlmostEqual(offsets[0][0], 10.0)
+        self.assertAlmostEqual(offsets[0][1], 0.0)
+        self.assertTrue(all((x * x + y * y) ** 0.5 >= 9.9 for x, y in offsets))
+
+    def test_gain_zscore_uses_robust_local_controls(self):
+        z, med, sigma = augment.gain_zscore(3.0, [1.0, 1.0, 1.0, 9.0])
+        self.assertEqual(med, 1.0)
+        self.assertGreaterEqual(sigma, 0.25)
+        self.assertGreater(z, 0.0)
+
+    def test_load_rows_can_filter_to_reviewed_frames(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "top.csv"
+            path.write_text(
+                "frame,rank,x,y,w,h\n"
+                "1,1,0,0,2,2\n"
+                "2,1,0,0,2,2\n"
+                "2,3,0,0,2,2\n"
+            )
+            rows = augment.load_rows(path, "clip-a", max_rank=2, frame_min=-1, frame_max=-1, frame_filter={2})
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["frame"], "2")
+        self.assertEqual(rows[0]["clip"], "clip-a")
 
 
 if __name__ == "__main__":

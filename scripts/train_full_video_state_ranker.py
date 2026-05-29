@@ -334,6 +334,7 @@ def frame_best_rows(
         rows.append(
             {
                 "model": model_name,
+                "clip": lab.get("clip", ""),
                 "frame": frame,
                 "visible": int(lab["visible"]),
                 "rank": safe_int(row.get("rank"), 999999),
@@ -399,6 +400,7 @@ def main() -> None:
         out_dir / "candidate_training_examples.csv",
         [
             {
+                "clip": ex["label"].get("clip", ""),
                 "frame": ex["frame"],
                 "rank": ex["row"].get("rank", ""),
                 "y": ex["y"],
@@ -471,6 +473,7 @@ def main() -> None:
             row = ex["row"]
             cand_rows.append(
                 {
+                    "clip": ex["label"].get("clip", ""),
                     "frame": ex["frame"],
                     "rank": row.get("rank", ""),
                     score_column: round(float(oof_scores[local_i]), 9),

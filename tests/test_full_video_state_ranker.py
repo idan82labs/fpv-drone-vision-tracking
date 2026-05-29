@@ -1,5 +1,6 @@
 import unittest
 
+from scripts import run_full_video_oof_state_eval as oof_eval
 from scripts import train_full_video_state_ranker as ranker
 
 
@@ -35,6 +36,27 @@ class FullVideoStateRankerTests(unittest.TestCase):
         self.assertEqual(set(folds), set(labels))
         self.assertEqual({folds[i] for i in range(6)}, {0, 1})
         self.assertEqual({folds[i] for i in range(6, 10)}, {0, 1})
+
+    def test_oof_eval_passes_clip_to_state_machine_commands(self):
+        cmd = ["python", "scripts/evaluate_lock_state_machine.py", "--labels", "labels.csv"]
+        self.assertEqual(
+            oof_eval.with_optional_clip(cmd, "clip-a"),
+            ["python", "scripts/evaluate_lock_state_machine.py", "--labels", "labels.csv", "--clip", "clip-a"],
+        )
+        self.assertEqual(oof_eval.with_optional_clip(cmd, ""), cmd)
+
+    def test_frame_best_rows_preserves_clip_for_state_eval_filter(self):
+        examples = [
+            {
+                "frame": 3,
+                "row": {"rank": "1", "x": "1", "y": "2", "w": "3", "h": "4"},
+                "label": {"clip": "clip-a", "visible": True},
+                "y": 1,
+                "dist_px": 0.0,
+            }
+        ]
+        rows = ranker.frame_best_rows(examples, [0.9], "m", "score_m")
+        self.assertEqual(rows[0]["clip"], "clip-a")
 
 
 if __name__ == "__main__":
