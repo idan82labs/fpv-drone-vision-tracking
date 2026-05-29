@@ -49,7 +49,7 @@ class FullVideoStateRankerTests(unittest.TestCase):
         examples = [
             {
                 "frame": 3,
-                "row": {"rank": "1", "x": "1", "y": "2", "w": "3", "h": "4"},
+                "row": {"rank": "1", "x": "1", "y": "2", "w": "3", "h": "4", "clba_gain_norm": "0.7"},
                 "label": {"clip": "clip-a", "visible": True},
                 "y": 1,
                 "dist_px": 0.0,
@@ -57,6 +57,7 @@ class FullVideoStateRankerTests(unittest.TestCase):
         ]
         rows = ranker.frame_best_rows(examples, [0.9], "m", "score_m")
         self.assertEqual(rows[0]["clip"], "clip-a")
+        self.assertEqual(rows[0]["clba_gain_norm"], "0.7")
 
 
 if __name__ == "__main__":

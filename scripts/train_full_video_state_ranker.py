@@ -331,7 +331,8 @@ def frame_best_rows(
         row = ex["row"]
         lab = ex["label"]
         strict_hit = bool(ex["y"] == 1)
-        rows.append(
+        out = dict(row)
+        out.update(
             {
                 "model": model_name,
                 "clip": lab.get("clip", ""),
@@ -352,6 +353,7 @@ def frame_best_rows(
                 "tube_verifier_score": row.get("tube_verifier_score", ""),
             }
         )
+        rows.append(out)
     return rows
 
 
@@ -471,7 +473,8 @@ def main() -> None:
         cand_rows = []
         for local_i, ex in enumerate(oof_examples):
             row = ex["row"]
-            cand_rows.append(
+            out = dict(row)
+            out.update(
                 {
                     "clip": ex["label"].get("clip", ""),
                     "frame": ex["frame"],
@@ -489,6 +492,7 @@ def main() -> None:
                     "verified_score": row.get("verified_score", ""),
                 }
             )
+            cand_rows.append(out)
         best_rows = frame_best_rows(oof_examples, oof_scores, model_name, score_column)
         write_csv(out_dir / f"oof_candidate_scores_{model_name}.csv", cand_rows)
         write_csv(out_dir / f"oof_best_per_frame_{model_name}.csv", best_rows)
