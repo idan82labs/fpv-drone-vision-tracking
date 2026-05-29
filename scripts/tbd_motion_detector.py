@@ -16,6 +16,7 @@ import json
 import math
 import sys
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -35,6 +36,18 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max_frames", type=int, default=None)
     p.add_argument("--save_every", type=int, default=30)
     p.add_argument("--write_video", action="store_true")
+    p.add_argument(
+        "--report_mode",
+        choices=("full", "summary"),
+        default="full",
+        help="full stores every frame record; summary stores bounded aggregate stats for long-running onboard use.",
+    )
+    p.add_argument(
+        "--stream_only",
+        action="store_true",
+        help="Do not accumulate selected/top-tube CSV rows in memory; use JSONL telemetry for live output.",
+    )
+    p.add_argument("--stats_window", type=int, default=4096, help="Rolling sample window for p90/p95 in summary report mode.")
 
     p.add_argument("--model", choices=("partial_affine", "full_affine", "homography", "auto"), default="auto")
     p.add_argument("--max_corners", type=int, default=900)
@@ -151,6 +164,22 @@ def parse_args() -> argparse.Namespace:
         default="off",
         help="Use learned surface ranker only as a confidence-gated selector fallback.",
     )
+    p.add_argument(
+        "--surface_ranker_gate",
+        choices=(
+            "none",
+            "learned_not_map",
+            "source_large_dark_or_appearance",
+            "high_support",
+            "high_texture_support",
+            "large_dark_high_support",
+            "low_sky_high_support",
+            "negative_bg_pair",
+            "support_negative_bg_pair",
+        ),
+        default="none",
+        help="Optional learned-candidate gate for state-specific surface fallback experiments.",
+    )
     p.add_argument("--surface_ranker_threshold", type=float, default=0.76)
     p.add_argument("--surface_ranker_top_n", type=int, default=80, help="Maximum baseline-ranked states to rescore; <=0 means all.")
     p.add_argument("--scenario_balance", action="store_true")
@@ -218,6 +247,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--pair_min_step_px", type=float, default=1.0)
     p.add_argument("--top_k_debug", type=int, default=12)
     p.add_argument("--export_top_tubes", type=int, default=0)
+    p.add_argument(
+        "--delayed_sequence_select",
+        action="store_true",
+        help="Use a lightweight delayed Viterbi selector over recent top states for selected_tracks.csv.",
+    )
+    p.add_argument("--delayed_sequence_top_n", type=int, default=20)
+    p.add_argument("--delayed_sequence_min_hits", type=int, default=1)
+    p.add_argument("--delayed_sequence_window", type=int, default=15)
+    p.add_argument("--delayed_sequence_max_jump_px", type=float, default=10.0)
+    p.add_argument("--delayed_sequence_transition_weight", type=float, default=1.5)
+    p.add_argument("--delayed_sequence_threshold", type=float, default=0.0)
+    p.add_argument(
+        "--delayed_sequence_require_floor",
+        action="store_true",
+        help="Require each delayed-sequence state to pass the immediate detector floor. Safer but can lose recall.",
+    )
+    p.add_argument(
+        "--delayed_sequence_commit_prefix",
+        action="store_true",
+        help="Commit the emitted delayed-sequence branch before future pops. Reduces jump risk but can lose recall.",
+    )
+    p.add_argument(
+        "--selected_jsonl",
+        default="",
+        help="Optional live newline-delimited selected-box stream for onboard consumers.",
+    )
+    p.add_argument(
+        "--telemetry_jsonl",
+        default="",
+        help="Optional per-processed-frame telemetry stream with selected/null status and latency.",
+    )
     p.add_argument("--draw_debug", action="store_true")
     return p.parse_args()
 
@@ -1871,7 +1931,7 @@ def state_feature_row(
         "misses": st.misses,
         "vx": st.vx,
         "vy": st.vy,
-        "competitor_margin": 0.0 if competitor_margin is None else competitor_margin,
+        "competitor_margin": "" if competitor_margin is None else competitor_margin,
     }
     cand_is_current = st.misses == 0 and st.last_candidate is not None
     if cand_is_current:
@@ -1882,6 +1942,53 @@ def state_feature_row(
     for key, value in features.items():
         row[f"tube_{key}"] = float(value)
     return row
+
+
+def ranker_row_float(row: dict[str, object], name: str, default: float = 0.0) -> float:
+    value = row.get(name, default)
+    if value in (None, ""):
+        return default
+    try:
+        out = float(value)  # type: ignore[arg-type]
+    except Exception:
+        return default
+    return out if math.isfinite(out) else default
+
+
+def surface_ranker_gate_allows(row: dict[str, object], gate: str) -> bool:
+    if gate == "none":
+        return True
+    source = str(row.get("cand_source", ""))
+    support = max(
+        ranker_row_float(row, "cand_attached_support"),
+        ranker_row_float(row, "tube_mean_attached_support"),
+    )
+    texture = max(
+        ranker_row_float(row, "cand_texture"),
+        ranker_row_float(row, "tube_mean_texture"),
+    )
+    sky = max(
+        ranker_row_float(row, "cand_sky_like"),
+        ranker_row_float(row, "tube_mean_sky_like"),
+    )
+    pair_bg = ranker_row_float(row, "tube_mean_pair_bg")
+    if gate == "learned_not_map":
+        return source != "map"
+    if gate == "source_large_dark_or_appearance":
+        return source in {"large_dark", "appearance"}
+    if gate == "high_support":
+        return support >= 8.0
+    if gate == "high_texture_support":
+        return texture >= 55.0 and support >= 6.0
+    if gate == "large_dark_high_support":
+        return source == "large_dark" and support >= 6.0
+    if gate == "low_sky_high_support":
+        return sky <= 0.02 and support >= 6.0
+    if gate == "negative_bg_pair":
+        return pair_bg <= 0.0
+    if gate == "support_negative_bg_pair":
+        return support >= 6.0 and pair_bg <= 0.0
+    return False
 
 
 class LearnedSurfaceRanker:
@@ -1934,6 +2041,10 @@ class BeamTBD:
             if args.surface_ranker_policy != "off" and args.surface_ranker_model
             else None
         )
+        self.last_surface_ranker_rows = 0
+        self.last_surface_ranker_score: float | None = None
+        self.last_surface_ranker_sid: int | None = None
+        self.last_surface_ranker_used = False
 
     def verified_score(self, st: PathState) -> float:
         if self.args.tube_verifier == "off":
@@ -1958,6 +2069,9 @@ class BeamTBD:
         return scored
 
     def _surface_ranker_fallback_best(self, scored: list[tuple[float, float, PathState]]) -> PathState | None:
+        self.last_surface_ranker_rows = 0
+        self.last_surface_ranker_score = None
+        self.last_surface_ranker_sid = None
         if self.surface_ranker is None or self.args.surface_ranker_policy != "confidence_fallback":
             return None
         rows: list[dict[str, object]] = []
@@ -1970,15 +2084,22 @@ class BeamTBD:
                 continue
             next_score = scored[rank][0] if rank < len(scored) else None
             margin = (baseline_score - next_score) if next_score is not None else None
-            rows.append(state_feature_row(st, self.args, rank, baseline_score, tube_score, margin))
+            row = state_feature_row(st, self.args, rank, baseline_score, tube_score, margin)
+            rows.append(row)
             states.append(st)
         if not rows:
             return None
+        self.last_surface_ranker_rows = len(rows)
         scores = self.surface_ranker.scores(rows)
         if len(scores) == 0:
             return None
         best_i = int(np.argmax(scores))
-        if float(scores[best_i]) >= self.args.surface_ranker_threshold:
+        self.last_surface_ranker_score = float(scores[best_i])
+        self.last_surface_ranker_sid = states[best_i].sid
+        if (
+            float(scores[best_i]) >= self.args.surface_ranker_threshold
+            and surface_ranker_gate_allows(rows[best_i], self.args.surface_ranker_gate)
+        ):
             return states[best_i]
         return None
 
@@ -2063,7 +2184,11 @@ class BeamTBD:
                 tuple[float, float, int, int],
             ]
         ] = []
-        need_extra_pair_features = self.args.tube_verifier == "likelihood" or self.args.export_top_tubes > 0
+        need_extra_pair_features = (
+            self.args.tube_verifier == "likelihood"
+            or self.args.export_top_tubes > 0
+            or self.surface_ranker is not None
+        )
         for st in self.states:
             dt = max(1, frame_no - st.last_frame)
             if dt > self.args.max_misses + 1:
@@ -2256,6 +2381,7 @@ class BeamTBD:
         return self.states
 
     def best(self) -> PathState | None:
+        self.last_surface_ranker_used = False
         eligible = [
             st
             for st in self.states
@@ -2263,6 +2389,15 @@ class BeamTBD:
         ]
         if not eligible:
             return None
+
+        if (
+            self.surface_ranker is None
+            and self.args.tube_verifier == "off"
+            and self.args.selection_margin <= 0.0
+            and not self.args.sky_rescue
+        ):
+            best = max(eligible, key=lambda st: st.score())
+            return best if best.score() >= self.args.selected_score else None
 
         scored = self._ranked_eligible(eligible)
         if not scored:
@@ -2272,6 +2407,7 @@ class BeamTBD:
         if learned_best is not None:
             learned_score = self.verified_score(learned_best)
             if learned_score >= self.args.selected_score:
+                self.last_surface_ranker_used = True
                 return learned_best
 
         best_score, _tube_score, best = scored[0]
@@ -2281,6 +2417,119 @@ class BeamTBD:
         if best_score >= self.args.selected_score:
             return best
         return self._sky_rescue_best()
+
+
+class DelayedSequenceSelector:
+    """Small delayed Viterbi selector over recent detector states.
+
+    This mirrors the Raspberry Pi export replay selector, but runs inside the
+    detector over a bounded top-N/window so it can be used as a live delayed
+    output mode without sklearn or full-video dynamic programming.
+    """
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.layers: list[dict[str, object]] = []
+
+    def add_frame(self, frame_no: int, states: list[PathState], tbd: BeamTBD) -> None:
+        ranked = sorted(
+            [(float(tbd.verified_score(st)), st) for st in states if state_is_sequence_candidate(st, tbd, self.args)],
+            key=lambda item: item[0],
+            reverse=True,
+        )[: max(1, self.args.delayed_sequence_top_n)]
+        path_scores: list[float] = []
+        backptrs: list[int | None] = []
+        prev = self.layers[-1] if self.layers else None
+        prev_rows = prev["rows"] if prev is not None else []
+        prev_scores = prev["path_scores"] if prev is not None else []
+        prev_frame = int(prev["frame"]) if prev is not None else frame_no - 1
+        if prev_rows and prev_scores:
+            gap = max(1, frame_no - prev_frame)
+            allowed = max(1e-6, self.args.delayed_sequence_max_jump_px * gap)
+            for score, st in ranked:
+                best_score = -1e18
+                best_idx: int | None = None
+                for pi, (_prev_score_raw, prev_st) in enumerate(prev_rows):
+                    jump = center_distance(st.bbox, prev_st.bbox)
+                    if jump > allowed:
+                        continue
+                    cost = self.args.delayed_sequence_transition_weight * (jump / allowed) ** 2
+                    path_score = float(prev_scores[pi]) + float(score) - cost
+                    if path_score > best_score:
+                        best_score = path_score
+                        best_idx = pi
+                if best_idx is None:
+                    best_score = float(score) - 1.0
+                path_scores.append(best_score)
+                backptrs.append(best_idx)
+        else:
+            path_scores = [float(score) for score, _st in ranked]
+            backptrs = [None for _score, _st in ranked]
+        self.layers.append(
+            {
+                "frame": frame_no,
+                "rows": ranked,
+                "path_scores": path_scores,
+                "backptrs": backptrs,
+            }
+        )
+
+    def ready(self) -> bool:
+        return len(self.layers) > max(1, self.args.delayed_sequence_window)
+
+    def pop_ready(self) -> tuple[int, PathState | None]:
+        if not self.layers:
+            raise RuntimeError("no delayed sequence layers")
+        frame_no, selected, path_indices = self._select_path()
+        self.layers.pop(0)
+        if selected is not None and path_indices and self.args.delayed_sequence_commit_prefix:
+            self._commit_remaining_path(path_indices[1:])
+        return frame_no, selected
+
+    def flush(self) -> list[tuple[int, PathState | None]]:
+        out: list[tuple[int, PathState | None]] = []
+        while self.layers:
+            out.append(self.pop_ready())
+        return out
+
+    def _select_path(self) -> tuple[int, PathState | None, list[int]]:
+        first_frame = int(self.layers[0]["frame"])
+        if not self.layers or not self.layers[-1]["path_scores"]:
+            return first_frame, None, []
+
+        last_scores = self.layers[-1]["path_scores"]
+        idx: int | None = max(range(len(last_scores)), key=lambda i: float(last_scores[i]))
+        path_indices: list[int] = []
+        for li in range(len(self.layers) - 1, 0, -1):
+            if idx is None:
+                return first_frame, None, []
+            path_indices.append(idx)
+            backptrs = self.layers[li]["backptrs"]
+            idx = backptrs[idx]
+        if idx is None:
+            return first_frame, None, []
+        path_indices.append(idx)
+        path_indices.reverse()
+        rows = self.layers[0]["rows"]
+        if not rows:
+            return first_frame, None, []
+        score, st = rows[idx]
+        if score < self.args.delayed_sequence_threshold:
+            return first_frame, None, path_indices
+        return first_frame, st, path_indices
+
+    def _commit_remaining_path(self, path_indices: list[int]) -> None:
+        if not path_indices:
+            return
+        for li, keep_idx in enumerate(path_indices[: len(self.layers)]):
+            layer = self.layers[li]
+            rows = layer["rows"]
+            path_scores = layer["path_scores"]
+            if keep_idx < 0 or keep_idx >= len(rows):
+                return
+            layer["rows"] = [rows[keep_idx]]
+            layer["path_scores"] = [path_scores[keep_idx]]
+            layer["backptrs"] = [None if li == 0 else 0]
 
 
 def draw_overlay(
@@ -2401,8 +2650,173 @@ def tube_state_payload(
     return payload, row
 
 
+def state_is_sequence_candidate(st: PathState, tbd: BeamTBD, args: argparse.Namespace) -> bool:
+    if st.misses > args.max_selected_misses or st.hit_count() < args.delayed_sequence_min_hits:
+        return False
+    if not getattr(args, "delayed_sequence_require_floor", False):
+        return True
+    raw = st.score()
+    if args.tube_verifier == "off":
+        return raw >= args.selected_score
+    features = tube_features(st)
+    tube_score = scoped_tube_verifier_score(features, args)
+    return tube_score >= args.tube_verifier_floor and tbd.verified_score(st) >= args.selected_score
+
+
+def selected_state_json(
+    frame_no: int,
+    selected: PathState,
+    tbd: BeamTBD,
+    args: argparse.Namespace,
+) -> dict:
+    selected_tube_features = tube_features(selected)
+    selected_tube_score = scoped_tube_verifier_score(selected_tube_features, args)
+    selected_cand_is_current = selected.misses == 0 and selected.last_candidate is not None
+    return {
+        "track_id": selected.sid,
+        "bbox": list(selected.bbox),
+        "source": "tbd",
+        "score": round(selected.score(), 3),
+        "verified_score": round(tbd.verified_score(selected), 3),
+        "tube_verifier_score": round(selected_tube_score, 3),
+        "surface_ranker_used": tbd.last_surface_ranker_used,
+        "surface_ranker_score": None
+        if tbd.last_surface_ranker_score is None
+        else round(tbd.last_surface_ranker_score, 6),
+        "surface_ranker_rows": tbd.last_surface_ranker_rows,
+        "tube_features": {k: round(float(v), 3) for k, v in selected_tube_features.items()},
+        "hits": selected.hit_count(),
+        "misses": selected.misses,
+        "vx": round(selected.vx, 3),
+        "vy": round(selected.vy, 3),
+        "candidate_is_current": selected_cand_is_current,
+        "candidate_frame": frame_no if selected_cand_is_current else None,
+        "candidate": selected.last_candidate.to_json() if selected_cand_is_current else None,
+    }
+
+
+def append_selected_output(
+    frame_no: int,
+    selected: PathState | None,
+    tbd: BeamTBD,
+    args: argparse.Namespace,
+    selected_rows: list[list],
+    selected_feature_rows: list[dict],
+    selected_jsonl_handle=None,
+    emitted_at_frame: int | None = None,
+    selected_source: str = "tbd",
+) -> int:
+    if selected is None:
+        return 0
+    if not args.stream_only:
+        selected_rows.append([frame_no, selected.sid, *selected.bbox, selected.score(), selected.misses])
+        _payload, row = tube_state_payload(frame_no, 1, selected, tbd, args, selected)
+        selected_feature_rows.append(row)
+    if selected_jsonl_handle is not None:
+        record = {
+            "frame": frame_no,
+            "emitted_at_frame": emitted_at_frame if emitted_at_frame is not None else frame_no,
+            "source": selected_source,
+            "track_id": selected.sid,
+            "bbox": list(selected.bbox),
+            "score": round(float(selected.score()), 6),
+            "verified_score": round(float(tbd.verified_score(selected)), 6),
+            "misses": selected.misses,
+            "hits": selected.hit_count(),
+        }
+        selected_jsonl_handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        selected_jsonl_handle.flush()
+    return 1
+
+
+def write_telemetry_output(
+    handle,
+    emitted_at_frame: int,
+    selected_frame: int,
+    selected: PathState | None,
+    tbd: BeamTBD,
+    source: str,
+    status: str,
+    process_ms: float,
+    wall_ms: float,
+) -> None:
+    if handle is None:
+        return
+    record = {
+        "emitted_at_frame": emitted_at_frame,
+        "selected_frame": selected_frame,
+        "source": source,
+        "status": status,
+        "process_ms": round(float(process_ms), 3),
+        "wall_ms": round(float(wall_ms), 3),
+        "selected": selected is not None,
+    }
+    if selected is not None:
+        record.update(
+            {
+                "track_id": selected.sid,
+                "bbox": list(selected.bbox),
+                "score": round(float(selected.score()), 6),
+                "verified_score": round(float(tbd.verified_score(selected)), 6),
+                "misses": selected.misses,
+                "hits": selected.hit_count(),
+            }
+        )
+    handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+    handle.flush()
+
+
+def video_capture_source(source: str) -> str | int:
+    raw = str(source).strip()
+    if raw.startswith("camera:"):
+        device = raw.split(":", 1)[1].strip()
+        if not device.isdigit():
+            raise ValueError(f"camera source must be camera:<integer>, got {source!r}")
+        return int(device)
+    if raw.isdigit():
+        return int(raw)
+    return source
+
+
+class RunningWindowStats:
+    def __init__(self, window: int = 4096):
+        self.count = 0
+        self.total = 0.0
+        self.max_value = 0.0
+        self.values: deque[float] = deque(maxlen=max(1, int(window)))
+
+    def add(self, value: float) -> None:
+        if not math.isfinite(value):
+            return
+        self.count += 1
+        v = float(value)
+        self.total += v
+        self.max_value = max(self.max_value, v)
+        self.values.append(v)
+
+    def mean(self) -> float:
+        return self.total / self.count if self.count else 0.0
+
+    def percentile(self, q: float) -> float:
+        if not self.values:
+            return 0.0
+        return float(np.percentile(np.asarray(self.values, dtype=np.float32), q))
+
+    def max(self) -> float:
+        return self.max_value if self.count else 0.0
+
+
 def run(args: argparse.Namespace) -> None:
-    cap = cv2.VideoCapture(args.video)
+    if args.surface_ranker_policy != "off" and not args.surface_ranker_model:
+        raise SystemExit("--surface_ranker_model is required when --surface_ranker_policy is not off")
+    if (
+        args.surface_ranker_policy != "off"
+        and args.surface_ranker_scope == "surface_backed"
+        and not router_is_active(args)
+    ):
+        raise SystemExit("--surface_ranker_scope surface_backed requires an active candidate router/runtime mode")
+
+    cap = cv2.VideoCapture(video_capture_source(args.video))
     if not cap.isOpened():
         raise SystemExit(f"cannot open {args.video}")
     fps_src = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -2427,9 +2841,30 @@ def run(args: argparse.Namespace) -> None:
 
     px_per_frame = base.kinematic_px_per_frame(w_img, fps_src, args)
     tbd = BeamTBD(args, px_per_frame)
+    delayed_selector = DelayedSequenceSelector(args) if args.delayed_sequence_select else None
+    selected_jsonl_handle = None
+    if args.selected_jsonl:
+        selected_jsonl_path = Path(args.selected_jsonl)
+        selected_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        selected_jsonl_handle = selected_jsonl_path.open("w")
+    telemetry_jsonl_handle = None
+    if args.telemetry_jsonl:
+        telemetry_jsonl_path = Path(args.telemetry_jsonl)
+        telemetry_jsonl_path.parent.mkdir(parents=True, exist_ok=True)
+        telemetry_jsonl_handle = telemetry_jsonl_path.open("w")
     prev_mask: np.ndarray | None = None
     report: list[dict] = []
+    process_stats = RunningWindowStats(args.stats_window)
+    wall_stats = RunningWindowStats(args.stats_window)
+    inlier_stats = RunningWindowStats(args.stats_window)
+    candidate_stats = RunningWindowStats(args.stats_window)
+    timing_stats: dict[str, RunningWindowStats] = {}
+    processed_count = 0
+    selected_frames = 0
+    noisy_frames = 0
+    multi_candidate_frames = 0
     selected_rows: list[list] = []
+    selected_output_count = 0
     selected_feature_rows: list[dict] = []
     top_tube_rows: list[dict] = []
     model_counts: dict[str, int] = {}
@@ -2443,10 +2878,12 @@ def run(args: argparse.Namespace) -> None:
     while True:
         if args.max_frames is not None and fno >= args.max_frames:
             break
+        wall_start = time.perf_counter()
         ok, cur = cap.read()
+        t_read = time.perf_counter()
         if not ok:
             break
-        frame_start = time.perf_counter()
+        frame_start = t_read
         cur_full = cur
         if args.downscale != 1.0:
             cur = cv2.resize(cur, None, fx=args.downscale, fy=args.downscale, interpolation=cv2.INTER_AREA)
@@ -2640,57 +3077,49 @@ def run(args: argparse.Namespace) -> None:
         selected = tbd.best()
         t_tbd = time.perf_counter()
 
-        selected_json = None
-        if selected is not None:
-            selected_tube_features = tube_features(selected)
-            selected_tube_score = scoped_tube_verifier_score(selected_tube_features, args)
-            selected_json = {
-                "track_id": selected.sid,
-                "bbox": list(selected.bbox),
-                "source": "tbd",
-                "score": round(selected.score(), 3),
-                "verified_score": round(tbd.verified_score(selected), 3),
-                "tube_verifier_score": round(selected_tube_score, 3),
-                "tube_features": {k: round(float(v), 3) for k, v in selected_tube_features.items()},
-                "hits": selected.hit_count(),
-                "misses": selected.misses,
-                "vx": round(selected.vx, 3),
-                "vy": round(selected.vy, 3),
-            }
-            selected_cand_is_current = selected.misses == 0 and selected.last_candidate is not None
-            selected_json["candidate_is_current"] = selected_cand_is_current
-            selected_json["candidate_frame"] = fno if selected_cand_is_current else None
-            selected_json["candidate"] = (
-                selected.last_candidate.to_json() if selected_cand_is_current else None
+        selected_json = selected_state_json(fno, selected, tbd, args) if selected is not None else None
+        telemetry_events: list[tuple[int, PathState | None, str, str]] = []
+        if selected is not None and not args.delayed_sequence_select:
+            selected_output_count += append_selected_output(
+                fno,
+                selected,
+                tbd,
+                args,
+                selected_rows,
+                selected_feature_rows,
+                selected_jsonl_handle,
+                emitted_at_frame=fno,
+                selected_source="tbd",
             )
-            selected_rows.append([fno, selected.sid, *selected.bbox, selected.score(), selected.misses])
-            row = {
-                "frame": fno,
-                "track_id": selected.sid,
-                "x": selected.bbox[0],
-                "y": selected.bbox[1],
-                "w": selected.bbox[2],
-                "h": selected.bbox[3],
-                "score": round(selected.score(), 6),
-                "verified_score": round(tbd.verified_score(selected), 6),
-                "tube_verifier_score": round(selected_tube_score, 6),
-                "misses": selected.misses,
-                "vx": round(selected.vx, 6),
-                "vy": round(selected.vy, 6),
-                "cand_is_current": int(selected_cand_is_current),
-                "cand_frame": fno if selected_cand_is_current else "",
-            }
-            if selected_cand_is_current:
-                cand_json = selected.last_candidate.to_json()
-                for key, value in cand_json.items():
-                    if isinstance(value, (int, float, str)):
-                        row[f"cand_{key}"] = value
-            for key, value in selected_tube_features.items():
-                row[f"tube_{key}"] = round(float(value), 6)
-            selected_feature_rows.append(row)
-            motion_model_mask_boxes = [selected.bbox] if selected.misses == 0 else []
-        else:
-            motion_model_mask_boxes = []
+        if not args.delayed_sequence_select:
+            telemetry_events.append((fno, selected, "tbd", "selected" if selected is not None else "no_target"))
+        motion_model_mask_boxes = [selected.bbox] if selected is not None and selected.misses == 0 else []
+
+        if delayed_selector is not None:
+            delayed_selector.add_frame(fno, states, tbd)
+            while delayed_selector.ready():
+                out_frame, out_selected = delayed_selector.pop_ready()
+                telemetry_events.append(
+                    (
+                        out_frame,
+                        out_selected,
+                        "delayed_sequence",
+                        "selected" if out_selected is not None else "no_target",
+                    )
+                )
+                selected_output_count += append_selected_output(
+                    out_frame,
+                    out_selected,
+                    tbd,
+                    args,
+                    selected_rows,
+                    selected_feature_rows,
+                    selected_jsonl_handle,
+                    emitted_at_frame=fno,
+                    selected_source="delayed_sequence",
+                )
+            if not telemetry_events:
+                telemetry_events.append((fno, None, "delayed_sequence", "warming"))
 
         top_tubes_json: list[dict] = []
         if args.export_top_tubes > 0:
@@ -2704,10 +3133,12 @@ def run(args: argparse.Namespace) -> None:
                 margin = (score_cur - next_score) if next_score is not None else None
                 payload, row = tube_state_payload(fno, rank, st, tbd, args, selected, margin)
                 top_tubes_json.append(payload)
-                top_tube_rows.append(row)
+                if not args.stream_only:
+                    top_tube_rows.append(row)
 
         t_export = time.perf_counter()
         timing_ms = {
+            "capture_read": round((t_read - wall_start) * 1000.0, 3),
             "preprocess": round((t_preprocess - frame_start) * 1000.0, 3),
             "frame_router": round((t_frame_router - t_preprocess) * 1000.0, 3),
             "motion_model": round((t_motion_model - t_frame_router) * 1000.0, 3),
@@ -2720,6 +3151,19 @@ def run(args: argparse.Namespace) -> None:
             "export_selection": round((t_export - t_tbd) * 1000.0, 3),
         }
         dt_ms = (t_export - frame_start) * 1000.0
+        wall_ms = (t_export - wall_start) * 1000.0
+        for telemetry_frame, telemetry_selected, telemetry_source, telemetry_status in telemetry_events:
+            write_telemetry_output(
+                telemetry_jsonl_handle,
+                emitted_at_frame=fno,
+                selected_frame=telemetry_frame,
+                selected=telemetry_selected,
+                tbd=tbd,
+                source=telemetry_source,
+                status=telemetry_status,
+                process_ms=dt_ms,
+                wall_ms=wall_ms,
+            )
         frame_mode_counts[frame_decision.mode] = frame_mode_counts.get(frame_decision.mode, 0) + 1
 
         frame_rec = {
@@ -2748,12 +3192,27 @@ def run(args: argparse.Namespace) -> None:
             "n_motion_model_mask_boxes": len(motion_model_mask_boxes),
             "kinematic_reject": None,
             "process_ms": round(dt_ms, 3),
+            "wall_ms": round(wall_ms, 3),
             "timing_ms": timing_ms,
             "top_candidates": [c.to_json() for c in cands[: args.top_k_debug]],
         }
         if args.export_top_tubes > 0:
             frame_rec["top_tubes"] = top_tubes_json
-        report.append(frame_rec)
+        processed_count += 1
+        process_stats.add(dt_ms)
+        wall_stats.add(wall_ms)
+        inlier_stats.add(float(chosen["inlier_ratio"]))
+        candidate_stats.add(float(len(cands)))
+        if selected is not None:
+            selected_frames += 1
+        if len(cands) > 10:
+            noisy_frames += 1
+        if len(cands) > 1:
+            multi_candidate_frames += 1
+        for key, value in timing_ms.items():
+            timing_stats.setdefault(key, RunningWindowStats(args.stats_window)).add(float(value))
+        if args.report_mode == "full":
+            report.append(frame_rec)
 
         if args.save_every and fno % args.save_every == 0:
             cv2.imwrite(str(out_dir / f"residual_{fno:05d}.png"), residual_blur)
@@ -2773,35 +3232,70 @@ def run(args: argparse.Namespace) -> None:
     cap.release()
     if video_writer is not None:
         video_writer.release()
-    if not report:
+    if delayed_selector is not None:
+        for out_frame, out_selected in delayed_selector.flush():
+            write_telemetry_output(
+                telemetry_jsonl_handle,
+                emitted_at_frame=fno,
+                selected_frame=out_frame,
+                selected=out_selected,
+                tbd=tbd,
+                source="delayed_sequence_flush",
+                status="selected" if out_selected is not None else "no_target",
+                process_ms=0.0,
+                wall_ms=0.0,
+            )
+            selected_output_count += append_selected_output(
+                out_frame,
+                out_selected,
+                tbd,
+                args,
+                selected_rows,
+                selected_feature_rows,
+                selected_jsonl_handle,
+                selected_source="delayed_sequence_flush",
+            )
+    if selected_jsonl_handle is not None:
+        selected_jsonl_handle.close()
+    if telemetry_jsonl_handle is not None:
+        telemetry_jsonl_handle.close()
+    if processed_count == 0:
         raise SystemExit("no usable frame pairs")
 
-    process_times = [r["process_ms"] for r in report]
-    avg_ms = float(np.mean(process_times))
-    p90_ms = float(np.percentile(process_times, 90))
-    p95_ms = float(np.percentile(process_times, 95))
-    avg_inlier = float(np.mean([r["inlier_ratio"] for r in report]))
-    avg_candidates = float(np.mean([r["n_candidates"] for r in report]))
-    med_candidates = float(np.median([r["n_candidates"] for r in report]))
-    p90_candidates = float(np.percentile([r["n_candidates"] for r in report], 90))
-    selected_frames = sum(1 for r in report if r["selected"] is not None)
-    selected_rate = selected_frames / len(report)
-    noisy_frames = sum(1 for r in report if r["n_candidates"] > 10)
-    timing_keys: list[str] = []
-    for rec in report:
-        for key in rec.get("timing_ms", {}):
-            if key not in timing_keys:
-                timing_keys.append(key)
+    avg_ms = process_stats.mean()
+    p90_ms = process_stats.percentile(90)
+    p95_ms = process_stats.percentile(95)
+    p99_ms = process_stats.percentile(99)
+    max_ms = process_stats.max()
+    avg_wall_ms = wall_stats.mean()
+    p90_wall_ms = wall_stats.percentile(90)
+    p95_wall_ms = wall_stats.percentile(95)
+    p99_wall_ms = wall_stats.percentile(99)
+    max_wall_ms = wall_stats.max()
+    avg_inlier = inlier_stats.mean()
+    avg_candidates = candidate_stats.mean()
+    med_candidates = candidate_stats.percentile(50)
+    p90_candidates = candidate_stats.percentile(90)
+    selected_rate = selected_frames / processed_count
+    timing_keys = list(timing_stats)
     avg_timing_ms = {
-        key: round(float(np.mean([r.get("timing_ms", {}).get(key, 0.0) for r in report])), 3)
+        key: round(timing_stats[key].mean(), 3)
         for key in timing_keys
     }
     p90_timing_ms = {
-        key: round(float(np.percentile([r.get("timing_ms", {}).get(key, 0.0) for r in report], 90)), 3)
+        key: round(timing_stats[key].percentile(90), 3)
         for key in timing_keys
     }
     p95_timing_ms = {
-        key: round(float(np.percentile([r.get("timing_ms", {}).get(key, 0.0) for r in report], 95)), 3)
+        key: round(timing_stats[key].percentile(95), 3)
+        for key in timing_keys
+    }
+    p99_timing_ms = {
+        key: round(timing_stats[key].percentile(99), 3)
+        for key in timing_keys
+    }
+    max_timing_ms = {
+        key: round(timing_stats[key].max(), 3)
         for key in timing_keys
     }
 
@@ -2810,13 +3304,27 @@ def run(args: argparse.Namespace) -> None:
         "source_frames": n_total,
         "source_fps": fps_src,
         "downscale": args.downscale,
+        "report_mode": args.report_mode,
+        "stream_only": args.stream_only,
+        "stats_window": args.stats_window,
         "args": vars(args),
         "summary": {
-            "n_processed": len(report),
+            "n_processed": processed_count,
+            "report_frames_stored": len(report),
             "avg_ms_per_frame": round(avg_ms, 3),
             "p90_ms_per_frame": round(p90_ms, 3),
             "p95_ms_per_frame": round(p95_ms, 3),
+            "p99_ms_per_frame": round(p99_ms, 3),
+            "max_ms_per_frame": round(max_ms, 3),
+            "avg_wall_ms_per_frame": round(avg_wall_ms, 3),
+            "p90_wall_ms_per_frame": round(p90_wall_ms, 3),
+            "p95_wall_ms_per_frame": round(p95_wall_ms, 3),
+            "p99_wall_ms_per_frame": round(p99_wall_ms, 3),
+            "max_wall_ms_per_frame": round(max_wall_ms, 3),
             "fits_30hz": avg_ms <= 33.3,
+            "wall_fits_30hz": avg_wall_ms <= 33.3,
+            "wall_p95_fits_30hz": p95_wall_ms <= 33.3,
+            "wall_p99_fits_30hz": p99_wall_ms <= 33.3,
             "fits_60hz_on_this_machine": avg_ms <= 16.7,
             "avg_inlier_ratio": round(avg_inlier, 3),
             "avg_candidates_per_frame": round(avg_candidates, 3),
@@ -2824,9 +3332,11 @@ def run(args: argparse.Namespace) -> None:
             "p90_candidates_per_frame": round(p90_candidates, 3),
             "selected_frames": selected_frames,
             "selected_frame_rate": round(selected_rate, 3),
+            "selected_output_rows": selected_output_count,
+            "selected_output_frame_rate": round(selected_output_count / processed_count, 3),
             "kinematic_gate_px_per_frame": round(px_per_frame, 3),
             "kinematic_rejections": 0,
-            "multi_candidate_frames": sum(1 for r in report if r["n_candidates"] > 1),
+            "multi_candidate_frames": multi_candidate_frames,
             "noisy_frames_gt10_candidates": noisy_frames,
             "model_counts": model_counts,
             "runtime_mode_counts": frame_mode_counts,
@@ -2834,6 +3344,8 @@ def run(args: argparse.Namespace) -> None:
             "avg_timing_ms": avg_timing_ms,
             "p90_timing_ms": p90_timing_ms,
             "p95_timing_ms": p95_timing_ms,
+            "p99_timing_ms": p99_timing_ms,
+            "max_timing_ms": max_timing_ms,
         },
         "frames": report,
     }
@@ -2864,25 +3376,38 @@ def run(args: argparse.Namespace) -> None:
             writer.writerows(top_tube_rows)
     if timing_keys:
         with (out_dir / "timing_summary.csv").open("w", newline="") as f:
-            writer = csv.DictWriter(f, fieldnames=["block", "avg_ms", "p90_ms"])
+            writer = csv.DictWriter(f, fieldnames=["block", "avg_ms", "p90_ms", "p95_ms", "p99_ms", "max_ms"])
             writer.writeheader()
             for key in timing_keys:
-                writer.writerow({"block": key, "avg_ms": avg_timing_ms[key], "p90_ms": p90_timing_ms[key]})
+                writer.writerow(
+                    {
+                        "block": key,
+                        "avg_ms": avg_timing_ms[key],
+                        "p90_ms": p90_timing_ms[key],
+                        "p95_ms": p95_timing_ms[key],
+                        "p99_ms": p99_timing_ms[key],
+                        "max_ms": max_timing_ms[key],
+                    }
+                )
     (out_dir / "summary.md").write_text(
         f"""# candidate TBD summary
 
 Video: `{args.video}`  
 Source: {n_total} frames @ {fps_src:.2f} fps  
-Processed: {len(report)} frame pairs at downscale {args.downscale}
+Processed: {processed_count} frame pairs at downscale {args.downscale}
 
 | metric | value |
 |---|---:|
 | Avg time / frame | {avg_ms:.2f} ms |
+| Avg wall time / frame | {avg_wall_ms:.2f} ms |
+| P95 wall time / frame | {p95_wall_ms:.2f} ms |
+| P99 wall time / frame | {p99_wall_ms:.2f} ms |
+| Max wall time / frame | {max_wall_ms:.2f} ms |
 | Avg RANSAC inlier ratio | {avg_inlier:.3f} |
 | Avg candidates / frame | {avg_candidates:.2f} |
 | Median candidates / frame | {med_candidates:.1f} |
 | P90 candidates / frame | {p90_candidates:.1f} |
-| Frames with selected box | {selected_frames}/{len(report)} ({selected_rate:.1%}) |
+| Frames with selected box | {selected_frames}/{processed_count} ({selected_rate:.1%}) |
 | Kinematic gate | {px_per_frame:.1f} px/frame |
 
 Runtime mode counts: `{frame_mode_counts}`

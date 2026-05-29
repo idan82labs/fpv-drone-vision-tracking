@@ -2,6 +2,15 @@
 
 The labeling app can be deployed to Fly.io with the included Dockerfile.
 
+The public/source repo does not contain review packets or videos. For a Fly
+labeling deployment, either:
+
+- keep the needed packet in local ignored `deploy_assets/` before `fly deploy`,
+  so the Docker build seeds `/seed`; or
+- upload the packet and videos to the Fly volume under `/data`.
+
+The container now fails fast with a clear message when neither source exists.
+
 ## Local Smoke Test
 
 ```bash
@@ -46,4 +55,4 @@ curl -u review:'<password>' https://<app-name>.fly.dev/api/export -o tube_altern
 ```
 
 The Fly volume persists labels under `/data`, but exported CSVs should still be
-pulled back into `artifacts/` or `deploy_assets/` before training.
+pulled back into local `artifacts/` or `deploy_assets/` before training.

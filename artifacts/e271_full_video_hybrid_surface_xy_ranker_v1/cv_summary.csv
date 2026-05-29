@@ -1,5 +1,0 @@
-model,all_frames,all_oracle_recall,all_strict_hit,all_strict_recall,all_loose_hit,all_loose_recall,all_wrong,high_frames,high_oracle_recall,high_strict_hit,high_strict_recall,high_loose_hit,high_loose_recall,high_wrong
-baseline_verified_score,698,0.967,438,0.628,513,0.735,260,345,0.997,238,0.69,295,0.855,107
-logistic,698,0.967,433,0.62,543,0.778,265,345,0.997,242,0.701,296,0.858,103
-hist_gbdt,698,0.967,457,0.655,594,0.851,241,345,0.997,248,0.719,324,0.939,97
-extra_trees,698,0.967,389,0.557,526,0.754,309,345,0.997,230,0.667,305,0.884,115

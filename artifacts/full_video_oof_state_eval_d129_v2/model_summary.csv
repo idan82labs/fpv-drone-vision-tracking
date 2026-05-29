@@ -1,5 +1,0 @@
-model,label_frames,visible_frames,invisible_frames,visible_frames_with_candidates,invisible_frames_with_candidates,visible_best_strict,visible_best_strict_rate,candidate_frames,oof_scored_examples,oof_score_column
-baseline_verified_score,250,38,212,38,211,26,0.6842,249,,
-logistic,250,38,212,38,211,38,1.0,249,19618,oof_logistic_score
-hist_gbdt,250,38,212,38,211,37,0.9737,249,19618,oof_hist_gbdt_score
-extra_trees,250,38,212,38,211,38,1.0,249,19618,oof_extra_trees_score

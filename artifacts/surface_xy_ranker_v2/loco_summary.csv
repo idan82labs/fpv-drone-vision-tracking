@@ -1,5 +1,0 @@
-model,frames,oracle_recall,strict_hit,strict_recall,loose_hit,loose_recall,high_frames,high_strict_recall,high_loose_recall
-baseline_verified_score,984,0.9949,790,0.8028,849,0.8628,778,0.829,0.8779
-logistic,984,0.9949,768,0.7805,842,0.8557,778,0.7931,0.8586
-hist_gbdt,984,0.9949,762,0.7744,865,0.8791,778,0.7828,0.8972
-extra_trees,984,0.9949,788,0.8008,854,0.8679,778,0.7943,0.8663

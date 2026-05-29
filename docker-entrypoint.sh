@@ -9,6 +9,11 @@ VIDEO_DIR="$DATA_DIR/videos"
 mkdir -p "$DATA_DIR"
 
 if [ ! -f "$CSV_DIR/tube_alternatives_to_label.csv" ]; then
+  if [ ! -f "/seed/$PACKET_NAME/tube_alternatives_to_label.csv" ]; then
+    echo "Missing label packet: $CSV_DIR/tube_alternatives_to_label.csv" >&2
+    echo "Seed a Fly volume under $DATA_DIR or build with local deploy_assets/$PACKET_NAME." >&2
+    exit 2
+  fi
   rm -rf "$CSV_DIR"
   cp -a "/seed/$PACKET_NAME" "$CSV_DIR"
 fi
@@ -17,6 +22,11 @@ mkdir -p /app/results
 ln -sfn "$CSV_DIR" "/app/results/$PACKET_NAME"
 
 if [ ! -d "$VIDEO_DIR" ] || [ -z "$(find "$VIDEO_DIR" -maxdepth 1 -name '*.MP4' -print -quit 2>/dev/null)" ]; then
+  if [ ! -d /seed/videos ] || [ -z "$(find /seed/videos -maxdepth 1 -name '*.MP4' -print -quit 2>/dev/null)" ]; then
+    echo "Missing review videos under $VIDEO_DIR and /seed/videos." >&2
+    echo "Seed a Fly volume under $DATA_DIR/videos or build with local deploy_assets/videos." >&2
+    exit 2
+  fi
   rm -rf "$VIDEO_DIR"
   cp -a /seed/videos "$VIDEO_DIR"
 fi

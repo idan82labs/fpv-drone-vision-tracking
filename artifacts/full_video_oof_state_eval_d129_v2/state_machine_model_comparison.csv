@@ -1,5 +1,0 @@
-model,label_frames,visible_frames,invisible_frames,visible_frames_with_candidates,invisible_frames_with_candidates,visible_best_strict,visible_best_strict_rate,candidate_frames,oof_scored_examples,oof_score_column,acquire_threshold,track_threshold,acquire_hits,max_misses,max_jump_px,output_tentative,coast_output,frames_all,all_frame_correct,all_frame_accuracy,visible_strict,visible_strict_recall,visible_loose,visible_loose_recall,invisible_no_box,invisible_no_box_rate,selected_frames,first_lock_frame,first_strict_frame,strict_latency_frames
-extra_trees,250,38,212,38,211,38,1.0,249,19618,oof_extra_trees_score,0.9,0.02,1,0,12.0,0,0,250,249,0.996,38,1.0,38,1.0,211,0.9953,39,211,212,0
-logistic,250,38,212,38,211,38,1.0,249,19618,oof_logistic_score,0.9,0.02,3,0,12.0,0,0,250,236,0.944,38,1.0,38,1.0,198,0.934,52,210,212,0
-hist_gbdt,250,38,212,38,211,37,0.9737,249,19618,oof_hist_gbdt_score,0.75,0.75,3,0,12.0,0,0,250,233,0.932,27,0.7105,27,0.7105,206,0.9717,33,221,221,9
-baseline_verified_score,250,38,212,38,211,26,0.6842,249,,,28.0,28.0,3,0,12.0,0,0,250,217,0.868,10,0.2632,10,0.2632,207,0.9764,15,240,240,28

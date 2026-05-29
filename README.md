@@ -1,30 +1,43 @@
-# FPV Drone Vision Tracking Lab
+# FPV Drone Vision Tracking
 
-This repository contains the current FPV drone video tracking work: classical motion proposals, short-window track-before-detect ranking, a browser labeling tool, training utilities, and curated experiment artifacts.
+This repository contains the source code, tests, docs, labeler, and Raspberry Pi
+runtime wrappers for the FPV drone tracking project.
 
-The repository is intentionally curated. The full local workspace had roughly 11 GB of generated outputs; this repo keeps the code, deployment assets, current labels, useful summaries, and selected demo videos.
+The repo is intentionally source-first. Generated videos, contact sheets, raw
+footage, trained model dumps, labeling packets, and benchmark sweeps stay local
+under ignored directories such as `artifacts/`, `deploy_assets/`, and `models/`.
 
-## Current Status
+## Honest Status
 
 This is not a solved autonomous tracker yet.
 
-- Best current operating direction: high-recall cheap proposals plus tube-level ranking/verifier.
-- Most useful recent progress: the e271 reel gap was traced to missing early/mid labels plus weak close-drone proposals; the new `large_dark` proposal source raises e271 gap oracle@100 from 49.0% to 92.8% on the dense gap labels.
-- Main blocker: ranking the real drone tube above cloud, terrain, skyline, and static-hotspot clutter.
-- Newest evaluation focus: textured/non-sky target frames, where clean-sky metrics are no longer representative.
-- Embedded direction: state-conditioned runtime for Raspberry Pi 5; do not run heavy hybrid proposal modes globally.
-- Recent vision-assisted videos show what the target track should look like, but they are not autonomous detector performance.
+- Best current architecture: cheap high-recall proposals plus short-window
+  continuity/track-before-detect selection.
+- Best current deployment signal: lightweight sequence selection can recover
+  strong e271 continuity without the heavy learned ranker in the hot loop.
+- Main blocker: tree/grass/terrain and skyline clutter still beat the true
+  drone in hard clips.
+- Production readiness: `raspberry_pi_runtime/PRODUCTION_READINESS.md` rates
+  the current Pi path at **4/10**. Runtime scaffolding is improving; physical
+  validation and hard-surface tracking are still not production-grade.
+- Rust is not the next step. Stabilize Python/OpenCV branch behavior first,
+  then port measured hot paths if needed.
 
 ## Repository Layout
 
 ```text
-scripts/          Detection, proposal generation, training, calibration, rendering.
-web/tube_labeler/ Browser UI for candidate and frame-level labeling.
-deploy_assets/   Small seed review packet and compressed review videos for deployment.
-artifacts/        Curated labels, summaries, diagnostics, and demo videos.
-docs/             Research questions and professor follow-up notes.
-config/           Example deployment config.
+raspberry_pi_runtime/ Pi-facing wrappers, profiles, service files, bundle tool.
+scripts/              Detector core plus desktop training/evaluation tools.
+web/tube_labeler/     Browser labeling UI.
+tests/                Unit and regression tests.
+docs/                 Architecture, status, data policy, runtime plans.
+config/               Example deployment config.
+artifacts/            Ignored local experiment output.
+deploy_assets/        Ignored local labeler/review/deploy assets.
+models/               Ignored promoted model files and calibration assets.
 ```
+
+See `docs/REPO_LAYOUT.md` for the production/Desktop split and promotion rules.
 
 ## Setup
 
@@ -34,7 +47,19 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Run the Labeling Website Locally
+Run the regression tests:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## Desktop Lab Path
+
+Use the desktop path for labeling, training, evaluation, rendering, and failure
+analysis. It is allowed to be heavier than the Pi runtime because the goal is to
+discover what works before distilling it.
+
+Run the labeling website locally:
 
 ```bash
 python scripts/tube_labeling_server.py \
@@ -47,75 +72,74 @@ python scripts/tube_labeling_server.py \
 
 Open `http://127.0.0.1:8768/`.
 
-The server writes labels back into the CSV atomically and creates timestamped backups beside the CSV.
+The server writes labels back to the CSV atomically and creates timestamped
+backups beside the CSV.
 
-## Current Demo Artifacts
+## Raspberry Pi Runtime Path
 
-The most useful team-facing clip is:
+The Pi path lives in `raspberry_pi_runtime/`. It does not fork detector logic;
+it calls the shared detector with bounded settings.
 
-```text
-artifacts/current_demo/e271_vision_assisted_clean_9p0-12p8s_v2.mp4
-```
-
-Important caveat: this is vision-assisted target-track data, not autonomous detector output. Use it to inspect the target trajectory and to train/check future proposal recovery, not as a claim of final tracking accuracy.
-
-The latest e271 gap-fix package is:
-
-```text
-artifacts/e271_gapfix_v1/
-```
-
-It contains the dense gap labels, a fixed reel render, proposal/ranker audit summaries, and contact sheets for the reel seconds 25-36 failure. Low-confidence rows marked `low_review_required` should be human-reviewed before being treated as strict ground truth.
-
-The latest surface-background harness summary is:
-
-```text
-artifacts/surface_xy_ranker_v2/
-```
-
-It contains split summaries and the first leave-one-clip-out surface-ranker result. Current read: the harness is useful, but the v2 model should not replace the selector yet because it does not generalize cleanly to aaf1 when held out.
-
-The latest hybrid proposal/coast experiment is:
-
-```text
-artifacts/hybrid_surface_v1/
-```
-
-It adds experimental `--hybrid_coast_proposals` and `--scenario_balance` flags. The current result is mixed: it improves aaf1 textured/non-sky frames but hurts clean-sky and e271, so it is not a default pipeline.
-
-The embedded runtime plan is:
-
-```text
-docs/EMBEDDED_RUNTIME_PLAN.md
-```
-
-Current direction: cheap frame router, cheap baseline proposals, candidate-local router, then specialized surface proposal/ranker branches only when the router says they are useful. Rust is a deployment option for stable hot paths later, not the next algorithm step.
-
-The first runtime-mode benchmark is:
-
-```text
-artifacts/runtime_mode_benchmark_v1/
-```
-
-It adds candidate-local router logging/application flags and per-frame timing. Current read: the router is cheap enough to keep testing, but the Python beam update dominates when candidate count is high.
-
-## Fly.io Deployment
-
-Use the example config, set secrets, then deploy:
+Create a clean Pi bundle:
 
 ```bash
-cp config/fly.example.toml fly.toml
-fly apps create <app-name>
-fly volumes create label_data --region fra --size 1
-fly secrets set BASIC_AUTH_PASSWORD='<password>'
-fly deploy
+python raspberry_pi_runtime/make_pi_bundle.py \
+  --out artifacts/pi_runtime_bundle/fpv-drone-vision-tracking-pi.tar.gz \
+  --force
 ```
 
-Do not commit `.fly-basic-auth-password`, `.env`, or a real shared password.
+Live-style pass:
+
+```bash
+python raspberry_pi_runtime/run_pi_detector.py \
+  /path/to/video.MP4 \
+  --output_dir artifacts/pi_run \
+  --profile pi_light_live
+```
+
+Camera smoke pass with selected-box telemetry:
+
+```bash
+python raspberry_pi_runtime/run_pi_detector.py \
+  camera:0 \
+  --output_dir /tmp/fpv-tracker-smoke \
+  --profile pi_light_live \
+  --max_frames 120 \
+  --selected_jsonl /tmp/fpv-tracker-selected.jsonl \
+  --telemetry_jsonl /tmp/fpv-tracker-telemetry.jsonl \
+  --stream_only
+```
+
+Gate a run directory:
+
+```bash
+cp /tmp/fpv-tracker-telemetry.jsonl /tmp/fpv-tracker-smoke/telemetry.jsonl
+python raspberry_pi_runtime/production_gate.py \
+  --run_dir /tmp/fpv-tracker-smoke
+```
+
+The gate checks reporting mode, stream-only output, telemetry coverage, and
+p95/p99/max latency tails. It is a deployment sanity check, not proof of flight
+readiness.
+
+## Data and Artifact Policy
+
+Do not commit generated experiment output or raw footage.
+
+- `artifacts/` is local generated output.
+- `deploy_assets/` is local review/labeler/deployment data.
+- `models/` is local promoted model/calibration storage.
+- Stable results should be summarized in `docs/STATUS.md` or a small manifest.
+- Large shareable outputs should be published as release assets or external
+  packets, not committed to the source repo.
+
+See `docs/DATA_AND_ARTIFACTS.md` for details.
 
 ## Development Notes
 
-- Keep raw full-resolution footage out of Git unless it has been intentionally compressed and curated.
-- Keep generated sweeps under local `results/`; copy only stable summaries into `artifacts/`.
-- Treat `vision_assisted` and `vision_assisted_gapfill` rows as weak labels unless manually reviewed frame by frame.
-- Prefer leave-one-clip-out validation for learned rankers; random row splits overstate performance.
+- Prefer leave-one-clip-out or held-out evaluation for learned rankers.
+- Always include null/no-target frames when judging a selector.
+- Treat `vision_assisted` and `vision_assisted_gapfill` rows as weak labels
+  until manually reviewed.
+- Runtime changes need timing tails, not just average ms/frame.
+- Do not copy `artifacts/` or `deploy_assets/` to the Pi.

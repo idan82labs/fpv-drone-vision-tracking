@@ -18,13 +18,30 @@ env/
 .env
 *.local
 
-# Generated experiment outputs. Commit curated artifacts under artifacts/.
+# Generated experiment outputs and local review data.
+# Keep only small README/manifest files in these directories.
+artifacts/**
+!artifacts/
+!artifacts/README.md
+!artifacts/MANIFEST.md
+
+deploy_assets/**
+!deploy_assets/
+!deploy_assets/README.md
+
+models/**
+!models/
+!models/README.md
+
 results/
 tmp/
 scratch/
 *.log
+*.joblib
+*.onnx
+*.pt
+*.pth
 
 # Raw source footage is not part of normal commits unless explicitly curated.
 raw_videos/
 downloads/
-

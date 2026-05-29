@@ -270,6 +270,37 @@ def viterbi_select(
     return {frame: layers[fi][idx] for fi, (frame, idx) in enumerate(zip(frames, selected_idx))}
 
 
+def rolling_viterbi_select(
+    by_frame: dict[int, list[dict[str, Any]]],
+    max_jump_px: float,
+    transition_weight: float,
+    size_jump_weight: float = 0.0,
+    sequence_window: int = 60,
+) -> dict[int, dict[str, Any]]:
+    """Run Viterbi in a sliding window and emit only each window's newest frame.
+
+    The full-video selector forces one path across the whole clip. That is useful
+    for short reviewed snippets, but it fails when a false background lock exists
+    before target birth: a later real target far away cannot connect to the old
+    branch/terrain path. A rolling window keeps the continuity prior local, so
+    the selector can restart after enough local evidence accumulates.
+    """
+
+    frames = sorted(by_frame)
+    if not frames:
+        return {}
+    window = max(1, int(sequence_window))
+    selected: dict[int, dict[str, Any]] = {}
+    for idx, frame in enumerate(frames):
+        start = max(0, idx - window + 1)
+        local_frames = frames[start : idx + 1]
+        local_by_frame = {f: by_frame[f] for f in local_frames}
+        local_selected = viterbi_select(local_by_frame, max_jump_px, transition_weight, size_jump_weight)
+        if frame in local_selected:
+            selected[frame] = local_selected[frame]
+    return selected
+
+
 def row_score(row: dict[str, Any], score_name: str = "learned_score") -> float:
     return float(row.get(score_name, 0.0) or 0.0)
 

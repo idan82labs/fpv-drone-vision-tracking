@@ -1,0 +1,18 @@
+[Unit]
+Description=FPV drone vision tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/fpv-tracker.env
+WorkingDirectory=/
+ExecStartPre=/usr/bin/mkdir -p /run/fpv-tracker
+ExecStart=/bin/bash -lc 'cd "$FPV_REPO" && . .venv/bin/activate && python raspberry_pi_runtime/run_pi_detector.py "$FPV_VIDEO_SOURCE" --output_dir "$FPV_OUTPUT_DIR" --profile "$FPV_PROFILE" --selected_jsonl "$FPV_SELECTED_JSONL" --telemetry_jsonl "$FPV_TELEMETRY_JSONL" --stream_only ${FPV_MAX_FRAMES:+--max_frames "$FPV_MAX_FRAMES"}'
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=fpv-tracker
+RuntimeDirectoryMode=0755
+
+[Install]
+WantedBy=multi-user.target

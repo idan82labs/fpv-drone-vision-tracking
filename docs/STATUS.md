@@ -17,6 +17,17 @@ Current blocker:
 - More candidate count alone is not a reliable improvement.
 - Surface backgrounds need their own benchmark; clean-sky numbers hide the tree/grass/terrain failure mode.
 
+Repo/runtime cleanup update:
+
+- Generated artifacts, review videos, crop sheets, model dumps, and Fly labeler
+  seed data are now local/ignored rather than source-controlled.
+- `docs/REPO_LAYOUT.md` defines the split between the desktop lab and the
+  Raspberry Pi runtime path.
+- The production/Pi path remains a bounded Python/OpenCV runtime scaffold, not
+  a separate Rust rewrite.
+- This cleanup improves repo hygiene and deployment boundaries. It does not
+  change the honest tracker capability rating.
+
 ## Recent Numbers
 
 From the v3 tail-extended labels:
@@ -120,6 +131,62 @@ selector and stays Mac-side 30 Hz at top-20. The remaining tail failure is not
 fixed by selector integration; it needs new terrain-tail features or more
 similar hard labels.
 
+Audit update:
+
+- Expert review found that the v1 runtime fallback was not computing all
+  pair/alignment feature columns used by the trained ranker when top-tube export
+  was disabled. This has been fixed in `tbd_motion_detector.py`.
+- The v1 fallback model was also an all-fit model that included e271 labels, so
+  the e271 runtime gain was in-sample integration evidence, not clean
+  generalization.
+- New artifact: `artifacts/runtime_surface_fallback_e271_audit_v2/`.
+  - baseline rerun: 63.2% strict, 72.7% loose, 12.47 ms/frame average.
+  - all-fit fallback after feature parity: 71.1% strict, 78.1% loose,
+    25.17 ms/frame average.
+  - e271-held-out fallback: 65.8% strict, 77.4% loose, 25.24 ms/frame average.
+  - e271-held-out tail `667..698`: 28.1% strict, 37.5% loose.
+
+Interpretation: the selector/ranker direction still has signal, especially for
+loose continuity and terrain-tail recovery, but the honest held-out strict gain
+is modest. Do not present the all-fit result as baseline progress. Next clean
+validation should use nested threshold selection or a separate holdout clip.
+
+Nested threshold-selection update:
+
+- Added nested fallback evaluation to `train_surface_xy_ranker.py`: for each
+  held-out clip, choose model/threshold using only the other clips, then score
+  the held-out clip.
+- Reran `artifacts/surface_training_v4_multiclip/ranker_e271_heldout_runtime_audit/`.
+- Optimistic fixed-threshold fallback remains 83.3% strict / 90.1% loose.
+- Nested fallback is 77.8% strict / 85.8% loose.
+- Baseline top-tube replay is 80.0% strict / 85.7% loose.
+
+Interpretation: global learned fallback is not a validated default. The ranker
+is useful as a state-specific/terrain-tail tool, but strict global selection
+needs better state routing or more representative hard surface labels before it
+should replace baseline behavior.
+
+State-gate follow-up:
+
+- Added nested gated fallback replay and an explicit runtime
+  `--surface_ranker_gate` flag.
+- Nested gated replay improves over ungated nested replay:
+  - nested ungated: 77.8% strict / 85.8% loose.
+  - nested gated: 80.2% strict / 86.1% loose.
+- Runtime initially applied the gate before scoring, while replay scored first
+  and gated only the best learned candidate. After fixing runtime semantics, the
+  live e271 high-support result improved:
+  - held-out ungated fallback: 65.8% strict / 77.4% loose.
+  - held-out high-support gate, threshold 0.00: 69.2% strict / 80.5% loose.
+  - held-out high-support gate, threshold 0.76: 69.1% strict / 80.4% loose.
+  - the high-support gate does not recover the late e271 tail; ungated fallback
+    still owns that specific failure mode.
+
+Interpretation: `high_support` is now a plausible state-specific policy for
+the main e271 body, but it is not a global default because it trades away tail
+recovery. Keep `--surface_ranker_gate` experimental until another held-out
+surface clip confirms the same behavior.
+
 From the first complete-video non-sky benchmark:
 
 - Built a full-video d129 vision-label set: 250 total frames, 38 visible target frames, 212 invisible/no-target frames.
@@ -162,9 +229,24 @@ From the embedded runtime candidate-router implementation:
 Interpretation: the router infrastructure is now cleaner and the Python beam
 update is no longer the only dominant cost in normal pair-rescue mode. Mac-side
 average 30 Hz is plausible for d129/e271 and borderline for aaf1, but this is
-still not a Pi 5 claim. Surface acquisition remains a separate, explicit
-experiment because disabling it improves runtime but risks missing hard surface
-targets.
+not yet a Pi-ready runtime profile.
+
+From the current top-tube / temporal-stack profile:
+
+- New artifact: `artifacts/surface_stack_profile_2026_05_29/`.
+- Current no-stack aaf1 visible-frame oracle@8 is only 17/75 = 22.7%; selected@8 is 6/75 = 8.0%.
+- Enabling temporal-stack proposals raises aaf1 oracle@8 to 74/75 = 98.7%, but selected@8 only reaches 7/75 = 9.3%.
+- d129 remains a selection/null failure: oracle@8 is 38/38, selected@8 is 0/38.
+- e271 does not benefit from global stack in the current top-80 profile: selected@8 drops from 442/699 = 63.2% to 420/699 = 60.1%.
+- All-stack ExtraTrees LOCO improves aggregate visible strict replay from 59.0% to 69.0%, but held-out aaf1 is still only 6/60 = 10.0% and held-out d129 is 0/34.
+- All-fit separability on aaf1 is 55/60 = 91.7% strict, so the feature set can use temporal-stack positives after seeing similar examples.
+- Runtime is not acceptable for global stack: 107-146 ms/frame average on the current machine.
+
+Interpretation: aaf1 is no longer primarily a visibility/proposal problem when
+temporal stack is available; it is a ranker generalization problem. Full-frame
+temporal stack should remain an offline teacher / surface-branch experiment, not
+a default runtime path. The next data need is more aaf1-like tree/road/grass
+positive labels from another clip, plus null labels for similar clutter.
 
 From the first acquisition/null state-machine sweep:
 
@@ -263,18 +345,196 @@ sequence over intermittent road/terrain clutter. The result is still
 single-segment and should not be promoted as a global default until repeated on
 another true tree/grass clip with no-target frames.
 
+From the e6 surface-mining pass:
+
+- Mined `e6a60298-989b-4c37-9b8f-79e0af4d62a0` and promoted 72
+  high-confidence visible labels:
+  - 60 skyline-surface frames.
+  - 12 textured/non-sky frames.
+- Kept 27 ambiguous tree/terrain rows out of training for human review.
+- All-stack e6 top-tube read:
+  - oracle@8 = 67/72 = 93.1%.
+  - selected@8 = 57/72 = 79.2%.
+  - frames 1775-1800 are useful ranking failures: the target is present in
+    top-tube alternatives while the selected box is more than 120 px away.
+- Added the e6 labels to the all-stack ExtraTrees LOCO ranker:
+  - aggregate strict recall improved from 68.97% to 71.67%.
+  - aggregate loose recall improved from 82.00% to 84.42%.
+  - d129 held-out strict improved from 0/34 to 6/34.
+  - aaf1 held-out strict stayed stuck at 6/60.
+  - e6 held-out strict was 62/72 = 86.1%.
+- Reran the acquisition/null diagnostic with the e6 labels:
+  - baseline selected: 50.10% all-frame correctness, 57.69% visible strict,
+    1.42% invisible no-select.
+  - nested logistic: 36.79% all-frame correctness, 42.38% visible strict,
+    0.94% invisible no-select.
+- Optimized `scripts/train_acquisition_null_ranker.py` so threshold sweeps reuse
+  cached per-frame scores rather than recomputing model predictions for every
+  threshold.
+
+Interpretation: e6 labels are a real but limited ranker improvement. They do not
+solve aaf1-style tree/grass generalization, and the null-ranker diagnostic is a
+negative result. The next data need is still more true target-over-tree/grass
+clips plus more varied no-target/clutter frames.
+
+From the aaf1/e6 hard-null pass:
+
+- Reviewed the 27 ambiguous e6 selected-candidate rows and promoted them as
+  high-confidence no-target/hard-null labels, not positives. They read as
+  tree/terrain/skyline clutter.
+- Inspected aaf1 frame samples and zoomed 480-640 gap crops. No new positive
+  labels were promoted because the local dark-component tracker drifted between
+  tiny sky points, cloud specks, and tree/terrain texture.
+- Added 28 high-confidence aaf1 pre-acquisition no-target labels from frames
+  0-270.
+- New merged label set:
+  `artifacts/aaf1_surface_mining_v1/aaf1_e6_existing_plus_null_labels_v1.csv`
+  with 1,359 visible frames and 267 invisible/null frames.
+- Logistic acquisition/null diagnostic:
+  - before aaf1 nulls: 31/239 invisible no-select = 13.0%.
+  - after aaf1 nulls: 58/267 invisible no-select = 21.7%.
+  - aaf1 pre-acquisition null: 27/28 no-select.
+  - e6 null: 14/27 no-select.
+  - d129 null remains poor: 17/212 no-select.
+  - visible strict remains weak: 590/1359 = 43.4%.
+
+Interpretation: this is useful hard-null data, but not a deployable null model.
+The model can learn local aaf1/e6 no-target clutter suppression but does not
+generalize to d129. More varied null labels are needed, and positive aaf1 gap
+labels should not be auto-promoted without human review.
+
+From the multiclip null-mining / accept-gate pass:
+
+- Reviewed no-label gap contact sheets across `1c`, `529`, `59e`, `7bd`, and
+  `b96`.
+- Rejected unsafe null ranges where the drone was visible or likely still
+  visible.
+- Promoted 37 high-confidence no-target frames:
+  - `1c`: 5 early frames.
+  - `59e`: 10 mid-clip terrain frames.
+  - `7bd`: 12 early/late road/field frames.
+  - `b96`: 10 early haze/road frames.
+- New merged label set:
+  `artifacts/null_mining_multiclip_v1/aaf1_e6_existing_plus_multiclip_null_labels_v1.csv`
+  with 1,359 visible frames and 304 invisible/null frames.
+- Select-best null ranker remains wrong:
+  - nested logistic: 40.1% all-frame correctness, 42.9% visible strict,
+    27.3% null no-select.
+- Added `--decision_mode gate_selected` to `scripts/train_acquisition_null_ranker.py`.
+  This scores only the detector-selected row and accepts/rejects it instead of
+  reselecting a different candidate.
+- Accept/reject gate result:
+  - baseline selected: 47.6% all-frame, 57.7% visible strict, 2.6% null no-select.
+  - optimistic fixed logistic threshold 0.05: 51.9% all-frame, 51.9% visible
+    strict, 51.6% null no-select.
+  - nested ExtraTrees gate: 47.0% all-frame, 46.0% visible strict, 51.3% null
+    no-select.
+
+Interpretation: the accept/reject gate is the right architecture for acquisition
+null suppression, but the learned gate is not a global default. It should be
+used as a state-machine acquisition gate candidate, with stricter policy around
+when the system is not already locked.
+
+State-machine accept-gate follow-up:
+
+- Fixed two evaluator issues before trusting the numbers:
+  - frame `0` in `train_acquisition_null_ranker.py` was being converted to
+    `-1` by truthiness-based parsing;
+  - `evaluate_lock_state_machine.py` now supports `--clip` filtering and a
+    separate `--track_score_column`, so acquisition can use learned accept
+    probability while locked tracking still uses raw `verified_score`.
+- New artifact:
+  `artifacts/null_mining_multiclip_v1/acquisition_gate_state_eval_v1/`.
+- Per-clip best configs look good but are optimistic:
+  - baseline selected/verified: 56.8% all-frame, 57.1% visible strict,
+    55.3% null no-box.
+  - ExtraTrees acquire gate + verified tracking: 64.9% all-frame, 57.3%
+    visible strict, 99.0% null no-box.
+- One shared config across all clips is the honest default-read:
+  - baseline selected/verified: 54.2% all-frame, 55.6% visible strict,
+    48.4% null no-box.
+  - ExtraTrees acquire gate + verified tracking: 54.3% all-frame, 55.6%
+    visible strict, 48.7% null no-box.
+  - logistic acquire gate + verified tracking: 54.1% all-frame, 52.9%
+    visible strict, 59.5% null no-box.
+
+Interpretation: the acquisition-only gate is architecturally useful, but it is
+not a meaningful global improvement yet. The impressive per-clip gain is mostly
+threshold tuning to each video. With a single config it is basically baseline
+plus one frame. The shared-config failure export confirms the misses are still
+visible-frame failures on e271, aaf1, 7bd, 529, d129, and 1c, not primarily null
+false positives. The next valuable work is more state-specific labels and/or a
+better router, not promoting this gate as default.
+
+From the dense surface-label expansion:
+
+- Added `artifacts/surface_dense_label_expansion_v1/`.
+- Promoted 228 continuity labels by interpolation between existing
+  high-confidence reviewed anchors:
+  - `529`: 57 rows.
+  - `7bd`: 66 rows.
+  - `b96`: 85 rows.
+  - `59e`: 20 rows.
+- No aaf1 gap labels were promoted; that segment remains visually ambiguous and
+  should not be trained as a positive without human review.
+- Fixed `train_surface_xy_ranker.py` parsing so frame `0` and zero-valued
+  coordinates are not lost through truthiness checks.
+- Apples-to-apples ranker comparison:
+  - original labels, fixed parser: ExtraTrees LOCO 71.67% strict / 84.42%
+    loose; nested gated fallback 69.08% strict / 80.25% loose.
+  - dense v1 labels: ExtraTrees LOCO and nested gated fallback both 75.21%
+    strict / 87.96% loose.
+
+Interpretation: this is meaningful offline progress for the learned surface
+selector. The dense labels increase the hard-frame denominator and make the
+learned selector generalize better across the currently labeled clips. It does
+not solve aaf1: held-out aaf1 remains 6/60 strict, so true tree/foliage
+acquisition is still the main unsolved visual regime.
+
+Acquisition/null gate check on the dense label set:
+
+- baseline selected: 45.43% all-frame, 53.62% visible strict, 2.63% null
+  no-select.
+- nested logistic gate: 41.78% all-frame, 38.37% visible strict, 59.54% null
+  no-select.
+- nested ExtraTrees gate: 36.70% all-frame, 36.42% visible strict, 38.16% null
+  no-select.
+
+Interpretation: positive continuity labels help the surface selector, not the
+selected-row accept/reject gate. Do not promote the acquisition gate.
+
+Held-out e271 runtime/sequence check:
+
+- Added `scripts/apply_surface_sequence_selector.py`.
+- The dense model trained with e271 excluded improves the live e271 fallback to
+  71.1% strict / 84.1% loose at 27.61 ms/frame, compared with the previous
+  held-out fallback at 65.8% / 77.4%.
+- The high-support gate is worse on this run: 70.1% strict / 83.4% loose, so it
+  should not be promoted.
+- Exported top-80 alternatives show oracle strict@80 = 94.4% and loose@80 =
+  99.9%. Frames 400-499 are the main failure block: oracle loose@80 is 100%,
+  but selected loose is only 50%.
+- A held-out sequence selector over top-20 candidates reaches 81.4% strict /
+  98.9% loose on e271 with `max_jump_px=10` and `transition_weight=0.5`.
+
+Interpretation: the current e271 bottleneck has moved from proposal recovery to
+sequence-level selection. This is the first honest e271 result crossing 80%
+strict while excluding e271 from the ranker training set. Caveat: the selector
+is offline/deferred over exported candidates; it still needs a short sliding
+window implementation before it is a live Pi-5 candidate.
+
 ## Next Meaningful Work
 
-1. Reproduce the surface sequence-ranker result on at least one more true
+1. Implement the sequence selector inside `tbd_motion_detector.py` behind an
+   explicit non-default delayed-window flag, then benchmark runtime and accuracy.
+2. Reproduce the held-out sequence result on at least one more true
    tree/grass/terrain segment; 1c-style skyline-adjacent rows should stay out
    unless visually verified.
-2. Integrate the acquisition/null selector and the surface continuity selector
-   behind explicit flags in `tbd_motion_detector.py`, driven by learned/OOF
-   scores rather than native detector scores.
-3. Reproduce the full-video OOF state-ranker harness on at least one more
-   complete clip, then integrate only if the null/visible tradeoff survives.
-4. Improve the frame router so it does not over-classify ridge or horizon clips
-   as surface.
+3. Keep improving the frame/candidate router so delayed sequence selection only
+   pays the extra cost in surface-backed states.
+4. Reproduce the full-video OOF state-ranker harness on at least one more
+   complete clip, then integrate null handling only if the null/visible tradeoff
+   survives.
 5. Keep collecting true target-over-tree/grass/terrain labels; route ambiguous
    d129-like frames to human review.
 6. Train null-aware tube rankers with explicit no-target/hallucination

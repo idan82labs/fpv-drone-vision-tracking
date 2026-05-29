@@ -21,6 +21,7 @@ from typing import Any
 @dataclass
 class Candidate:
     score: float
+    track_score: float
     rank: int
     bbox: tuple[float, float, float, float]
 
@@ -36,7 +37,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--labels", required=True, help="CSV with frame, visible, det_x/det_y/det_w/det_h.")
     p.add_argument("--candidates", required=True, help="Candidate CSV with frame, score, x/y/w/h. Multiple rows per frame are allowed.")
     p.add_argument("--out_dir", required=True)
-    p.add_argument("--score_column", default="score")
+    p.add_argument("--clip", default="", help="Optional clip id filter when labels/candidates contain multiple videos.")
+    p.add_argument("--score_column", default="score", help="Score used while acquiring a target.")
+    p.add_argument(
+        "--track_score_column",
+        default="",
+        help="Optional separate score used after lock. Defaults to --score_column.",
+    )
     p.add_argument("--max_rank", type=int, default=9999)
     p.add_argument("--strict_tol_px", type=float, default=8.0)
     p.add_argument("--loose_tol_px", type=float, default=16.0)
@@ -99,9 +106,11 @@ def center_dist(a: tuple[float, float, float, float], b: tuple[float, float, flo
     return float(math.hypot(ax - bx, ay - by))
 
 
-def load_labels(path: Path) -> dict[int, Label]:
+def load_labels(path: Path, clip: str = "") -> dict[int, Label]:
     out: dict[int, Label] = {}
     for row in read_csv(path):
+        if clip and row.get("clip", "") != clip:
+            continue
         frame_val = fnum(row.get("frame"), -1)
         frame = int(frame_val if frame_val is not None else -1)
         if frame < 0:
@@ -119,9 +128,17 @@ def load_labels(path: Path) -> dict[int, Label]:
     return out
 
 
-def load_candidates(path: Path, score_column: str, max_rank: int) -> dict[int, Candidate]:
+def load_candidates(
+    path: Path,
+    score_column: str,
+    max_rank: int,
+    track_score_column: str = "",
+    clip: str = "",
+) -> dict[int, Candidate]:
     out: dict[int, Candidate] = {}
     for row in read_csv(path):
+        if clip and row.get("clip", "") != clip:
+            continue
         frame_val = fnum(row.get("frame"), -1)
         frame = int(frame_val if frame_val is not None else -1)
         rank = int(fnum(row.get("rank"), 0) or 0)
@@ -130,13 +147,18 @@ def load_candidates(path: Path, score_column: str, max_rank: int) -> dict[int, C
         score = fnum(row.get(score_column))
         if score is None and score_column != "score":
             score = fnum(row.get("score"))
+        track_score = None
+        if track_score_column:
+            track_score = fnum(row.get(track_score_column))
+        if track_score is None:
+            track_score = score
         x = fnum(row.get("x"))
         y = fnum(row.get("y"))
         w = fnum(row.get("w"), 1.0)
         h = fnum(row.get("h"), 1.0)
-        if frame < 0 or score is None or x is None or y is None or w is None or h is None:
+        if frame < 0 or score is None or track_score is None or x is None or y is None or w is None or h is None:
             continue
-        cand = Candidate(score=score, rank=rank, bbox=(x, y, w, h))
+        cand = Candidate(score=score, track_score=track_score, rank=rank, bbox=(x, y, w, h))
         if frame not in out or cand.score > out[frame].score:
             out[frame] = cand
     return out
@@ -171,13 +193,15 @@ def evaluate_rows(
         selected_bbox = None
         selected = False
         reason = "none"
+        acquire_score = None if cand is None else cand.score
+        track_score = None if cand is None else cand.track_score
 
         jump_ok = True
         if cand is not None and last_bbox is not None:
             jump_ok = center_dist(cand.bbox, last_bbox) <= max_jump_px
 
         if state == "search":
-            if cand is not None and cand.score >= acquire_threshold:
+            if cand is not None and acquire_score is not None and acquire_score >= acquire_threshold:
                 streak = 1
                 last_bbox = cand.bbox
                 state = "tentative" if acquire_hits > 1 else "locked"
@@ -192,7 +216,7 @@ def evaluate_rows(
             else:
                 streak = 0
         elif state == "tentative":
-            if cand is not None and cand.score >= acquire_threshold and jump_ok:
+            if cand is not None and acquire_score is not None and acquire_score >= acquire_threshold and jump_ok:
                 streak += 1
                 last_bbox = cand.bbox
                 reason = "acquire_continue"
@@ -204,7 +228,7 @@ def evaluate_rows(
                 elif output_tentative:
                     selected = True
                     selected_bbox = cand.bbox
-            elif cand is not None and cand.score >= acquire_threshold:
+            elif cand is not None and acquire_score is not None and acquire_score >= acquire_threshold:
                 streak = 1
                 last_bbox = cand.bbox
                 reason = "acquire_restart_jump"
@@ -216,7 +240,7 @@ def evaluate_rows(
                 streak = 0
                 last_bbox = None
         else:
-            if cand is not None and cand.score >= track_threshold and jump_ok:
+            if cand is not None and track_score is not None and track_score >= track_threshold and jump_ok:
                 misses = 0
                 last_bbox = cand.bbox
                 selected = True
@@ -251,7 +275,8 @@ def evaluate_rows(
                 "frame": frame,
                 "visible": int(lab.visible),
                 "state": state,
-                "candidate_score": "" if cand is None else round(cand.score, 6),
+                "candidate_score": "" if acquire_score is None else round(acquire_score, 6),
+                "track_score": "" if track_score is None else round(track_score, 6),
                 "candidate_rank": "" if cand is None else cand.rank,
                 "selected": int(selected),
                 "reason": reason,
@@ -300,17 +325,24 @@ def evaluate_rows(
 
 def main() -> None:
     args = parse_args()
-    labels = load_labels(Path(args.labels))
-    candidates = load_candidates(Path(args.candidates), args.score_column, args.max_rank)
+    labels = load_labels(Path(args.labels), args.clip)
+    candidates = load_candidates(
+        Path(args.candidates),
+        args.score_column,
+        args.max_rank,
+        args.track_score_column,
+        args.clip,
+    )
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summaries: list[dict[str, Any]] = []
     best_rows: list[dict[str, Any]] | None = None
     best_score = (-1.0, -1.0, -1.0, 0)
+    same_score_scale = not args.track_score_column or args.track_score_column == args.score_column
     for aq in parse_float_list(args.acquire_thresholds):
         for tr in parse_float_list(args.track_thresholds):
-            if tr > aq:
+            if same_score_scale and tr > aq:
                 continue
             for hits in parse_int_list(args.acquire_hits):
                 for misses in parse_int_list(args.max_misses):

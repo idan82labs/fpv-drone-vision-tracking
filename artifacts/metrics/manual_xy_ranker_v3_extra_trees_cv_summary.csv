@@ -1,9 +1,0 @@
-clip,model,all_frames,all_oracle_recall,all_strict_hit,all_strict_recall,all_loose_hit,all_loose_recall,all_wrong,high_frames,high_oracle_recall,high_strict_hit,high_strict_recall,high_loose_hit,high_loose_recall,high_wrong
-1c1258a1,baseline_verified_score,322,0.891,251,0.78,282,0.876,71,267,0.951,229,0.858,246,0.921,38
-1c1258a1,extra_trees,322,0.891,263,0.817,291,0.904,59,267,0.951,235,0.88,243,0.91,32
-529a6584,baseline_verified_score,113,1.0,83,0.735,110,0.973,30,113,1.0,83,0.735,110,0.973,30
-529a6584,extra_trees,113,1.0,93,0.823,112,0.991,20,113,1.0,93,0.823,112,0.991,20
-7bd296cd,baseline_verified_score,153,1.0,101,0.66,141,0.922,52,151,1.0,100,0.662,139,0.921,51
-7bd296cd,extra_trees,153,1.0,98,0.641,139,0.908,55,151,1.0,97,0.642,137,0.907,54
-e2711620,baseline_verified_score,89,0.494,30,0.337,43,0.483,59,49,0.082,3,0.061,3,0.061,46
-e2711620,extra_trees,89,0.494,37,0.416,45,0.506,52,49,0.082,4,0.082,5,0.102,45

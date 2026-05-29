@@ -28,6 +28,10 @@ EXCLUDE_COLUMNS = {
     "selected",
     "eligible",
     "passes_floor",
+    "cand_frame",
+    "cand_is_current",
+    "candidate_frame",
+    "candidate_is_current",
 }
 
 
@@ -43,6 +47,34 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--confidence", nargs="*", default=["high", "medium_high"])
     p.add_argument("--models", nargs="+", choices=("logistic", "hist_gbdt", "extra_trees"), default=["logistic", "hist_gbdt", "extra_trees"])
     p.add_argument("--fallback_thresholds", default="0:1:0.02", help="Threshold sweep for learned-score fallback rules: start:end:step or comma list.")
+    p.add_argument(
+        "--fallback_gates",
+        default="none,learned_not_map,source_large_dark_or_appearance,high_support,high_texture_support,large_dark_high_support,low_sky_high_support,negative_bg_pair,support_negative_bg_pair",
+        help="Comma-separated learned-candidate gates to sweep for state-specific fallback.",
+    )
+    p.add_argument(
+        "--final_exclude_clip",
+        nargs="*",
+        default=[],
+        help="Optional clip ids to exclude when fitting the saved deployment model.",
+    )
+    p.add_argument(
+        "--extra_examples",
+        default="",
+        help=(
+            "Optional candidate-level hard examples CSV for the saved final model. "
+            "Rows must contain hard_label plus the same candidate/tube feature columns."
+        ),
+    )
+    p.add_argument(
+        "--extra_weight",
+        type=int,
+        default=1,
+        help=(
+            "Integer repeat weight for --extra_examples in the saved final model. "
+            "This only affects the deployment model, not LOCO evaluation."
+        ),
+    )
     p.add_argument("--random_state", type=int, default=17)
     return p.parse_args()
 
@@ -77,6 +109,25 @@ def safe_float(value: Any, default: float | None = None) -> float | None:
     return out if math.isfinite(out) else default
 
 
+def float_or_default(value: Any, default: float) -> float:
+    out = safe_float(value)
+    return default if out is None else out
+
+
+def int_or_default(value: Any, default: int) -> int:
+    out = safe_float(value)
+    return default if out is None else int(out)
+
+
+def label_visible(row: dict[str, str]) -> bool:
+    raw = str(row.get("visible", "")).strip().lower()
+    if raw in {"", "1", "true", "yes", "visible", "target"}:
+        return True
+    if raw in {"0", "false", "no", "empty", "none", "not_visible", "not visible"}:
+        return False
+    return True
+
+
 def clip_matches(a: str, b: str) -> bool:
     return a == b or a.startswith(b) or b.startswith(a)
 
@@ -97,10 +148,10 @@ def load_top_tubes(results_dir: Path, clip: str, max_rank: int) -> dict[int, lis
     if path is None:
         return by_frame
     for row in read_csv(path):
-        rank = int(safe_float(row.get("rank"), 999) or 999)
+        rank = int_or_default(row.get("rank"), 999)
         if rank > max_rank:
             continue
-        frame = int(safe_float(row.get("frame"), -1) or -1)
+        frame = int_or_default(row.get("frame"), -1)
         if frame >= 0:
             by_frame[frame].append(row)
     return by_frame
@@ -108,19 +159,19 @@ def load_top_tubes(results_dir: Path, clip: str, max_rank: int) -> dict[int, lis
 
 def row_bbox(row: dict[str, str]) -> tuple[float, float, float, float]:
     return (
-        safe_float(row.get("x"), 0.0) or 0.0,
-        safe_float(row.get("y"), 0.0) or 0.0,
-        safe_float(row.get("w"), 1.0) or 1.0,
-        safe_float(row.get("h"), 1.0) or 1.0,
+        float_or_default(row.get("x"), 0.0),
+        float_or_default(row.get("y"), 0.0),
+        float_or_default(row.get("w"), 1.0),
+        float_or_default(row.get("h"), 1.0),
     )
 
 
 def label_bbox(row: dict[str, str]) -> tuple[float, float, float, float]:
     return (
-        safe_float(row.get("det_x", row.get("x")), 0.0) or 0.0,
-        safe_float(row.get("det_y", row.get("y")), 0.0) or 0.0,
-        safe_float(row.get("det_w", row.get("w")), 1.0) or 1.0,
-        safe_float(row.get("det_h", row.get("h")), 1.0) or 1.0,
+        float_or_default(row.get("det_x", row.get("x")), 0.0),
+        float_or_default(row.get("det_y", row.get("y")), 0.0),
+        float_or_default(row.get("det_w", row.get("w")), 1.0),
+        float_or_default(row.get("det_h", row.get("h")), 1.0),
     )
 
 
@@ -236,7 +287,7 @@ def fallback_rows(
 ) -> list[dict[str, Any]]:
     by_key: dict[tuple[str, int], dict[str, dict[str, Any]]] = defaultdict(dict)
     for row in predictions:
-        key = (str(row.get("clip", "")), int(row.get("frame", 0) or 0))
+        key = (str(row.get("clip", "")), int_or_default(row.get("frame"), 0))
         by_key[key][str(row.get("model", ""))] = row
 
     rows: list[dict[str, Any]] = []
@@ -257,6 +308,234 @@ def fallback_rows(
         rec["learned_score"] = round(score, 6)
         rows.append(rec)
     return rows
+
+
+def parse_gates(raw: str) -> list[str]:
+    return [x.strip() for x in raw.split(",") if x.strip()]
+
+
+def top_row_for_prediction(
+    top_by_clip: dict[str, dict[int, list[dict[str, str]]]],
+    row: dict[str, Any],
+) -> dict[str, str] | None:
+    clip = str(row.get("clip", ""))
+    frame = int_or_default(row.get("frame"), 0)
+    rank = str(row.get("rank", ""))
+    for cand in top_by_clip.get(clip, {}).get(frame, []):
+        if str(cand.get("rank", "")) == rank:
+            return cand
+    return None
+
+
+def gate_float(row: dict[str, str] | None, name: str, default: float = 0.0) -> float:
+    if row is None:
+        return default
+    value = safe_float(row.get(name), default)
+    return default if value is None else value
+
+
+def gate_source(row: dict[str, str] | None) -> str:
+    return "" if row is None else str(row.get("cand_source", ""))
+
+
+def gate_allows(row: dict[str, str] | None, gate: str) -> bool:
+    if gate == "none":
+        return True
+    source = gate_source(row)
+    cand_support = gate_float(row, "cand_attached_support")
+    tube_support = gate_float(row, "tube_mean_attached_support")
+    support = max(cand_support, tube_support)
+    cand_texture = gate_float(row, "cand_texture")
+    tube_texture = gate_float(row, "tube_mean_texture")
+    texture = max(cand_texture, tube_texture)
+    sky = max(gate_float(row, "cand_sky_like"), gate_float(row, "tube_mean_sky_like"))
+    pair_bg = gate_float(row, "tube_mean_pair_bg")
+    if gate == "learned_not_map":
+        return source != "map"
+    if gate == "source_large_dark_or_appearance":
+        return source in {"large_dark", "appearance"}
+    if gate == "high_support":
+        return support >= 8.0
+    if gate == "high_texture_support":
+        return texture >= 55.0 and support >= 6.0
+    if gate == "large_dark_high_support":
+        return source == "large_dark" and support >= 6.0
+    if gate == "low_sky_high_support":
+        return sky <= 0.02 and support >= 6.0
+    if gate == "negative_bg_pair":
+        return pair_bg <= 0.0
+    if gate == "support_negative_bg_pair":
+        return support >= 6.0 and pair_bg <= 0.0
+    raise SystemExit(f"unknown fallback gate: {gate}")
+
+
+def gated_fallback_rows(
+    predictions: list[dict[str, Any]],
+    top_by_clip: dict[str, dict[int, list[dict[str, str]]]],
+    model_name: str,
+    threshold: float,
+    gate: str,
+) -> list[dict[str, Any]]:
+    by_key: dict[tuple[str, int], dict[str, dict[str, Any]]] = defaultdict(dict)
+    for row in predictions:
+        key = (str(row.get("clip", "")), int_or_default(row.get("frame"), 0))
+        by_key[key][str(row.get("model", ""))] = row
+
+    rows: list[dict[str, Any]] = []
+    for key in sorted(by_key):
+        pair = by_key[key]
+        baseline = pair.get("baseline_verified_score")
+        learned = pair.get(model_name)
+        if baseline is None or learned is None:
+            continue
+        learned_top = top_row_for_prediction(top_by_clip, learned)
+        score_value = safe_float(learned.get("score"), -1e9)
+        score = -1e9 if score_value is None else score_value
+        allowed = gate_allows(learned_top, gate)
+        chosen = learned if score >= threshold and allowed else baseline
+        rec = dict(chosen)
+        rec["model"] = f"gated_{gate}_{model_name}_thr{threshold:.2f}"
+        rec["fallback_model"] = model_name
+        rec["fallback_threshold"] = round(threshold, 6)
+        rec["fallback_gate"] = gate
+        rec["fallback_gate_allowed"] = allowed
+        rec["fallback_used_learned"] = chosen is learned
+        rec["learned_score"] = round(score, 6)
+        rows.append(rec)
+    return rows
+
+
+def nested_fallback_rows(
+    predictions: list[dict[str, Any]],
+    model_names: list[str],
+    thresholds: list[float],
+    clips: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Select fallback model/threshold without looking at the held-out clip."""
+    fallback_by_config: dict[tuple[str, float], list[dict[str, Any]]] = {}
+    for model_name in model_names:
+        for threshold in thresholds:
+            fallback_by_config[(model_name, threshold)] = fallback_rows(predictions, model_name, threshold)
+
+    nested_rows: list[dict[str, Any]] = []
+    selection_rows: list[dict[str, Any]] = []
+    for held_clip in clips:
+        best_key: tuple[str, float] | None = None
+        best_summary: dict[str, Any] | None = None
+        for key, rows in fallback_by_config.items():
+            train_rows = [r for r in rows if r.get("clip") != held_clip]
+            if not train_rows:
+                continue
+            rec = summarize(train_rows, f"nested_train_{key[0]}_thr{key[1]:.2f}")
+            if best_summary is None or (
+                rec["strict_recall"],
+                rec["loose_recall"],
+                rec["high_strict_recall"],
+            ) > (
+                best_summary["strict_recall"],
+                best_summary["loose_recall"],
+                best_summary["high_strict_recall"],
+            ):
+                best_key = key
+                best_summary = rec
+        if best_key is None or best_summary is None:
+            continue
+        model_name, threshold = best_key
+        test_rows = [dict(r) for r in fallback_by_config[best_key] if r.get("clip") == held_clip]
+        for row in test_rows:
+            row["model"] = "nested_fallback"
+            row["nested_model"] = model_name
+            row["nested_threshold"] = round(threshold, 6)
+        nested_rows.extend(test_rows)
+        test_summary = summarize(test_rows, f"nested_test_{held_clip}")
+        selection_rows.append(
+            {
+                "heldout_clip": held_clip,
+                "selected_model": model_name,
+                "selected_threshold": round(threshold, 6),
+                "train_strict_recall": best_summary["strict_recall"],
+                "train_loose_recall": best_summary["loose_recall"],
+                "train_high_strict_recall": best_summary["high_strict_recall"],
+                "test_frames": test_summary["frames"],
+                "test_strict_recall": test_summary["strict_recall"],
+                "test_loose_recall": test_summary["loose_recall"],
+                "test_high_strict_recall": test_summary["high_strict_recall"],
+            }
+        )
+    return nested_rows, selection_rows
+
+
+def nested_gated_fallback_rows(
+    predictions: list[dict[str, Any]],
+    top_by_clip: dict[str, dict[int, list[dict[str, str]]]],
+    model_names: list[str],
+    thresholds: list[float],
+    gates: list[str],
+    clips: list[str],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any] | None]:
+    fallback_by_config: dict[tuple[str, float, str], list[dict[str, Any]]] = {}
+    for model_name in model_names:
+        for threshold in thresholds:
+            for gate in gates:
+                fallback_by_config[(model_name, threshold, gate)] = gated_fallback_rows(
+                    predictions,
+                    top_by_clip,
+                    model_name,
+                    threshold,
+                    gate,
+                )
+
+    nested_rows: list[dict[str, Any]] = []
+    selection_rows: list[dict[str, Any]] = []
+    for held_clip in clips:
+        best_key: tuple[str, float, str] | None = None
+        best_summary: dict[str, Any] | None = None
+        for key, rows in fallback_by_config.items():
+            train_rows = [r for r in rows if r.get("clip") != held_clip]
+            if not train_rows:
+                continue
+            rec = summarize(train_rows, f"nested_gate_train_{key[0]}_{key[2]}_thr{key[1]:.2f}")
+            if best_summary is None or (
+                rec["strict_recall"],
+                rec["loose_recall"],
+                rec["high_strict_recall"],
+            ) > (
+                best_summary["strict_recall"],
+                best_summary["loose_recall"],
+                best_summary["high_strict_recall"],
+            ):
+                best_key = key
+                best_summary = rec
+        if best_key is None or best_summary is None:
+            continue
+        model_name, threshold, gate = best_key
+        test_rows = [dict(r) for r in fallback_by_config[best_key] if r.get("clip") == held_clip]
+        for row in test_rows:
+            row["model"] = "nested_gated_fallback"
+            row["nested_model"] = model_name
+            row["nested_threshold"] = round(threshold, 6)
+            row["nested_gate"] = gate
+        nested_rows.extend(test_rows)
+        test_summary = summarize(test_rows, f"nested_gate_test_{held_clip}")
+        selection_rows.append(
+            {
+                "heldout_clip": held_clip,
+                "selected_model": model_name,
+                "selected_threshold": round(threshold, 6),
+                "selected_gate": gate,
+                "train_strict_recall": best_summary["strict_recall"],
+                "train_loose_recall": best_summary["loose_recall"],
+                "train_high_strict_recall": best_summary["high_strict_recall"],
+                "test_frames": test_summary["frames"],
+                "test_strict_recall": test_summary["strict_recall"],
+                "test_loose_recall": test_summary["loose_recall"],
+                "test_high_strict_recall": test_summary["high_strict_recall"],
+            }
+        )
+    summary = summarize(nested_rows, "nested_gated_fallback") if nested_rows else None
+    if summary:
+        summary["selection"] = "per-heldout-clip model/threshold/gate selected on other clips"
+    return nested_rows, selection_rows, summary
 
 
 def summarize_by_clip(rows: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
@@ -280,17 +559,18 @@ def evaluate_by_score(
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for lab in labels:
-        rows = top_by_clip.get(lab["clip"], {}).get(int(lab["frame"]), [])
+        frame = int_or_default(lab.get("frame"), 0)
+        rows = top_by_clip.get(lab["clip"], {}).get(frame, [])
         if not rows:
             continue
-        best = max(rows, key=lambda r: safe_float(r.get(score_name), -1e9) or -1e9)
+        best = max(rows, key=lambda r: float_or_default(r.get(score_name), -1e9))
         d = dist_to_label(best, lab)
         oracle_d = min((dist_to_label(r, lab) for r in rows), default=float("inf"))
         out.append(
             {
                 "model": f"baseline_{score_name}",
                 "clip": lab["clip"],
-                "frame": int(lab["frame"]),
+                "frame": frame,
                 "confidence": lab.get("confidence", ""),
                 "rank": best.get("rank", ""),
                 "score": safe_float(best.get(score_name), ""),
@@ -304,14 +584,31 @@ def evaluate_by_score(
     return out
 
 
+def load_extra_examples(path: Path) -> tuple[list[dict[str, str]], np.ndarray]:
+    rows: list[dict[str, str]] = []
+    y_vals: list[int] = []
+    if not path.exists():
+        raise SystemExit(f"--extra_examples not found: {path}")
+    for row in read_csv(path):
+        raw = row.get("hard_label", row.get("y", ""))
+        if raw == "":
+            continue
+        label = int(float(raw))
+        if label not in {0, 1}:
+            continue
+        rows.append(row)
+        y_vals.append(label)
+    return rows, np.asarray(y_vals, dtype=np.int32)
+
+
 def main() -> None:
     args = parse_args()
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    labels = [r for r in read_csv(Path(args.labels)) if r.get("visible", "1") != "0"]
+    labels = [r for r in read_csv(Path(args.labels)) if label_visible(r)]
     if args.confidence:
         labels = [r for r in labels if r.get("confidence") in set(args.confidence)]
-    labels.sort(key=lambda r: (r.get("clip", ""), int(r.get("frame", "0") or 0)))
+    labels.sort(key=lambda r: (r.get("clip", ""), int_or_default(r.get("frame"), 0)))
     clips = sorted({r["clip"] for r in labels})
     top_by_clip = {clip: load_top_tubes(Path(args.results_dir), clip, args.max_rank) for clip in clips}
 
@@ -320,7 +617,8 @@ def main() -> None:
     ignored_near = 0
     missing_frames = 0
     for lab in labels:
-        rows = top_by_clip.get(lab["clip"], {}).get(int(lab["frame"]), [])
+        frame = int_or_default(lab.get("frame"), 0)
+        rows = top_by_clip.get(lab["clip"], {}).get(frame, [])
         if not rows:
             missing_frames += 1
             continue
@@ -334,7 +632,7 @@ def main() -> None:
             else:
                 ignored_near += 1
                 continue
-            examples.append({"clip": lab["clip"], "frame": int(lab["frame"]), "label": lab, "row": row, "dist_px": d, "y": y})
+            examples.append({"clip": lab["clip"], "frame": frame, "label": lab, "row": row, "dist_px": d, "y": y})
     if not examples:
         raise SystemExit("no examples")
 
@@ -348,6 +646,8 @@ def main() -> None:
     baseline = evaluate_by_score(labels, top_by_clip, "verified_score", args.center_tol_px, args.loose_tol_px)
     predictions.extend(baseline)
     summary.append(summarize(baseline, "baseline_verified_score"))
+    thresholds = parse_thresholds(args.fallback_thresholds)
+    gates = parse_gates(args.fallback_gates)
 
     models = make_models(args.random_state)
     fallback_summaries: list[dict[str, Any]] = []
@@ -361,7 +661,8 @@ def main() -> None:
             model = Pipeline(models[model_name].steps)
             model.fit(x[train_idx], y[train_idx])
             for lab in [r for r in labels if r["clip"] == held_clip]:
-                rows = top_by_clip.get(held_clip, {}).get(int(lab["frame"]), [])
+                frame = int_or_default(lab.get("frame"), 0)
+                rows = top_by_clip.get(held_clip, {}).get(frame, [])
                 if not rows:
                     continue
                 scores = predict_score(model, vectorize(rows, numeric, sources))
@@ -372,7 +673,7 @@ def main() -> None:
                 rec = {
                     "model": model_name,
                     "clip": held_clip,
-                    "frame": int(lab["frame"]),
+                    "frame": frame,
                     "confidence": lab.get("confidence", ""),
                     "rank": best.get("rank", ""),
                     "score": round(float(scores[best_i]), 6),
@@ -387,7 +688,7 @@ def main() -> None:
         summary.append(summarize(model_rows, model_name))
 
     for model_name in args.models:
-        for threshold in parse_thresholds(args.fallback_thresholds):
+        for threshold in thresholds:
             rows = fallback_rows(predictions, model_name, threshold)
             if not rows:
                 continue
@@ -399,11 +700,44 @@ def main() -> None:
             fallback_summaries.append(rec)
             fallback_predictions_by_name[str(rec["model"])] = rows
 
+    nested_rows, nested_selection_rows = nested_fallback_rows(predictions, args.models, thresholds, clips)
+    nested_fallback_summary = summarize(nested_rows, "nested_fallback") if nested_rows else None
+    if nested_fallback_summary:
+        nested_fallback_summary["selection"] = "per-heldout-clip model/threshold selected on other clips"
+    nested_gated_rows, nested_gated_selection_rows, nested_gated_fallback_summary = nested_gated_fallback_rows(
+        predictions,
+        top_by_clip,
+        args.models,
+        thresholds,
+        gates,
+        clips,
+    )
+
     best_direct = max(summary[1:], key=lambda r: (r["strict_recall"], r["high_strict_recall"]))["model"]
     best_fallback = max(fallback_summaries, key=lambda r: (r["strict_recall"], r["loose_recall"], r["high_strict_recall"]), default=None)
     best_name = best_direct
     final_model = make_models(args.random_state)[best_name]
-    final_model.fit(x, y)
+    final_exclude = set(args.final_exclude_clip or [])
+    final_train_idx = np.asarray([i for i, clip in enumerate(ex_clips) if clip not in final_exclude], dtype=int)
+    if len(final_train_idx) == 0 or len(set(y[final_train_idx])) < 2:
+        raise SystemExit("--final_exclude_clip leaves no usable final training examples")
+    final_x = x[final_train_idx]
+    final_y = y[final_train_idx]
+    extra_rows: list[dict[str, str]] = []
+    extra_y = np.asarray([], dtype=np.int32)
+    unique_extra_y = np.asarray([], dtype=np.int32)
+    extra_repeat = max(1, int(args.extra_weight))
+    if args.extra_examples:
+        extra_rows, extra_y = load_extra_examples(Path(args.extra_examples))
+        unique_extra_y = extra_y.copy()
+        if extra_rows:
+            extra_x = vectorize(extra_rows, numeric, sources)
+            if extra_repeat > 1:
+                extra_x = np.repeat(extra_x, extra_repeat, axis=0)
+                extra_y = np.repeat(extra_y, extra_repeat, axis=0)
+            final_x = np.vstack([final_x, extra_x])
+            final_y = np.concatenate([final_y, extra_y])
+    final_model.fit(final_x, final_y)
     model_path = out_dir / f"{best_name}_surface_xy_ranker.joblib"
     joblib.dump(
         {
@@ -417,6 +751,16 @@ def main() -> None:
             "best_model_loco": best_name,
             "best_direct_model_loco": best_direct,
             "best_fallback_loco": best_fallback,
+            "nested_fallback_loco": nested_fallback_summary,
+            "nested_gated_fallback_loco": nested_gated_fallback_summary,
+            "fallback_gates": gates,
+            "final_exclude_clip": sorted(final_exclude),
+            "final_training_examples": int(len(final_y)),
+            "base_final_training_examples": int(len(final_train_idx)),
+            "extra_examples": args.extra_examples,
+            "extra_weight": extra_repeat,
+            "extra_training_examples": int(len(extra_y)),
+            "unique_extra_examples": int(len(extra_rows)),
         },
         model_path,
     )
@@ -424,6 +768,16 @@ def main() -> None:
     write_csv(out_dir / "loco_predictions.csv", predictions)
     write_csv(out_dir / "loco_summary.csv", summary)
     write_csv(out_dir / "fallback_sweep.csv", fallback_summaries)
+    if nested_rows:
+        write_csv(out_dir / "nested_fallback_predictions.csv", nested_rows)
+        write_csv(out_dir / "nested_fallback_by_clip.csv", summarize_by_clip(nested_rows, "nested_fallback"))
+    if nested_selection_rows:
+        write_csv(out_dir / "nested_fallback_selection.csv", nested_selection_rows)
+    if nested_gated_rows:
+        write_csv(out_dir / "nested_gated_fallback_predictions.csv", nested_gated_rows)
+        write_csv(out_dir / "nested_gated_fallback_by_clip.csv", summarize_by_clip(nested_gated_rows, "nested_gated_fallback"))
+    if nested_gated_selection_rows:
+        write_csv(out_dir / "nested_gated_fallback_selection.csv", nested_gated_selection_rows)
     if best_fallback:
         best_fallback_name = str(best_fallback["model"])
         best_fallback_rows = fallback_predictions_by_name.get(best_fallback_name, [])
@@ -444,6 +798,24 @@ def main() -> None:
             for ex in examples
         ],
     )
+    if extra_rows:
+        write_csv(
+            out_dir / "extra_training_examples.csv",
+            [
+                {
+                    "clip": row.get("clip", ""),
+                    "frame": row.get("frame", ""),
+                    "y": int(unique_extra_y[i]),
+                    "kind": row.get("hard_kind", ""),
+                    "rank": row.get("rank", ""),
+                    "source": row.get("cand_source", ""),
+                    "candidate_dist_px": row.get("candidate_dist_px", ""),
+                    "old_selected_dist_px": row.get("old_selected_dist_px", ""),
+                    "weight": extra_repeat,
+                }
+                for i, row in enumerate(extra_rows)
+            ],
+        )
     metadata = {
         "labels": str(args.labels),
         "results_dir": str(args.results_dir),
@@ -459,7 +831,18 @@ def main() -> None:
         "best_model_loco": best_name,
         "best_direct_model_loco": best_direct,
         "best_fallback_loco": best_fallback,
+        "nested_fallback_loco": nested_fallback_summary,
+        "nested_gated_fallback_loco": nested_gated_fallback_summary,
+        "fallback_gates": gates,
+        "final_exclude_clip": sorted(final_exclude),
+        "final_training_examples": int(len(final_y)),
+        "base_final_training_examples": int(len(final_train_idx)),
+        "extra_examples": args.extra_examples,
+        "extra_weight": extra_repeat,
+        "extra_training_examples": int(len(extra_y)),
+        "unique_extra_examples": int(len(extra_rows)),
         "model_path": str(model_path),
+        "metric_caveat": "fallback threshold is selected from this LOCO sweep; use nested threshold selection or a separate holdout for unbiased reporting",
     }
     (out_dir / "metadata.json").write_text(json.dumps(metadata, indent=2))
     (out_dir / "README.md").write_text(
@@ -467,8 +850,14 @@ def main() -> None:
         "Leave-one-clip-out evaluation for textured/non-sky labels.\n\n"
         f"Best direct LOCO model: `{best_direct}`\n\n"
         f"Best confidence fallback: `{best_fallback['model'] if best_fallback else ''}`\n\n"
+        f"Nested confidence fallback: `{nested_fallback_summary['strict_recall'] if nested_fallback_summary else ''}` strict recall\n\n"
+        f"Nested gated fallback: `{nested_gated_fallback_summary['strict_recall'] if nested_gated_fallback_summary else ''}` strict recall\n\n"
+        "Caveat: the fallback threshold is selected from this LOCO sweep. Treat it\n"
+        "as model-selection evidence unless rerun with nested threshold selection\n"
+        "or a separate holdout.\n\n"
         "See `loco_summary.csv`, `fallback_sweep.csv`, "
-        "`best_fallback_by_clip.csv`, `loco_predictions.csv`, and `metadata.json`.\n"
+        "`nested_fallback_selection.csv`, `nested_gated_fallback_selection.csv`, `best_fallback_by_clip.csv`, "
+        "`loco_predictions.csv`, and `metadata.json`.\n"
     )
     print(out_dir / "loco_summary.csv")
     print(model_path)

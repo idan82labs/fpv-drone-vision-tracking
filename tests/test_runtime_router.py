@@ -1,5 +1,7 @@
 import argparse
+import math
 import unittest
+from unittest import mock
 
 from scripts import motion_detector_v2 as base
 from scripts import tbd_motion_detector as tbd
@@ -38,6 +40,7 @@ def args(**overrides):
         "surface_ranker_min_rate": 0.45,
         "surface_ranker_model": "",
         "surface_ranker_policy": "off",
+        "surface_ranker_gate": "none",
         "surface_ranker_threshold": 0.76,
         "surface_ranker_top_n": 80,
         "beam_width": 90,
@@ -154,6 +157,124 @@ class RuntimeRouterTests(unittest.TestCase):
 
         tracker.surface_ranker = FakeRanker(high_score=0.50)
         self.assertEqual(tracker.best().sid, 1)
+
+    def test_surface_ranker_respects_top_n_cap(self):
+        class FakeRanker:
+            def scores(self, rows):
+                return [0.10 if row["track_id"] != 3 else 0.99 for row in rows]
+
+        opts = args(surface_ranker_policy="confidence_fallback", surface_ranker_threshold=0.76, surface_ranker_top_n=2)
+        tracker = tbd.BeamTBD(opts, px_per_frame=10.0)
+        tracker.surface_ranker = FakeRanker()
+        tracker.states = [
+            tbd.PathState(1, (0, 0, 3, 3), contribs=[10.0], hit_flags=[True]),
+            tbd.PathState(2, (10, 0, 3, 3), contribs=[9.0], hit_flags=[True]),
+            tbd.PathState(3, (20, 0, 3, 3), contribs=[8.0], hit_flags=[True]),
+        ]
+
+        self.assertEqual(tracker.best().sid, 1)
+        self.assertEqual(tracker.last_surface_ranker_rows, 2)
+
+    def test_surface_ranker_cannot_override_selected_score_floor(self):
+        class FakeRanker:
+            def scores(self, rows):
+                return [0.10 if row["track_id"] == 1 else 0.99 for row in rows]
+
+        opts = args(surface_ranker_policy="confidence_fallback", surface_ranker_threshold=0.76, selected_score=6.0)
+        tracker = tbd.BeamTBD(opts, px_per_frame=10.0)
+        tracker.surface_ranker = FakeRanker()
+        tracker.states = [
+            tbd.PathState(1, (0, 0, 3, 3), contribs=[10.0], hit_flags=[True]),
+            tbd.PathState(2, (10, 0, 3, 3), contribs=[5.0], hit_flags=[True]),
+        ]
+
+        self.assertEqual(tracker.best().sid, 1)
+        self.assertFalse(tracker.last_surface_ranker_used)
+        self.assertEqual(tracker.last_surface_ranker_sid, 2)
+
+    def test_state_feature_row_schema_matches_top_tube_missing_margin(self):
+        opts = args()
+        tracker = tbd.BeamTBD(opts, px_per_frame=10.0)
+        st = tbd.PathState(1, (0, 0, 3, 3), contribs=[10.0], hit_flags=[True])
+
+        runtime_row = tbd.state_feature_row(st, opts, 1, 10.0, 0.0, None)
+        _payload, export_row = tbd.tube_state_payload(1, 1, st, tracker, opts, st, None)
+
+        self.assertEqual(runtime_row["competitor_margin"], "")
+        self.assertEqual(export_row["competitor_margin"], "")
+
+    def test_learned_surface_ranker_vectorize_matches_source_bits_and_missing_values(self):
+        ranker = object.__new__(tbd.LearnedSurfaceRanker)
+        ranker.numeric_features = ["rank", "competitor_margin", "cand_score"]
+        ranker.source_features = ["src_map", "src_temporal_stack"]
+
+        x = ranker.vectorize(
+            [
+                {
+                    "rank": 2,
+                    "competitor_margin": "",
+                    "cand_score": 5.5,
+                    "cand_source": "temporal_stack",
+                }
+            ]
+        )
+
+        self.assertEqual(x.shape, (1, 5))
+        self.assertEqual(x[0, 0], 2.0)
+        self.assertTrue(math.isnan(x[0, 1]))
+        self.assertEqual(x[0, 2], 5.5)
+        self.assertEqual(x[0, 3], 0.0)
+        self.assertEqual(x[0, 4], 1.0)
+
+    def test_surface_ranker_gate_requires_support_when_enabled(self):
+        self.assertTrue(
+            tbd.surface_ranker_gate_allows(
+                {"cand_source": "large_dark", "cand_attached_support": 10.0, "tube_mean_attached_support": 1.0},
+                "high_support",
+            )
+        )
+
+    def test_surface_ranker_gate_applies_after_best_learned_choice(self):
+        class FakeRanker:
+            def scores(self, rows):
+                return [0.10 if row["track_id"] == 1 else 0.99 if row["track_id"] == 2 else 0.80 for row in rows]
+
+        opts = args(
+            surface_ranker_policy="confidence_fallback",
+            surface_ranker_threshold=0.0,
+            surface_ranker_gate="high_support",
+        )
+        tracker = tbd.BeamTBD(opts, px_per_frame=10.0)
+        tracker.surface_ranker = FakeRanker()
+        baseline = tbd.PathState(1, (0, 0, 3, 3), contribs=[10.0], hit_flags=[True])
+        ungated_high_score = tbd.PathState(2, (10, 0, 3, 3), contribs=[9.0], hit_flags=[True])
+        gated_lower_score = tbd.PathState(3, (20, 0, 3, 3), contribs=[8.0], hit_flags=[True])
+        gated_lower_score.last_candidate = cand(8.0, source="large_dark")
+        gated_lower_score.last_candidate.attached_support = 10.0
+        tracker.states = [baseline, ungated_high_score, gated_lower_score]
+
+        selected = tracker.best()
+
+        self.assertEqual(selected.sid, 1)
+        self.assertEqual(tracker.last_surface_ranker_sid, 2)
+        self.assertFalse(tracker.last_surface_ranker_used)
+        self.assertFalse(
+            tbd.surface_ranker_gate_allows(
+                {"cand_source": "large_dark", "cand_attached_support": 2.0, "tube_mean_attached_support": 1.0},
+                "high_support",
+            )
+        )
+
+    def test_default_best_fast_path_does_not_compute_tube_features(self):
+        opts = args(tube_verifier="off", surface_ranker_policy="off", selection_margin=0.0, sky_rescue=False)
+        tracker = tbd.BeamTBD(opts, px_per_frame=10.0)
+        tracker.states = [
+            tbd.PathState(1, (0, 0, 3, 3), contribs=[10.0], hit_flags=[True]),
+            tbd.PathState(2, (10, 0, 3, 3), contribs=[9.0], hit_flags=[True]),
+        ]
+
+        with mock.patch.object(tbd, "tube_features", side_effect=AssertionError("slow feature path used")):
+            self.assertEqual(tracker.best().sid, 1)
 
 
 if __name__ == "__main__":
