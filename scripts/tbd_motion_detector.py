@@ -2191,7 +2191,8 @@ def tube_state_payload(
         and st.bbox == selected.bbox
         and st.last_frame == selected.last_frame
     )
-    cand_json = st.last_candidate.to_json() if st.last_candidate is not None else None
+    cand_is_current = st.misses == 0 and st.last_candidate is not None
+    cand_json = st.last_candidate.to_json() if cand_is_current else None
     payload = {
         "rank": rank,
         "track_id": st.sid,
@@ -2207,6 +2208,8 @@ def tube_state_payload(
         "vx": round(st.vx, 3),
         "vy": round(st.vy, 3),
         "competitor_margin": round(float(competitor_margin), 3) if competitor_margin is not None else None,
+        "candidate_is_current": cand_is_current,
+        "candidate_frame": frame_no if cand_is_current else None,
         "candidate": cand_json,
         "tube_features": {k: round(float(v), 3) for k, v in features.items()},
     }
@@ -2229,6 +2232,8 @@ def tube_state_payload(
         "vx": round(st.vx, 6),
         "vy": round(st.vy, 6),
         "competitor_margin": round(float(competitor_margin), 6) if competitor_margin is not None else "",
+        "cand_is_current": int(cand_is_current),
+        "cand_frame": frame_no if cand_is_current else "",
     }
     if cand_json is not None:
         for key, value in cand_json.items():
@@ -2479,8 +2484,13 @@ def run(args: argparse.Namespace) -> None:
                 "misses": selected.misses,
                 "vx": round(selected.vx, 3),
                 "vy": round(selected.vy, 3),
-                "candidate": selected.last_candidate.to_json() if selected.last_candidate is not None else None,
             }
+            selected_cand_is_current = selected.misses == 0 and selected.last_candidate is not None
+            selected_json["candidate_is_current"] = selected_cand_is_current
+            selected_json["candidate_frame"] = fno if selected_cand_is_current else None
+            selected_json["candidate"] = (
+                selected.last_candidate.to_json() if selected_cand_is_current else None
+            )
             selected_rows.append([fno, selected.sid, *selected.bbox, selected.score(), selected.misses])
             row = {
                 "frame": fno,
@@ -2495,8 +2505,10 @@ def run(args: argparse.Namespace) -> None:
                 "misses": selected.misses,
                 "vx": round(selected.vx, 6),
                 "vy": round(selected.vy, 6),
+                "cand_is_current": int(selected_cand_is_current),
+                "cand_frame": fno if selected_cand_is_current else "",
             }
-            if selected.last_candidate is not None:
+            if selected_cand_is_current:
                 cand_json = selected.last_candidate.to_json()
                 for key, value in cand_json.items():
                     if isinstance(value, (int, float, str)):

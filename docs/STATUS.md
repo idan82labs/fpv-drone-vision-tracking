@@ -138,11 +138,19 @@ From the first acquisition/null state-machine sweep:
 - Probe `--mask_selected_for_motion_model`: d129 visible strict improved
   29/38 -> 30/38, but all-frame correctness fell 160/250 -> 152/250 because
   hallucinations increased. Keep it as an explicit experiment, not a default.
+- Negative control over native detector `verified_score` from top-80 tubes:
+  best all-frame was 86.8%, but visible strict collapsed to 10/38 = 26.3%.
+  No swept config reached 65% visible strict recall.
+- Export hygiene fix: top-tube and selected-feature rows now mark whether
+  `cand_*` fields are from a current-frame candidate. Coasting/missed states no
+  longer export stale candidate fields as if they were fresh detections.
 
 Interpretation: acquisition/null state is a better no-new-label path than more
 threshold tuning. It can materially suppress hallucinations, but the
-high-accuracy config acquires late. The next integration should support two
-modes: strict search/null before lock and continuity-backed tracking after lock.
+high-accuracy config acquires late, and raw detector scores are not sufficient
+for selection. The next integration should support two modes: strict search/null
+before lock and continuity-backed tracking after lock, driven by learned or
+out-of-fold candidate scores rather than native `verified_score` alone.
 
 ## Next Meaningful Work
 

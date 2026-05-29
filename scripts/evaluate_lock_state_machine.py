@@ -34,8 +34,10 @@ class Label:
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--labels", required=True, help="CSV with frame, visible, det_x/det_y/det_w/det_h.")
-    p.add_argument("--candidates", required=True, help="Per-frame best candidate CSV with frame, score, x/y/w/h.")
+    p.add_argument("--candidates", required=True, help="Candidate CSV with frame, score, x/y/w/h. Multiple rows per frame are allowed.")
     p.add_argument("--out_dir", required=True)
+    p.add_argument("--score_column", default="score")
+    p.add_argument("--max_rank", type=int, default=9999)
     p.add_argument("--strict_tol_px", type=float, default=8.0)
     p.add_argument("--loose_tol_px", type=float, default=16.0)
     p.add_argument("--acquire_thresholds", default="0.55,0.6,0.65,0.7,0.75,0.8,0.85,0.9")
@@ -117,20 +119,26 @@ def load_labels(path: Path) -> dict[int, Label]:
     return out
 
 
-def load_candidates(path: Path) -> dict[int, Candidate]:
+def load_candidates(path: Path, score_column: str, max_rank: int) -> dict[int, Candidate]:
     out: dict[int, Candidate] = {}
     for row in read_csv(path):
         frame_val = fnum(row.get("frame"), -1)
         frame = int(frame_val if frame_val is not None else -1)
-        score = fnum(row.get("score"))
+        rank = int(fnum(row.get("rank"), 0) or 0)
+        if rank > max_rank:
+            continue
+        score = fnum(row.get(score_column))
+        if score is None and score_column != "score":
+            score = fnum(row.get("score"))
         x = fnum(row.get("x"))
         y = fnum(row.get("y"))
         w = fnum(row.get("w"), 1.0)
         h = fnum(row.get("h"), 1.0)
         if frame < 0 or score is None or x is None or y is None or w is None or h is None:
             continue
-        rank = int(fnum(row.get("rank"), 0) or 0)
-        out[frame] = Candidate(score=score, rank=rank, bbox=(x, y, w, h))
+        cand = Candidate(score=score, rank=rank, bbox=(x, y, w, h))
+        if frame not in out or cand.score > out[frame].score:
+            out[frame] = cand
     return out
 
 
@@ -293,7 +301,7 @@ def evaluate_rows(
 def main() -> None:
     args = parse_args()
     labels = load_labels(Path(args.labels))
-    candidates = load_candidates(Path(args.candidates))
+    candidates = load_candidates(Path(args.candidates), args.score_column, args.max_rank)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
