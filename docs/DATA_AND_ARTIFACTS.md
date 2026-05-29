@@ -18,6 +18,9 @@ This repository includes only curated data.
   - A few diagnostic sheets used to justify vision-assisted gap filling.
 - `artifacts/state_machine_selector_d129_v1/`
   - Complete-video d129 acquisition/null selector sweep and its input CSVs.
+- `artifacts/full_video_oof_state_eval_d129_v2/`
+  - Reproducible full-video d129 out-of-fold candidate scores plus
+    acquire/track/null state-machine sweeps.
 - `artifacts/surface_training_v2_vision_checked/`
   - Strictly promoted non-sky/surface-backed labels from visual review. This is
     intentionally smaller than the router `surface_backed` set.

@@ -169,6 +169,30 @@ From the first full-video OOF state-ranker harness:
   strong evidence that null-aware candidate scores are the right selector input,
   but it should not become a default until reproduced on another complete clip.
 
+From the reproducible full-video OOF state-eval driver:
+
+- Added `scripts/run_full_video_oof_state_eval.py` to generate OOF candidate
+  scores and run acquire/track/null sweeps from one command.
+- Rebuilt the d129 complete-video benchmark as
+  `artifacts/full_video_oof_state_eval_d129_v2/`.
+- The artifact now keeps all-candidate OOF score tables:
+  `oof_candidate_scores_<model>.csv`, not only best-per-frame selections.
+- Best OOF ExtraTrees + state machine:
+  - 249/250 all-frame correct = 99.6%.
+  - 38/38 visible strict = 100.0%.
+  - 211/212 invisible/no-box = 99.5%.
+  - selected frames = 39.
+- OOF logistic + state machine also kept 38/38 visible strict, but with more
+  false positives: 236/250 all-frame correct and 198/212 invisible/no-box.
+- Native `verified_score` negative control, using the correct raw-score
+  threshold grid, reached 217/250 all-frame correct but only 10/38 visible
+  strict. This confirms that the win is not the state machine alone; it needs
+  null-aware learned candidate scores.
+
+Interpretation: the next integration target is now concrete: pass learned
+candidate scores into the acquire/lock/null selector. The same caveat remains:
+this is one-clip stratified OOF, not cross-video proof.
+
 From the second vision-checked surface pass:
 
 - Re-profiled the next-batch labels with the target-local router.

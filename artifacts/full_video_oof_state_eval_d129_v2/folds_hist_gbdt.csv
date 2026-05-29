@@ -1,0 +1,6 @@
+model,fold,status,test_examples,train_examples,train_pos,train_neg,test_pos,test_neg
+hist_gbdt,0,ok,3859,15759,43,15716,8,3851
+hist_gbdt,1,ok,4041,15577,42,15535,9,4032
+hist_gbdt,2,ok,3987,15631,39,15592,12,3975
+hist_gbdt,3,ok,3823,15795,42,15753,9,3814
+hist_gbdt,4,ok,3908,15710,38,15672,13,3895
