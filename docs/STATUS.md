@@ -1346,3 +1346,42 @@ better review/training artifacts for the real failures. The next implementation
 should use the current failure packets to train/evaluate explicit reselect and
 no-box states, or add richer target-aligned/background-aligned features. A
 global no-box classifier and raw continuity guard are killed for now.
+
+Multiclip candidate-ranker probe:
+
+- Added `scripts/evaluate_multiclip_candidate_ranker.py`, an offline
+  leave-one-clip-out harness that trains on exported `top_tubes.csv` rows and
+  asks whether a learned candidate re-ranker can select the right box or emit
+  no-box without the full runtime tracker.
+- Added unit coverage in `tests/test_multiclip_candidate_ranker.py`.
+- Top-20 current scored tubes, strict positive definition:
+  - `e271` oracle@20 strict: `451/699 = 64.5%`;
+  - `aaf1` oracle@20 strict: `99/107 = 92.5%`;
+  - best global point was `hist_gbdt` at threshold `0.02`:
+    `76.41%` strict / `76.41%` loose / `8.88%` invisible no-box.
+- Top-70 current runtime tubes, strict positive definition:
+  - `e271` oracle@70 strict: `592/699 = 84.7%`;
+  - `aaf1` oracle@70 strict: `65/107 = 60.7%`;
+  - best global point was `extra_trees` at threshold `0.02`:
+    `68.99%` strict / `68.99%` loose / `3.29%` invisible no-box.
+- Mixed full-stack/large-dark/CLBA artifact:
+  - `e271` oracle: `592/699 = 84.7%`;
+  - `aaf1` oracle: `73/107 = 68.2%`;
+  - best global point was only `68.38%` strict / `68.38%` loose /
+    `3.29%` invisible no-box.
+- Top-20 with a looser positive definition (`positive_tol_px=16`):
+  - `e271` oracle@20: `488/699 = 69.8%`;
+  - `aaf1` oracle@20: `107/107 = 100%`;
+  - best global point was `hist_gbdt` at threshold `0.02`:
+    `69.24%` strict / `78.01%` loose / `7.24%` invisible no-box.
+
+Interpretation: this kills a broad global candidate re-ranker as a default
+runtime replacement. The exported candidate features contain useful diagnostic
+signal, but they do not transfer cleanly enough to beat the current seeded
+router (`77.39%` strict / `82.52%` loose / `83.55%` invisible no-box at
+threshold `0.1`). Increasing candidate count improves e271 oracle but adds too
+much clutter and makes selection worse. The next algorithmic work should follow
+the professor's state-model recommendation more literally: explicit
+target/null/background-lock/attached-lock observations with
+target-aligned-vs-background-aligned evidence, not another scalar global
+ranker.
