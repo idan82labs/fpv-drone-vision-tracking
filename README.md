@@ -359,3 +359,6 @@ The most valuable next work is:
 
 Only after those pass should we consider porting stable hot paths to Rust or
 C++ for deployment.
+
+The concrete experiment ladder is tracked in
+`docs/IMPROVEMENT_LOOP_PLAN.md`.
