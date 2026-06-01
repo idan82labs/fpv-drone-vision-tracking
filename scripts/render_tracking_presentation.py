@@ -42,7 +42,20 @@ def draw_text(
 
 def selected_rows(path: Path, clip: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    df = df[df["clip"].eq(clip)].copy()
+    if "clip" in df.columns:
+        df["clip"] = df["clip"].astype(str)
+        df = df[df["clip"].eq(clip)].copy()
+    else:
+        df["clip"] = clip
+    if "learned_score" not in df.columns:
+        for fallback in ("target_obs", "target_llr", "raw_score", "score"):
+            if fallback in df.columns:
+                df["learned_score"] = df[fallback]
+                break
+        else:
+            df["learned_score"] = 0.0
+    if "source" not in df.columns:
+        df["source"] = df.get("reason", "")
     for col in ["selected", "x", "y", "w", "h", "rank", "learned_score"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")

@@ -3,6 +3,7 @@ import tempfile
 from pathlib import Path
 
 from raspberry_pi_runtime.verified_sequence_selector import load_rows, output_rows, viterbi_select, write_csv
+from scripts.selector_core import SequenceItem, select_viterbi_sequence
 import unittest
 
 
@@ -46,6 +47,61 @@ class VerifiedSequenceSelectorTest(unittest.TestCase):
         self.assertEqual(rows[0]["frame"], 2)
         self.assertEqual(rows[0]["selected"], 1)
         self.assertEqual(rows[0]["x"], 2)
+
+    def test_output_rows_can_emit_no_box_rows_for_parity(self):
+        by_frame = {
+            1: [candidate(1, 1, 0, 0, -1.0)],
+            2: [candidate(2, 1, 2, 0, 4.0)],
+            3: [candidate(3, 1, 100, 100, 10.0)],
+        }
+        selected = {1: by_frame[1][0], 2: by_frame[2][0]}
+
+        rows = output_rows("clip", by_frame, selected, threshold=0.0, emit_no_box_rows=True)
+
+        self.assertEqual([row["frame"] for row in rows], [1, 2, 3])
+        self.assertEqual([row["selected"] for row in rows], [0, 1, 0])
+        self.assertEqual(rows[0]["x"], "")
+        self.assertEqual(rows[2]["x"], "")
+
+    def test_viterbi_matches_selector_core_no_backfill_selected_no_box_parity(self):
+        by_frame = {
+            1: [candidate(1, 1, 0, 0, 9.0)],
+            2: [candidate(2, 1, 100, 100, 20.0)],
+            3: [candidate(3, 1, 102, 100, 15.0)],
+        }
+
+        selected = viterbi_select(by_frame, max_jump_px=5.0, transition_weight=1.5)
+        core_selected = select_viterbi_sequence(
+            [
+                (
+                    frame,
+                    [
+                        SequenceItem(
+                            frame=frame,
+                            bbox=(row["x"], row["y"], row["w"], row["h"]),
+                            score=row["selector_score"],
+                            payload=row,
+                        )
+                        for row in rows
+                    ],
+                )
+                for frame, rows in sorted(by_frame.items())
+            ],
+            max_jump_px=5.0,
+            transition_weight=1.5,
+        )
+        core_selected_payloads = {
+            frame: item.payload
+            for frame, item in core_selected.items()
+            if isinstance(item.payload, dict)
+        }
+        rows = output_rows("clip", by_frame, selected, threshold=0.0, emit_no_box_rows=True)
+
+        self.assertEqual(selected, core_selected_payloads)
+        self.assertEqual([row["frame"] for row in rows], [1, 2, 3])
+        self.assertEqual([row["selected"] for row in rows], [0, 1, 1])
+        self.assertEqual(rows[0]["x"], "")
+        self.assertEqual(rows[1]["track_id"], 1)
 
     def test_load_rows_filters_detector_ineligible_rows(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -4,6 +4,7 @@ import json
 import unittest
 
 from scripts.tbd_motion_detector import DelayedSequenceSelector, PathState, write_telemetry_output
+from scripts.selector_core import SequenceItem, select_viterbi_sequence
 
 
 class FakeTBD:
@@ -68,6 +69,57 @@ class DelayedSequenceSelectorTest(unittest.TestCase):
 
         self.assertEqual(frame, 1)
         self.assertIsNone(selected)
+
+    def test_delayed_sequence_matches_core_no_backfill_selected_no_box_stream(self):
+        frames = [
+            (1, [state(1, 1, 0, 0, 9.0)]),
+            (2, [state(2, 2, 100, 100, 20.0)]),
+            (3, [state(2, 3, 102, 100, 15.0)]),
+        ]
+        selector = DelayedSequenceSelector(args())
+        emitted = []
+        selector.add_frame(*frames[0], FakeTBD())
+        selector.add_frame(*frames[1], FakeTBD())
+        emitted.append(selector.pop_ready())
+        selector.add_frame(*frames[2], FakeTBD())
+        emitted.append(selector.pop_ready())
+        emitted.extend(selector.flush())
+
+        core_selected = select_viterbi_sequence(
+            [
+                (
+                    frame,
+                    [
+                        SequenceItem(
+                            frame=frame,
+                            bbox=(
+                                float(st.bbox[0]),
+                                float(st.bbox[1]),
+                                float(st.bbox[2]),
+                                float(st.bbox[3]),
+                            ),
+                            score=float(st.score()),
+                            payload=st,
+                        )
+                        for st in states
+                    ],
+                )
+                for frame, states in frames
+            ],
+            max_jump_px=5.0,
+            transition_weight=1.5,
+        )
+        expected = [
+            (frame, core_selected[frame].payload if frame in core_selected else None)
+            for frame, _states in frames
+        ]
+
+        self.assertEqual([frame for frame, _selected in emitted], [1, 2, 3])
+        self.assertEqual([selected.sid if selected else None for _frame, selected in emitted], [None, 2, 2])
+        self.assertEqual(
+            [selected.sid if selected else None for _frame, selected in emitted],
+            [selected.sid if selected else None for _frame, selected in expected],
+        )
 
     def test_reachable_path_emits_oldest_state(self):
         selector = DelayedSequenceSelector(args())

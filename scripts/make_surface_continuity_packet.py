@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--audit_csv", required=True)
     p.add_argument("--out_dir", required=True)
     p.add_argument("--video", action="append", default=[], help="CLIP=/absolute/path/video.mp4")
+    p.add_argument("--clip", default="", help="Optional clip id/prefix to select from multi-clip CSVs.")
     p.add_argument("--split", default="textured_non_sky")
     p.add_argument("--start_frame", type=int, required=True)
     p.add_argument("--end_frame", type=int, required=True)
@@ -59,6 +60,14 @@ def safe_float(value: Any, default: float = 0.0) -> float:
     except Exception:
         return default
     return out if math.isfinite(out) else default
+
+
+def first_value(row: dict[str, str], keys: tuple[str, ...], default: str = "") -> str:
+    for key in keys:
+        value = row.get(key, "")
+        if value not in (None, ""):
+            return str(value)
+    return default
 
 
 def parse_video_map(items: list[str]) -> dict[str, Path]:
@@ -99,10 +108,12 @@ class FrameReader:
 
 
 def label_box_fullres(row: dict[str, str]) -> tuple[int, int, int, int]:
-    x = 2.0 * safe_float(row.get("label_x"), 0.0)
-    y = 2.0 * safe_float(row.get("label_y"), 0.0)
-    w = 2.0 * safe_float(row.get("label_w"), 1.0)
-    h = 2.0 * safe_float(row.get("label_h"), 1.0)
+    # Dense ground labels are detector-space coordinates. Older packets used
+    # label_*; newer audit/eval CSVs use det_*; raw candidate tables use x/y.
+    x = 2.0 * safe_float(first_value(row, ("label_x", "det_x", "x")), 0.0)
+    y = 2.0 * safe_float(first_value(row, ("label_y", "det_y", "y")), 0.0)
+    w = 2.0 * safe_float(first_value(row, ("label_w", "det_w", "w"), "1.0"), 1.0)
+    h = 2.0 * safe_float(first_value(row, ("label_h", "det_h", "h"), "1.0"), 1.0)
     return int(round(x)), int(round(y)), max(1, int(round(w))), max(1, int(round(h)))
 
 
@@ -161,6 +172,8 @@ def select_rows(rows: list[dict[str, str]], args: argparse.Namespace) -> list[di
     selected = []
     for row in rows:
         frame = int(safe_float(row.get("frame"), -1))
+        if args.clip and not clip_matches(str(row.get("clip", "")), args.clip):
+            continue
         if row.get("bg_split") != args.split:
             continue
         if frame < args.start_frame or frame > args.end_frame:
@@ -235,10 +248,10 @@ def main() -> None:
                 "time_s": round(frame_no / reader.fps, 3) if reader.fps else "",
                 "bg_split": row.get("bg_split", ""),
                 "source_confidence": row.get("confidence", ""),
-                "det_x": row.get("label_x", ""),
-                "det_y": row.get("label_y", ""),
-                "det_w": row.get("label_w", ""),
-                "det_h": row.get("label_h", ""),
+                "det_x": first_value(row, ("label_x", "det_x", "x")),
+                "det_y": first_value(row, ("label_y", "det_y", "y")),
+                "det_w": first_value(row, ("label_w", "det_w", "w")),
+                "det_h": first_value(row, ("label_h", "det_h", "h")),
                 "visible": "true",
                 "vision_confidence": "",
                 "status": "needs_vision_review",

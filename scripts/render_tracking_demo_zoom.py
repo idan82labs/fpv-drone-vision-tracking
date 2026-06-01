@@ -48,7 +48,8 @@ def crop_zoom(frame: np.ndarray, cx: int, cy: int, size: int, out_size: int) -> 
 def main() -> None:
     args = parse_args()
     sel = pd.read_csv(args.selections)
-    sel = sel[sel["clip"].eq(args.clip)].copy()
+    sel["clip"] = sel["clip"].astype(str)
+    sel = sel[sel["clip"].eq(str(args.clip))].copy()
     by_frame = {int(r.frame): r for r in sel.itertuples(index=False)}
 
     cap = cv2.VideoCapture(args.video)
@@ -125,4 +126,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

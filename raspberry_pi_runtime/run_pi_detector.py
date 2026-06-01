@@ -139,6 +139,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sequence_transition_weight", default=SEQUENCE_DEFAULTS["transition_weight"])
     p.add_argument("--clip", default="", help="Clip id for deferred selected-track CSV; defaults to video stem.")
     p.add_argument("--render_demo", action="store_true")
+    p.add_argument(
+        "--surface_false_lock_gate",
+        action="store_true",
+        help=(
+            "Post-process live selected_tubes.csv with the causal surface false-lock gate. "
+            "This is a lab/validation option; it is not used for deferred sequence output."
+        ),
+    )
     p.add_argument("--extra", nargs=argparse.REMAINDER, default=[])
     return p.parse_args()
 
@@ -257,6 +265,26 @@ def main() -> None:
                 sequence_defaults["transition_weight"],
             ]
         )
+    elif args.surface_false_lock_gate:
+        gate_script = repo / "scripts" / "apply_pi_surface_false_lock_gate.py"
+        gated_selected = out_dir / "surface_gated_selected_tracks.csv"
+        run(
+            [
+                args.python,
+                str(gate_script),
+                "--selected_tubes",
+                str(out_dir / "selected_tubes.csv"),
+                "--clip",
+                clip,
+                "--out_csv",
+                str(gated_selected),
+                "--decisions_csv",
+                str(out_dir / "surface_gate_frame_decisions.csv"),
+                "--events_csv",
+                str(out_dir / "surface_gate_suppression_events.csv"),
+            ]
+        )
+        selected_path = gated_selected
 
     if args.render_demo:
         renderer = repo / "scripts" / "render_tracking_demo_zoom.py"
@@ -289,6 +317,7 @@ def main() -> None:
                 "selected_tracks": str(selected_path),
                 "profile_args": detector_args,
                 "sequence_defaults": sequence_defaults if (args.deferred_sequence or args.live_sequence) else None,
+                "surface_false_lock_gate": args.surface_false_lock_gate,
                 "selected_jsonl": args.selected_jsonl or None,
                 "telemetry_jsonl": args.telemetry_jsonl or None,
                 "report_mode": args.report_mode,

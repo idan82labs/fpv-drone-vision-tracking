@@ -126,6 +126,82 @@ def sample_control_offsets(radius: float, count: int) -> list[tuple[float, float
     return offsets
 
 
+def broad_router_bucket(row: dict[str, str]) -> str:
+    state = str(row.get("cand_router_state", "")).strip()
+    if state == "surface_backed":
+        return "surface"
+    if state == "line_attached":
+        return "line"
+    if state in {"boundary_mixed", "sky_target_near_surface"}:
+        return "boundary"
+    if state == "clean_sky":
+        return "clean_sky"
+    rates = {
+        "surface": align.safe_float(row.get("tube_router_surface_backed_rate")),
+        "line": align.safe_float(row.get("tube_router_line_attached_rate")),
+        "boundary": align.safe_float(row.get("tube_router_boundary_rate")),
+        "clean_sky": align.safe_float(row.get("tube_router_clean_sky_rate")),
+    }
+    best, value = max(rates.items(), key=lambda item: item[1])
+    return best if value >= 0.35 else "unknown"
+
+
+def row_center_dist(a: dict[str, str], b: dict[str, str]) -> float:
+    ax, ay = align.center(a)
+    bx, by = align.center(b)
+    return float(math.hypot(ax - bx, ay - by))
+
+
+def context_similar(a: dict[str, str], b: dict[str, str]) -> bool:
+    """Cheap same-router/same-texture check for local controls."""
+
+    if broad_router_bucket(a) != broad_router_bucket(b):
+        return False
+    texture_a = max(align.safe_float(a.get("cand_texture")), align.safe_float(a.get("tube_mean_texture")))
+    texture_b = max(align.safe_float(b.get("cand_texture")), align.safe_float(b.get("tube_mean_texture")))
+    sky_a = max(align.safe_float(a.get("cand_sky_like")), align.safe_float(a.get("tube_mean_sky_like")))
+    sky_b = max(align.safe_float(b.get("cand_sky_like")), align.safe_float(b.get("tube_mean_sky_like")))
+    line_a = max(align.safe_float(a.get("cand_line_context")), align.safe_float(a.get("tube_mean_line_context")))
+    line_b = max(align.safe_float(b.get("cand_line_context")), align.safe_float(b.get("tube_mean_line_context")))
+    return (
+        abs(texture_a - texture_b) <= 0.35
+        and abs(sky_a - sky_b) <= 0.35
+        and abs(line_a - line_b) <= 0.45
+    )
+
+
+def matched_control_offsets(
+    row: dict[str, str],
+    frame_rows: list[dict[str, str]],
+    fallback_offsets: list[tuple[float, float]],
+    max_controls: int,
+) -> tuple[list[tuple[float, float]], int]:
+    """Prefer nearby same-context candidate centers, then fill from annulus offsets."""
+
+    anchor = align.center(row)
+    offsets: list[tuple[float, float]] = []
+    for other in frame_rows:
+        if other is row:
+            continue
+        if other.get("track_id") and row.get("track_id") and other.get("track_id") == row.get("track_id"):
+            continue
+        dist = row_center_dist(row, other)
+        if dist < 8.0 or dist > 48.0:
+            continue
+        if not context_similar(row, other):
+            continue
+        ox, oy = align.center(other)
+        offsets.append((float(ox - anchor[0]), float(oy - anchor[1])))
+        if len(offsets) >= max_controls:
+            break
+    matched_count = len(offsets)
+    for offset in fallback_offsets:
+        if len(offsets) >= max_controls:
+            break
+        offsets.append(offset)
+    return offsets, matched_count
+
+
 def finite_quality(value: float) -> float:
     return float(value) if math.isfinite(float(value)) else 0.0
 
@@ -138,6 +214,12 @@ def gain_zscore(raw_gain: float, controls: list[float]) -> tuple[float, float, f
     mad = float(np.median(np.abs(arr - med)))
     sigma = max(0.25, 1.4826 * mad)
     return float((raw_gain - med) / sigma), med, sigma
+
+
+def shrink_low_control_gain(norm_gain: float, matched_count: int, min_matched: int = 6) -> float:
+    if matched_count >= min_matched:
+        return norm_gain
+    return norm_gain * max(0.0, matched_count / float(min_matched))
 
 
 def path_quality(
@@ -196,6 +278,7 @@ def clutter_context(row: dict[str, str]) -> tuple[float, float, float]:
 
 def score_row(
     row: dict[str, str],
+    frame_rows: list[dict[str, str]],
     frame_cache: align.FrameCache,
     transforms: align.TransformCache,
     tube_rows: dict[tuple[str, str], dict[int, dict[str, str]]],
@@ -208,13 +291,17 @@ def score_row(
         clip, row, frame_cache, transforms, tube_rows, window_radius, crop_size
     )
     raw_gain = tq["q"] - bq["q"]
+    selected_offsets, matched_count = matched_control_offsets(
+        row, frame_rows, control_offsets, max_controls=max(4, len(control_offsets))
+    )
     control_gains: list[float] = []
-    for offset in control_offsets:
+    for offset in selected_offsets:
         ctq, cbq, _, _, _ = path_quality(
             clip, row, frame_cache, transforms, tube_rows, window_radius, crop_size, offset
         )
         control_gains.append(ctq["q"] - cbq["q"])
     norm_gain, control_median, control_sigma = gain_zscore(raw_gain, control_gains)
+    norm_gain = shrink_low_control_gain(norm_gain, matched_count)
     line, support, density = clutter_context(row)
     bg_dist_mean = float(np.mean(path_dist)) if path_dist else 0.0
     bg_dist_max = float(np.max(path_dist)) if path_dist else 0.0
@@ -230,6 +317,9 @@ def score_row(
             "clba_gain_norm": round(float(norm_gain), 6),
             "clba_control_median": round(float(control_median), 6),
             "clba_control_sigma": round(float(control_sigma), 6),
+            "clba_control_count": len(control_gains),
+            "clba_matched_control_count": matched_count,
+            "clba_control_mode": "matched" if matched_count >= 6 else "fallback_shrunk",
             "clba_path_bg_dist_mean": round(bg_dist_mean, 6),
             "clba_path_bg_dist_max": round(bg_dist_max, 6),
             "clba_target_stack_dark_z": round(float(tq["stack_dark_z"]), 6),
@@ -271,11 +361,23 @@ def main() -> None:
         tube_rows.update(aliased)
 
     control_offsets = sample_control_offsets(args.control_radius, args.control_count)
+    rows_by_frame: dict[int, list[dict[str, str]]] = {}
+    for row in rows:
+        rows_by_frame.setdefault(align.safe_int(row.get("frame"), -1), []).append(row)
     frame_cache = align.FrameCache(Path(args.video_dir), args.detector_scale)
     transforms = align.TransformCache(frame_cache, args.orb_features, args.min_matches)
     try:
         out_rows = [
-            score_row(row, frame_cache, transforms, tube_rows, args.window_radius, args.crop_size, control_offsets)
+            score_row(
+                row,
+                rows_by_frame.get(align.safe_int(row.get("frame"), -1), []),
+                frame_cache,
+                transforms,
+                tube_rows,
+                args.window_radius,
+                args.crop_size,
+                control_offsets,
+            )
             for row in rows
         ]
     finally:

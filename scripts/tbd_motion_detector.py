@@ -26,6 +26,7 @@ import numpy as np
 
 sys.path.append(str(Path(__file__).resolve().parent))
 import motion_detector_v2 as base  # noqa: E402
+from selector_core import SequenceItem, StreamingViterbiSelector  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,6 +59,14 @@ def parse_args() -> argparse.Namespace:
         "--mask_selected_for_motion_model",
         action="store_true",
         help="Mask the previous selected box out of LK/RANSAC ego-motion estimation.",
+    )
+    p.add_argument(
+        "--motion_model_fallback_identity",
+        action="store_true",
+        help=(
+            "When LK/RANSAC cannot estimate frame motion, keep processing the frame "
+            "with an identity warp so appearance/large-dark proposals are still exported."
+        ),
     )
 
     p.add_argument("--threshold_sigma", type=float, default=5.5)
@@ -130,6 +139,78 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--hybrid_coast_min_evidence", type=float, default=0.1)
     p.add_argument("--hybrid_coast_offsets", default="0:0,-4:0,4:0,0:-4,0:4,-7:0,7:0,0:-7,0:7")
     p.add_argument("--hybrid_coast_score_weight", type=float, default=0.18)
+    p.add_argument("--hybrid_coast_highres_recenter", action="store_true")
+    p.add_argument("--hybrid_coast_recenter_radius_det_px", type=float, default=6.0)
+    p.add_argument("--hybrid_coast_recenter_radii", default="2,3,4")
+    p.add_argument("--hybrid_coast_recenter_peaks", type=int, default=3)
+    p.add_argument("--hybrid_coast_recenter_texture_weight", type=float, default=0.010)
+    p.add_argument("--hybrid_coast_recenter_shift_penalty", type=float, default=0.20)
+    p.add_argument("--hybrid_coast_recenter_score_weight", type=float, default=0.70)
+    p.add_argument(
+        "--target_local_recovery_proposals",
+        action="store_true",
+        help="Opt-in recent-lock local high-res recovery branch around the last emitted track prediction.",
+    )
+    p.add_argument("--target_local_recovery_top_k", type=int, default=8)
+    p.add_argument("--target_local_recovery_max_seed_gap", type=int, default=5)
+    p.add_argument("--target_local_recovery_min_hits", type=int, default=3)
+    p.add_argument("--target_local_recovery_min_verified_score", type=float, default=6.0)
+    p.add_argument("--target_local_recovery_search_radius_det_px", type=float, default=18.0)
+    p.add_argument("--target_local_recovery_radii", default="2,3,4")
+    p.add_argument("--target_local_recovery_texture_weight", type=float, default=0.010)
+    p.add_argument("--target_local_recovery_shift_penalty", type=float, default=0.020)
+    p.add_argument("--target_local_recovery_score_weight", type=float, default=0.95)
+    p.add_argument("--target_local_recovery_state_score_weight", type=float, default=0.10)
+    p.add_argument("--target_local_recovery_box_det_px", type=float, default=4.0)
+    p.add_argument(
+        "--target_local_recovery_predictor",
+        choices=("previous", "state_velocity", "clamped_velocity"),
+        default="clamped_velocity",
+        help="Prediction used to center target-local recovery. Clamped avoids poisoned beam velocity jumps.",
+    )
+    p.add_argument("--target_local_recovery_max_velocity_px", type=float, default=3.0)
+    p.add_argument(
+        "--target_local_state_select",
+        action="store_true",
+        help=(
+            "Opt-in selector override for recent target-local recovery states. "
+            "This does not create proposals; it only lets an already-generated "
+            "target-local state replace a far-off selected lock."
+        ),
+    )
+    p.add_argument("--target_local_state_select_error_px", type=float, default=9.0)
+    p.add_argument("--target_local_state_select_improvement_px", type=float, default=6.0)
+    p.add_argument("--target_local_state_select_max_pred_error_px", type=float, default=6.0)
+    p.add_argument("--target_local_state_select_anchor_px", type=float, default=18.0)
+    p.add_argument("--target_local_state_select_min_side", type=float, default=7.0)
+    p.add_argument("--target_local_state_select_max_side", type=float, default=18.0)
+    p.add_argument("--target_local_state_select_top_n", type=int, default=80)
+    p.add_argument("--target_local_state_select_sources", default="target_local_recovery")
+    p.add_argument(
+        "--target_local_state_select_allow_missed_anchor",
+        action="store_true",
+        help="Allow a near-anchor one-frame coast state to beat current clutter in target-local selection.",
+    )
+    p.add_argument("--target_local_state_select_missed_max_misses", type=int, default=1)
+    p.add_argument(
+        "--candidate_local_recenter_proposals",
+        action="store_true",
+        help="Opt-in high-res local recentering around top cheap proposals before TBD ranking.",
+    )
+    p.add_argument("--candidate_local_recenter_seed_top_k", type=int, default=24)
+    p.add_argument("--candidate_local_recenter_top_k", type=int, default=48)
+    p.add_argument("--candidate_local_recenter_radius_det_px", type=float, default=16.0)
+    p.add_argument("--candidate_local_recenter_radii", default="2,3,4")
+    p.add_argument("--candidate_local_recenter_texture_weight", type=float, default=0.010)
+    p.add_argument("--candidate_local_recenter_shift_penalty", type=float, default=0.025)
+    p.add_argument("--candidate_local_recenter_score_weight", type=float, default=1.10)
+    p.add_argument("--candidate_local_recenter_seed_score_weight", type=float, default=0.035)
+    p.add_argument("--candidate_local_recenter_box_det_px", type=float, default=4.0)
+    p.add_argument(
+        "--candidate_local_recenter_router_scope",
+        choices=("all", "surface_context"),
+        default="surface_context",
+    )
     p.add_argument(
         "--runtime_mode",
         choices=("baseline", "clean_sky", "boundary", "surface", "auto"),
@@ -361,6 +442,68 @@ class FrameRouterDecision:
     max_candidates: int
     confidence: float
     features: dict[str, float]
+
+
+@dataclass
+class TargetLocalRecoverySeed:
+    sid: int
+    bbox: tuple[int, int, int, int]
+    vx: float
+    vy: float
+    frame_no: int
+    hits: int
+    verified_score: float
+
+    @classmethod
+    def from_state(
+        cls,
+        frame_no: int,
+        st: PathState,
+        verified_score: float,
+    ) -> "TargetLocalRecoverySeed":
+        return cls(
+            sid=st.sid,
+            bbox=st.bbox,
+            vx=st.vx,
+            vy=st.vy,
+            frame_no=frame_no,
+            hits=st.hit_count(),
+            verified_score=float(verified_score),
+        )
+
+    def age(self, frame_no: int) -> int:
+        return int(frame_no - self.frame_no)
+
+    def predict_bbox(self, frame_no: int, w_img: int, h_img: int) -> tuple[int, int, int, int]:
+        dt = max(1, self.age(frame_no))
+        x, y, w, h = self.bbox
+        return base.clip_bbox_float((x + self.vx * dt, y + self.vy * dt, w, h), w_img, h_img)
+
+
+def target_local_seed_prediction_bbox(
+    seed: TargetLocalRecoverySeed,
+    frame_no: int,
+    w_img: int,
+    h_img: int,
+    args: argparse.Namespace,
+) -> tuple[int, int, int, int]:
+    predictor = getattr(args, "target_local_recovery_predictor", "clamped_velocity")
+    if predictor == "state_velocity":
+        return seed.predict_bbox(frame_no, w_img, h_img)
+    x, y, w, h = seed.bbox
+    if predictor == "previous":
+        return base.clip_bbox_float((x, y, w, h), w_img, h_img)
+
+    dt = max(1, seed.age(frame_no))
+    vx = float(seed.vx)
+    vy = float(seed.vy)
+    max_step = max(0.0, float(getattr(args, "target_local_recovery_max_velocity_px", 3.0))) * dt
+    speed = math.hypot(vx * dt, vy * dt)
+    if max_step > 0.0 and speed > max_step:
+        scale = max_step / max(1e-6, speed)
+        vx *= scale
+        vy *= scale
+    return base.clip_bbox_float((x + vx * dt, y + vy * dt, w, h), w_img, h_img)
 
 
 def robust_sigma(img: np.ndarray) -> float:
@@ -997,6 +1140,40 @@ def dedupe_full_peaks(
     return out
 
 
+def local_native_peaks_near(
+    score_maps: dict[int, np.ndarray],
+    center_full: tuple[float, float],
+    search_radius_full_px: float,
+    max_peaks: int,
+) -> list[tuple[float, float, float, int]]:
+    """Find compact-response peaks near a predicted full-resolution center."""
+
+    cx, cy = center_full
+    peaks: list[tuple[float, float, float, int]] = []
+    for radius, score_map in score_maps.items():
+        h, w = score_map.shape[:2]
+        x0 = max(0, int(math.floor(cx - search_radius_full_px)))
+        y0 = max(0, int(math.floor(cy - search_radius_full_px)))
+        x1 = min(w, int(math.ceil(cx + search_radius_full_px + 1)))
+        y1 = min(h, int(math.ceil(cy + search_radius_full_px + 1)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        crop = score_map[y0:y1, x0:x1]
+        nms = max(3, int(round(2 * radius + 1)))
+        if nms % 2 == 0:
+            nms += 1
+        dilated = cv2.dilate(crop, np.ones((nms, nms), dtype=np.uint8))
+        mask = (crop >= dilated - 1e-6) & np.isfinite(crop) & (crop > -100.0)
+        ys, xs = np.nonzero(mask)
+        if len(xs) == 0:
+            continue
+        vals = crop[ys, xs]
+        order = np.argsort(vals)[::-1][: max(1, max_peaks)]
+        for idx in order:
+            peaks.append((float(vals[idx]), float(x0 + xs[idx]), float(y0 + ys[idx]), radius))
+    return dedupe_full_peaks(peaks, nms_px=2.0, max_n=max(1, max_peaks))
+
+
 def inverse_warp_point(
     x: float,
     y: float,
@@ -1242,6 +1419,8 @@ def hybrid_coast_candidates(
     frame_h: np.ndarray | None,
     w_img: int,
     h_img: int,
+    cur_full: np.ndarray | None,
+    downscale: float,
     residual_blur: np.ndarray,
     app_resp: np.ndarray,
     cur_g: np.ndarray,
@@ -1254,6 +1433,14 @@ def hybrid_coast_candidates(
     cands: list[base.Candidate] = []
     occupied: list[base.Candidate] = []
     ranked_states = sorted(states, key=lambda st: tbd.verified_score(st), reverse=True)
+    highres_score_maps: dict[int, np.ndarray] = {}
+    highres_gray: np.ndarray | None = None
+    if args.hybrid_coast_highres_recenter and cur_full is not None and downscale > 0:
+        highres_gray = base.ensure_gray(cur_full)
+        highres_score_maps = {
+            r: compact_dark_map_native(highres_gray, r, args.hybrid_coast_recenter_texture_weight)
+            for r in parse_radii(args.hybrid_coast_recenter_radii)
+        }
     for st in ranked_states[: args.hybrid_coast_top_k]:
         if st.misses > args.hybrid_coast_max_misses:
             continue
@@ -1264,28 +1451,200 @@ def hybrid_coast_candidates(
         base_bbox = warp_bbox(st.bbox, frame_h, w_img, h_img)
         bx, by, bw, bh = base_bbox
         for dx, dy in offsets:
-            bbox = base.clip_bbox_float((bx + st.vx + dx, by + st.vy + dy, bw, bh), w_img, h_img)
-            mask = np.zeros_like(cur_g, dtype=np.uint8)
-            x, y, w, h = bbox
-            mask[y : y + h, x : x + w] = 255
-            cand = base.candidate_score("hybrid_coast", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
-            evidence_score = float(cand.score)
-            if evidence_score < args.hybrid_coast_min_evidence:
-                continue
+            pred_bbox = base.clip_bbox_float((bx + st.vx + dx, by + st.vy + dy, bw, bh), w_img, h_img)
+            pred_x, pred_y, pred_w, pred_h = pred_bbox
+            pred_cx = pred_x + 0.5 * pred_w
+            pred_cy = pred_y + 0.5 * pred_h
+            candidate_boxes: list[tuple[tuple[int, int, int, int], float, str]] = [(pred_bbox, 0.0, "hybrid_coast")]
+
+            if highres_gray is not None and highres_score_maps:
+                peaks = local_native_peaks_near(
+                    highres_score_maps,
+                    (pred_cx / downscale, pred_cy / downscale),
+                    args.hybrid_coast_recenter_radius_det_px / downscale,
+                    args.hybrid_coast_recenter_peaks,
+                )
+                for peak_score, x_full, y_full, radius in peaks:
+                    cx = x_full * downscale
+                    cy = y_full * downscale
+                    side = max(3, int(round((2 * radius + 1) * downscale)))
+                    recentered = base.clip_bbox_float((cx - 0.5 * side, cy - 0.5 * side, side, side), w_img, h_img)
+                    shift_det = math.hypot(cx - pred_cx, cy - pred_cy)
+                    recentered_score = peak_score - args.hybrid_coast_recenter_shift_penalty * shift_det
+                    candidate_boxes.append((recentered, recentered_score, "hybrid_coast_highres"))
+
             state_score = max(0.0, min(12.0, tbd.verified_score(st)))
-            cand.map_score = evidence_score
-            cand.score = 0.70 * evidence_score + args.hybrid_coast_score_weight * state_score
+            for bbox, recentered_score, source in candidate_boxes:
+                mask = np.zeros_like(cur_g, dtype=np.uint8)
+                x, y, w, h = bbox
+                mask[y : y + h, x : x + w] = 255
+                cand = base.candidate_score(source, bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+                evidence_score = float(cand.score)
+                if evidence_score < args.hybrid_coast_min_evidence and source == "hybrid_coast":
+                    continue
+                if source == "hybrid_coast_highres" and evidence_score < args.hybrid_coast_min_evidence and recentered_score <= 0.0:
+                    continue
+                cand.map_score = recentered_score if source == "hybrid_coast_highres" else evidence_score
+                cand.score = (
+                    0.70 * evidence_score
+                    + args.hybrid_coast_score_weight * state_score
+                    + (args.hybrid_coast_recenter_score_weight * recentered_score if source == "hybrid_coast_highres" else 0.0)
+                )
+                if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
+                    continue
+                occupied.append(cand)
+                cands.append(cand)
+                if len(cands) >= args.hybrid_coast_top_k:
+                    return sorted(cands, key=lambda c: c.score, reverse=True)
+    return sorted(cands, key=lambda c: c.score, reverse=True)
+
+
+def target_local_recovery_candidates(
+    seed: TargetLocalRecoverySeed | None,
+    frame_no: int,
+    w_img: int,
+    h_img: int,
+    cur_full: np.ndarray | None,
+    downscale: float,
+    residual_blur: np.ndarray,
+    app_resp: np.ndarray,
+    cur_g: np.ndarray,
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    """Search a small native-resolution window around the last accepted track.
+
+    This is intentionally narrower than hybrid coast. It does not introduce a
+    new acquisition path; it only gives an already/recently accepted track a
+    few centered high-res options when terrain proposals drift off target.
+    """
+    if not args.target_local_recovery_proposals or seed is None:
+        return []
+    gap = seed.age(frame_no)
+    if gap <= 0 or gap > args.target_local_recovery_max_seed_gap:
+        return []
+    if seed.hits < args.target_local_recovery_min_hits:
+        return []
+    if seed.verified_score < args.target_local_recovery_min_verified_score:
+        return []
+    if cur_full is None or downscale <= 0:
+        return []
+
+    predicted = target_local_seed_prediction_bbox(seed, frame_no, w_img, h_img, args)
+    pred_cx, pred_cy = base.bbox_center(predicted)
+    full_g = base.ensure_gray(cur_full)
+    score_maps = {
+        r: compact_dark_map_native(full_g, r, args.target_local_recovery_texture_weight)
+        for r in parse_radii(args.target_local_recovery_radii)
+    }
+    peaks = local_native_peaks_near(
+        score_maps,
+        (pred_cx / downscale, pred_cy / downscale),
+        args.target_local_recovery_search_radius_det_px / downscale,
+        args.target_local_recovery_top_k,
+    )
+    if not peaks:
+        return []
+
+    side = max(3, int(round(args.target_local_recovery_box_det_px)))
+    state_score = max(0.0, min(12.0, seed.verified_score))
+    cands: list[base.Candidate] = []
+    occupied: list[base.Candidate] = []
+    for peak_score, x_full, y_full, _radius in peaks:
+        cx = x_full * downscale
+        cy = y_full * downscale
+        bbox = base.clip_bbox_float((cx - 0.5 * side, cy - 0.5 * side, side, side), w_img, h_img)
+        shift_det = math.hypot(cx - pred_cx, cy - pred_cy)
+        recentered_score = float(peak_score - args.target_local_recovery_shift_penalty * shift_det)
+        x, y, w, h = bbox
+        mask = np.zeros_like(cur_g, dtype=np.uint8)
+        mask[y : y + h, x : x + w] = 255
+        cand = base.candidate_score("target_local_recovery", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+        cand.map_score = recentered_score
+        cand.score = (
+            0.40 * float(cand.score)
+            + args.target_local_recovery_score_weight * recentered_score
+            + args.target_local_recovery_state_score_weight * state_score
+        )
+        if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
+            continue
+        occupied.append(cand)
+        cands.append(cand)
+        if len(cands) >= args.target_local_recovery_top_k:
+            break
+    return sorted(cands, key=lambda c: c.score, reverse=True)
+
+
+def candidate_local_recenter_candidates(
+    seed_cands: list[base.Candidate],
+    cur_full: np.ndarray | None,
+    downscale: float,
+    residual_blur: np.ndarray,
+    app_resp: np.ndarray,
+    cur_g: np.ndarray,
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    """Recenter top cheap proposals with a native compact-dark local search."""
+    if not args.candidate_local_recenter_proposals or cur_full is None or downscale <= 0 or not seed_cands:
+        return []
+    seed_pool = list(seed_cands)
+    if args.candidate_local_recenter_router_scope == "surface_context":
+        scoped = [
+            cand
+            for cand in seed_pool
+            if getattr(cand, "router_state", "unknown")
+            in {"surface_backed", "boundary_mixed", "sky_target_near_surface", "unknown", "unrouted"}
+        ]
+        if scoped:
+            seed_pool = scoped
+    seed_pool = sorted(seed_pool, key=lambda cand: candidate_obs(cand, args), reverse=True)[
+        : max(1, args.candidate_local_recenter_seed_top_k)
+    ]
+
+    full_g = base.ensure_gray(cur_full)
+    score_maps = {
+        r: compact_dark_map_native(full_g, r, args.candidate_local_recenter_texture_weight)
+        for r in parse_radii(args.candidate_local_recenter_radii)
+    }
+    side = max(3, int(round(args.candidate_local_recenter_box_det_px)))
+    h_img, w_img = cur_g.shape[:2]
+    cands: list[base.Candidate] = []
+    occupied: list[base.Candidate] = []
+    for seed in seed_pool:
+        seed_cx, seed_cy = base.bbox_center(seed.bbox)
+        peaks = local_native_peaks_near(
+            score_maps,
+            (seed_cx / downscale, seed_cy / downscale),
+            args.candidate_local_recenter_radius_det_px / downscale,
+            max(1, min(4, args.candidate_local_recenter_top_k)),
+        )
+        seed_score = max(0.0, min(30.0, candidate_obs(seed, args)))
+        for peak_score, x_full, y_full, _radius in peaks:
+            cx = x_full * downscale
+            cy = y_full * downscale
+            shift_det = math.hypot(cx - seed_cx, cy - seed_cy)
+            recentered_score = float(peak_score - args.candidate_local_recenter_shift_penalty * shift_det)
+            bbox = base.clip_bbox_float((cx - 0.5 * side, cy - 0.5 * side, side, side), w_img, h_img)
+            x, y, w, h = bbox
+            mask = np.zeros_like(cur_g, dtype=np.uint8)
+            mask[y : y + h, x : x + w] = 255
+            cand = base.candidate_score("candidate_local_recenter", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+            cand.map_score = recentered_score
+            cand.score = (
+                0.35 * float(cand.score)
+                + args.candidate_local_recenter_score_weight * recentered_score
+                + args.candidate_local_recenter_seed_score_weight * seed_score
+            )
             if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
                 continue
             occupied.append(cand)
             cands.append(cand)
-            if len(cands) >= args.hybrid_coast_top_k:
+            if len(cands) >= args.candidate_local_recenter_top_k:
                 return sorted(cands, key=lambda c: c.score, reverse=True)
     return sorted(cands, key=lambda c: c.score, reverse=True)
 
 
 def candidate_scenario(cand: base.Candidate, use_router: bool = False) -> str:
-    if cand.source == "hybrid_coast":
+    if cand.source in {"hybrid_coast", "target_local_recovery"}:
         return "coast"
     if cand.source == "large_dark" or max(cand.bbox[2], cand.bbox[3]) >= 10:
         return "large"
@@ -2675,6 +3034,127 @@ class BeamTBD:
         return self._sky_rescue_best()
 
 
+def _parse_source_set(raw: str) -> set[str]:
+    return {part.strip() for part in str(raw or "").split(",") if part.strip()}
+
+
+def target_local_state_select_override(
+    selected: PathState | None,
+    states: list[PathState],
+    seed: TargetLocalRecoverySeed | None,
+    frame_no: int,
+    w_img: int,
+    h_img: int,
+    tbd: BeamTBD,
+    args: argparse.Namespace,
+) -> tuple[PathState | None, dict[str, object]]:
+    """Choose a current target-local recovery state only when it fixes a bad lock.
+
+    The recovery proposal path can generate a centered candidate near the last
+    trusted target-local track, while normal TBD ranking can still prefer a
+    stronger terrain/edge lock. This override is deliberately narrow: it only
+    runs from a recent trusted seed, only considers current-frame recovery
+    states, and requires a clear prediction-error improvement over the selected
+    state.
+    """
+    info: dict[str, object] = {"enabled": bool(getattr(args, "target_local_state_select", False)), "used": False}
+    if not getattr(args, "target_local_state_select", False):
+        return selected, info
+    if seed is None:
+        info["reason"] = "no_seed"
+        return selected, info
+    seed_age = seed.age(frame_no)
+    info["seed_age"] = seed_age
+    if seed_age <= 0 or seed_age > args.target_local_recovery_max_seed_gap:
+        info["reason"] = "seed_gap"
+        return selected, info
+    if seed.hits < args.target_local_recovery_min_hits:
+        info["reason"] = "seed_hits"
+        return selected, info
+    if seed.verified_score < args.target_local_recovery_min_verified_score:
+        info["reason"] = "seed_score"
+        return selected, info
+
+    predicted = target_local_seed_prediction_bbox(seed, frame_no, w_img, h_img, args)
+    pred_cx, pred_cy = base.bbox_center(predicted)
+    selected_error = None
+    if selected is not None:
+        sel_cx, sel_cy = base.bbox_center(selected.bbox)
+        seed_cx, seed_cy = base.bbox_center(seed.bbox)
+        selected_error = math.hypot(sel_cx - pred_cx, sel_cy - pred_cy)
+        selected_anchor_error = math.hypot(sel_cx - seed_cx, sel_cy - seed_cy)
+        info["selected_error_px"] = round(selected_error, 3)
+        info["selected_anchor_error_px"] = round(selected_anchor_error, 3)
+        if selected_error < args.target_local_state_select_error_px:
+            info["reason"] = "selected_near_prediction"
+            return selected, info
+        if selected_anchor_error <= args.target_local_state_select_anchor_px:
+            info["reason"] = "selected_near_anchor"
+            return selected, info
+
+    allowed_sources = _parse_source_set(args.target_local_state_select_sources)
+    ranked = sorted(states, key=lambda st: tbd.verified_score(st), reverse=True)
+    if args.target_local_state_select_top_n > 0:
+        ranked = ranked[: args.target_local_state_select_top_n]
+
+    best: tuple[float, float, PathState] | None = None
+    for rank, st in enumerate(ranked, start=1):
+        source = st.last_candidate.source if st.last_candidate is not None else "missed_anchor"
+        missed_anchor = st.misses > 0 or st.last_candidate is None
+        if missed_anchor:
+            if not getattr(args, "target_local_state_select_allow_missed_anchor", False):
+                continue
+            if st.misses > args.target_local_state_select_missed_max_misses:
+                continue
+        elif allowed_sources and source not in allowed_sources:
+            continue
+        _x, _y, bw, bh = st.bbox
+        min_side = min(bw, bh)
+        max_side = max(bw, bh)
+        if min_side < args.target_local_state_select_min_side:
+            continue
+        if args.target_local_state_select_max_side > 0 and max_side > args.target_local_state_select_max_side:
+            continue
+
+        cx, cy = base.bbox_center(st.bbox)
+        pred_error = math.hypot(cx - pred_cx, cy - pred_cy)
+        seed_cx, seed_cy = base.bbox_center(seed.bbox)
+        anchor_error = math.hypot(cx - seed_cx, cy - seed_cy)
+        if (
+            pred_error > args.target_local_state_select_max_pred_error_px
+            and anchor_error > args.target_local_state_select_anchor_px
+        ):
+            continue
+        if (
+            selected_error is not None
+            and pred_error + args.target_local_state_select_improvement_px > selected_error
+        ):
+            continue
+        score = tbd.verified_score(st)
+        candidate_key = (pred_error, -score, st)
+        if best is None or candidate_key[:2] < best[:2]:
+            best = candidate_key
+            info.update(
+                {
+                    "candidate_rank": rank,
+                    "candidate_source": source,
+                    "candidate_error_px": round(pred_error, 3),
+                    "candidate_anchor_error_px": round(anchor_error, 3),
+                    "candidate_score": round(float(score), 3),
+                }
+            )
+
+    if best is None:
+        info["reason"] = "no_candidate"
+        return selected, info
+
+    chosen = best[2]
+    info["used"] = True
+    info["reason"] = "target_local_state_select"
+    info["selected_track_id"] = chosen.sid
+    return chosen, info
+
+
 class DelayedSequenceSelector:
     """Small delayed Viterbi selector over recent detector states.
 
@@ -2685,7 +3165,10 @@ class DelayedSequenceSelector:
 
     def __init__(self, args: argparse.Namespace):
         self.args = args
-        self.layers: list[dict[str, object]] = []
+        self.core = StreamingViterbiSelector(
+            max_jump_px=args.delayed_sequence_max_jump_px,
+            transition_weight=args.delayed_sequence_transition_weight,
+        )
         self.active = False
         self.pending_hits = 0
         self.pending_frame: int | None = None
@@ -2730,51 +3213,27 @@ class DelayedSequenceSelector:
 
     def add_frame(self, frame_no: int, states: list[PathState], tbd: BeamTBD) -> None:
         ranked = self._ranked_states(states, tbd)
-        path_scores: list[float] = []
-        backptrs: list[int | None] = []
-        prev = self.layers[-1] if self.layers else None
-        prev_rows = prev["rows"] if prev is not None else []
-        prev_scores = prev["path_scores"] if prev is not None else []
-        prev_frame = int(prev["frame"]) if prev is not None else frame_no - 1
-        if prev_rows and prev_scores:
-            gap = max(1, frame_no - prev_frame)
-            allowed = max(1e-6, self.args.delayed_sequence_max_jump_px * gap)
-            for score, st in ranked:
-                best_score = -1e18
-                best_idx: int | None = None
-                for pi, (_prev_score_raw, prev_st) in enumerate(prev_rows):
-                    jump = center_distance(st.bbox, prev_st.bbox)
-                    if jump > allowed:
-                        continue
-                    cost = self.args.delayed_sequence_transition_weight * (jump / allowed) ** 2
-                    path_score = float(prev_scores[pi]) + float(score) - cost
-                    if path_score > best_score:
-                        best_score = path_score
-                        best_idx = pi
-                if best_idx is None:
-                    best_score = float(score) - 1.0
-                path_scores.append(best_score)
-                backptrs.append(best_idx)
-        else:
-            path_scores = [float(score) for score, _st in ranked]
-            backptrs = [None for _score, _st in ranked]
-        self.layers.append(
-            {
-                "frame": frame_no,
-                "rows": ranked,
-                "path_scores": path_scores,
-                "backptrs": backptrs,
-            }
+        self.core.add_layer(
+            frame_no,
+            [
+                SequenceItem(
+                    frame=frame_no,
+                    bbox=(float(st.bbox[0]), float(st.bbox[1]), float(st.bbox[2]), float(st.bbox[3])),
+                    score=float(score),
+                    payload=st,
+                )
+                for score, st in ranked
+            ],
         )
 
     def ready(self) -> bool:
-        return len(self.layers) > max(1, self.args.delayed_sequence_window)
+        return self.core.ready(self.args.delayed_sequence_window)
 
     def pop_ready(self) -> tuple[int, PathState | None]:
-        if not self.layers:
+        if not self.core.layers:
             raise RuntimeError("no delayed sequence layers")
         frame_no, selected, selected_score, path_indices = self._select_path()
-        self.layers.pop(0)
+        self.core.pop_first()
         if selected is not None and path_indices and self.args.delayed_sequence_commit_prefix:
             self._commit_remaining_path(path_indices[1:])
         selected = self._apply_hysteresis(frame_no, selected, selected_score)
@@ -2782,7 +3241,7 @@ class DelayedSequenceSelector:
 
     def flush(self) -> list[tuple[int, PathState | None]]:
         out: list[tuple[int, PathState | None]] = []
-        while self.layers:
+        while self.core.layers:
             out.append(self.pop_ready())
         return out
 
@@ -2856,43 +3315,19 @@ class DelayedSequenceSelector:
         return None
 
     def _select_path(self) -> tuple[int, PathState | None, float | None, list[int]]:
-        first_frame = int(self.layers[0]["frame"])
-        if not self.layers or not self.layers[-1]["path_scores"]:
+        frame_no, item, score, path_indices = self.core.first_selection()
+        first_frame = int(frame_no) if frame_no is not None else 0
+        if item is None or score is None:
             return first_frame, None, None, []
-
-        last_scores = self.layers[-1]["path_scores"]
-        idx: int | None = max(range(len(last_scores)), key=lambda i: float(last_scores[i]))
-        path_indices: list[int] = []
-        for li in range(len(self.layers) - 1, 0, -1):
-            if idx is None:
-                return first_frame, None, None, []
-            path_indices.append(idx)
-            backptrs = self.layers[li]["backptrs"]
-            idx = backptrs[idx]
-        if idx is None:
+        st = item.payload
+        if not isinstance(st, PathState):
             return first_frame, None, None, []
-        path_indices.append(idx)
-        path_indices.reverse()
-        rows = self.layers[0]["rows"]
-        if not rows:
-            return first_frame, None, None, []
-        score, st = rows[idx]
         if score < self.args.delayed_sequence_threshold:
             return first_frame, None, float(score), path_indices
         return first_frame, st, float(score), path_indices
 
     def _commit_remaining_path(self, path_indices: list[int]) -> None:
-        if not path_indices:
-            return
-        for li, keep_idx in enumerate(path_indices[: len(self.layers)]):
-            layer = self.layers[li]
-            rows = layer["rows"]
-            path_scores = layer["path_scores"]
-            if keep_idx < 0 or keep_idx >= len(rows):
-                return
-            layer["rows"] = [rows[keep_idx]]
-            layer["path_scores"] = [path_scores[keep_idx]]
-            layer["backptrs"] = [None if li == 0 else 0]
+        self.core.commit_prefix(path_indices)
 
 
 def draw_overlay(
@@ -3243,6 +3678,8 @@ def run(args: argparse.Namespace) -> None:
     frame_mode_counts: dict[str, int] = {}
     candidate_router_counts_total: dict[str, int] = {}
     motion_model_mask_boxes: list[tuple[int, int, int, int]] = []
+    target_local_recovery_seed: TargetLocalRecoverySeed | None = None
+    target_local_state_select_count = 0
 
     while True:
         if args.max_frames is not None and fno >= args.max_frames:
@@ -3271,21 +3708,37 @@ def run(args: argparse.Namespace) -> None:
         )
         g0, g1 = base.lk_tracks(prev_g, cur_g, feature_mask, args)
         if g0 is None:
-            prev_g = cur_g
-            prev_full = cur_full.copy()
-            temporal_history = []
-            motion_model_mask_boxes = []
-            fno += 1
-            continue
-
-        chosen = base.choose_model(prev_g, cur_g, g0, g1, args)
+            if not args.motion_model_fallback_identity:
+                prev_g = cur_g
+                prev_full = cur_full.copy()
+                temporal_history = []
+                motion_model_mask_boxes = []
+                fno += 1
+                continue
+            g0 = np.empty((0, 2), dtype=np.float32)
+            g1 = np.empty((0, 2), dtype=np.float32)
+            chosen = {
+                "name": "identity_fallback",
+                "h": np.eye(3, dtype=np.float32),
+                "inlier_ratio": 0.0,
+                "median_feature_error": 0.0,
+            }
+        else:
+            chosen = base.choose_model(prev_g, cur_g, g0, g1, args)
         if chosen is None:
-            prev_g = cur_g
-            prev_full = cur_full.copy()
-            temporal_history = []
-            motion_model_mask_boxes = []
-            fno += 1
-            continue
+            if not args.motion_model_fallback_identity:
+                prev_g = cur_g
+                prev_full = cur_full.copy()
+                temporal_history = []
+                motion_model_mask_boxes = []
+                fno += 1
+                continue
+            chosen = {
+                "name": "identity_fallback",
+                "h": np.eye(3, dtype=np.float32),
+                "inlier_ratio": 0.0,
+                "median_feature_error": 0.0,
+            }
         model_counts[chosen["name"]] = model_counts.get(chosen["name"], 0) + 1
         t_motion_model = time.perf_counter()
         temporal_history = update_temporal_stack_history(
@@ -3350,6 +3803,8 @@ def run(args: argparse.Namespace) -> None:
         cheap_cands = motion_cands + app_cands + map_cands + native_cands + large_dark_cands
         stack_cands: list[base.Candidate] = []
         hybrid_coast_cands: list[base.Candidate] = []
+        target_local_recovery_cands: list[base.Candidate] = []
+        candidate_local_recenter_cands: list[base.Candidate] = []
         routed_cheap: list[base.Candidate] = []
         cheap_limit = (
             max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
@@ -3406,13 +3861,39 @@ def run(args: argparse.Namespace) -> None:
                 chosen["h"],
                 w_img,
                 h_img,
+                cur_full,
+                args.downscale,
+                residual_blur,
+                app_resp,
+                cur_g,
+                args,
+            )
+        if args.candidate_local_recenter_proposals:
+            recenter_seed_cands = routed_cheap if routed_cheap else dedupe_candidates(cheap_cands, cheap_limit, None)
+            candidate_local_recenter_cands = candidate_local_recenter_candidates(
+                recenter_seed_cands,
+                cur_full,
+                args.downscale,
+                residual_blur,
+                app_resp,
+                cur_g,
+                args,
+            )
+        if args.target_local_recovery_proposals:
+            target_local_recovery_cands = target_local_recovery_candidates(
+                target_local_recovery_seed,
+                fno,
+                w_img,
+                h_img,
+                cur_full,
+                args.downscale,
                 residual_blur,
                 app_resp,
                 cur_g,
                 args,
             )
         t_proposals = time.perf_counter()
-        raw_cands = cheap_cands + stack_cands + hybrid_coast_cands
+        raw_cands = cheap_cands + stack_cands + hybrid_coast_cands + candidate_local_recenter_cands + target_local_recovery_cands
         if args.native_roi_score:
             assign_native_roi_scores(raw_cands, cur_full, args.downscale)
         preselect_score = (
@@ -3458,9 +3939,28 @@ def run(args: argparse.Namespace) -> None:
 
         states = tbd.update(fno, cands, signed_diff, signed_sigma, w_img, h_img, chosen["h"], residual_blur, app_resp)
         selected = tbd.raw_best_for_mask() if args.delayed_sequence_select else tbd.best()
+        selected_source = "tbd"
+        target_local_state_select_info: dict[str, object] = {"enabled": bool(args.target_local_state_select), "used": False}
+        if not args.delayed_sequence_select:
+            selected, target_local_state_select_info = target_local_state_select_override(
+                selected,
+                states,
+                target_local_recovery_seed,
+                fno,
+                w_img,
+                h_img,
+                tbd,
+                args,
+            )
+            if target_local_state_select_info.get("used"):
+                selected_source = "target_local_state_select"
+                target_local_state_select_count += 1
         t_tbd = time.perf_counter()
 
         selected_json = selected_state_json(fno, selected, tbd, args) if selected is not None else None
+        if selected_json is not None:
+            selected_json["source"] = selected_source
+            selected_json["target_local_state_select"] = target_local_state_select_info
         telemetry_events: list[tuple[int, PathState | None, str, str]] = []
         if selected is not None and not args.delayed_sequence_select:
             selected_output_count += append_selected_output(
@@ -3472,11 +3972,31 @@ def run(args: argparse.Namespace) -> None:
                 selected_feature_rows,
                 selected_jsonl_handle,
                 emitted_at_frame=fno,
-                selected_source="tbd",
+                selected_source=selected_source,
             )
         if not args.delayed_sequence_select:
-            telemetry_events.append((fno, selected, "tbd", "selected" if selected is not None else "no_target"))
-        motion_model_mask_boxes = [selected.bbox] if selected is not None and selected.misses == 0 else []
+            telemetry_events.append((fno, selected, selected_source, "selected" if selected is not None else "no_target"))
+        feedback_selected = None if args.delayed_sequence_select else selected
+        if args.target_local_recovery_proposals:
+            if feedback_selected is not None:
+                selected_verified = tbd.verified_score(feedback_selected)
+                if (
+                    feedback_selected.hit_count() >= args.target_local_recovery_min_hits
+                    and selected_verified >= args.target_local_recovery_min_verified_score
+                ):
+                    target_local_recovery_seed = TargetLocalRecoverySeed.from_state(
+                        fno,
+                        feedback_selected,
+                        selected_verified,
+                    )
+            elif (
+                target_local_recovery_seed is not None
+                and target_local_recovery_seed.age(fno) > args.target_local_recovery_max_seed_gap
+            ):
+                target_local_recovery_seed = None
+        motion_model_mask_boxes = (
+            [feedback_selected.bbox] if feedback_selected is not None and feedback_selected.misses == 0 else []
+        )
 
         if delayed_selector is not None:
             delayed_selector.add_frame(fno, states, tbd)
@@ -3501,6 +4021,17 @@ def run(args: argparse.Namespace) -> None:
                     emitted_at_frame=fno,
                     selected_source="delayed_sequence",
                 )
+                if args.target_local_recovery_proposals and out_selected is not None:
+                    selected_verified = tbd.verified_score(out_selected)
+                    if (
+                        out_selected.hit_count() >= args.target_local_recovery_min_hits
+                        and selected_verified >= args.target_local_recovery_min_verified_score
+                    ):
+                        target_local_recovery_seed = TargetLocalRecoverySeed.from_state(
+                            out_frame,
+                            out_selected,
+                            selected_verified,
+                        )
             if not telemetry_events:
                 telemetry_events.append((fno, None, "delayed_sequence", "warming"))
 
@@ -3569,6 +4100,9 @@ def run(args: argparse.Namespace) -> None:
             "n_large_dark_candidates": len(large_dark_cands),
             "n_temporal_stack_candidates": len(stack_cands),
             "n_hybrid_coast_candidates": len(hybrid_coast_cands),
+            "n_candidate_local_recenter_candidates": len(candidate_local_recenter_cands),
+            "n_target_local_recovery_candidates": len(target_local_recovery_cands),
+            "target_local_state_select": target_local_state_select_info,
             "candidate_router_counts": candidate_router_counts,
             "n_tracks": len(states),
             "selected": selected_json,
@@ -3717,6 +4251,7 @@ def run(args: argparse.Namespace) -> None:
             "selected_frame_rate": round(selected_rate, 3),
             "selected_output_rows": selected_output_count,
             "selected_output_frame_rate": round(selected_output_count / processed_count, 3),
+            "target_local_state_select_count": target_local_state_select_count,
             "kinematic_gate_px_per_frame": round(px_per_frame, 3),
             "kinematic_rejections": 0,
             "multi_candidate_frames": multi_candidate_frames,

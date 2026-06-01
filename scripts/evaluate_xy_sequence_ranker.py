@@ -20,8 +20,10 @@ from sklearn.pipeline import Pipeline
 
 try:
     import train_xy_tube_ranker as xy_ranker
+    from selector_core import SequenceItem, select_viterbi_sequence
 except ModuleNotFoundError:  # pragma: no cover - used when imported as scripts.*
     from scripts import train_xy_tube_ranker as xy_ranker
+    from scripts.selector_core import SequenceItem, select_viterbi_sequence
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +44,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--cv_accel_weight", default="", help="Optional comma-separated acceleration weights for second-order CV Viterbi.")
     p.add_argument("--sequence_beam", type=int, default=50)
     p.add_argument("--state_beam", type=int, default=512)
+    p.add_argument(
+        "--no_viterbi_backfill",
+        dest="viterbi_backfill_unreachable",
+        action="store_false",
+        default=True,
+        help=(
+            "Disable legacy offline prefix backfill for unreachable Viterbi restarts. "
+            "This leaves earlier frames unselected and better matches production replay."
+        ),
+    )
     p.add_argument("--random_state", type=int, default=11)
     return p.parse_args()
 
@@ -216,58 +228,32 @@ def viterbi_select(
     max_jump_px: float,
     transition_weight: float,
     size_jump_weight: float = 0.0,
+    backfill_unreachable: bool = True,
 ) -> dict[int, dict[str, Any]]:
     frames = sorted(by_frame)
     if not frames:
         return {}
-    prev_scores: list[float] = []
-    backptrs: list[list[int | None]] = []
-    layers: list[list[dict[str, Any]]] = []
-
-    for fi, frame in enumerate(frames):
-        rows = by_frame[frame]
-        layers.append(rows)
-        current: list[float] = []
-        current_bp: list[int | None] = []
-        if fi == 0:
-            for row in rows:
-                current.append(float(row.get("learned_score", 0.0) or 0.0))
-                current_bp.append(None)
-        else:
-            prev_rows = layers[fi - 1]
-            gap = max(1, frame - frames[fi - 1])
-            for row in rows:
-                best_score = -1e18
-                best_idx: int | None = None
-                rb = bbox(row)
-                for pi, prev in enumerate(prev_rows):
-                    pb = bbox(prev)
-                    size_allowance = size_jump_weight * max(rb[2], rb[3], pb[2], pb[3])
-                    allowed = max_jump_px * gap + size_allowance
-                    jump = center_dist(rb, bbox(prev))
-                    if jump > allowed:
-                        continue
-                    cost = transition_weight * (jump / max(1e-6, allowed)) ** 2
-                    cand_score = prev_scores[pi] + float(row.get("learned_score", 0.0) or 0.0) - cost
-                    if cand_score > best_score:
-                        best_score = cand_score
-                        best_idx = pi
-                if best_idx is None:
-                    best_score = float(row.get("learned_score", 0.0) or 0.0) - 1.0
-                current.append(best_score)
-                current_bp.append(best_idx)
-        prev_scores = current
-        backptrs.append(current_bp)
-
-    best_last = int(np.argmax(np.asarray(prev_scores)))
-    selected_idx = [best_last]
-    for fi in range(len(frames) - 1, 0, -1):
-        prev = backptrs[fi][selected_idx[-1]]
-        if prev is None:
-            prev = int(np.argmax(np.asarray([float(r.get("learned_score", 0.0) or 0.0) for r in layers[fi - 1]])))
-        selected_idx.append(prev)
-    selected_idx.reverse()
-    return {frame: layers[fi][idx] for fi, (frame, idx) in enumerate(zip(frames, selected_idx))}
+    frame_items: list[tuple[int, list[SequenceItem]]] = []
+    for frame in frames:
+        items: list[SequenceItem] = []
+        for row in by_frame[frame]:
+            items.append(
+                SequenceItem(
+                    frame=frame,
+                    bbox=bbox(row),
+                    score=float(row.get("learned_score", 0.0) or 0.0),
+                    payload=row,
+                )
+            )
+        frame_items.append((frame, items))
+    selected = select_viterbi_sequence(
+        frame_items,
+        max_jump_px=max_jump_px,
+        transition_weight=transition_weight,
+        size_jump_weight=size_jump_weight,
+        backfill_unreachable=backfill_unreachable,
+    )
+    return {frame: item.payload for frame, item in selected.items() if isinstance(item.payload, dict)}
 
 
 def rolling_viterbi_select(
@@ -276,6 +262,7 @@ def rolling_viterbi_select(
     transition_weight: float,
     size_jump_weight: float = 0.0,
     sequence_window: int = 60,
+    backfill_unreachable: bool = True,
 ) -> dict[int, dict[str, Any]]:
     """Run Viterbi in a sliding window and emit only each window's newest frame.
 
@@ -295,7 +282,13 @@ def rolling_viterbi_select(
         start = max(0, idx - window + 1)
         local_frames = frames[start : idx + 1]
         local_by_frame = {f: by_frame[f] for f in local_frames}
-        local_selected = viterbi_select(local_by_frame, max_jump_px, transition_weight, size_jump_weight)
+        local_selected = viterbi_select(
+            local_by_frame,
+            max_jump_px,
+            transition_weight,
+            size_jump_weight,
+            backfill_unreachable=backfill_unreachable,
+        )
         if frame in local_selected:
             selected[frame] = local_selected[frame]
     return selected
@@ -325,6 +318,7 @@ def viterbi_select_constant_velocity(
     size_jump_weight: float,
     accel_weight: float,
     state_beam: int,
+    backfill_unreachable: bool = True,
 ) -> dict[int, dict[str, Any]]:
     """Second-order Viterbi selector with a constant-velocity prior.
 
@@ -336,11 +330,23 @@ def viterbi_select_constant_velocity(
 
     frames = sorted(by_frame)
     if len(frames) <= 2:
-        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
+        return viterbi_select(
+            by_frame,
+            max_jump_px,
+            transition_weight,
+            size_jump_weight,
+            backfill_unreachable=backfill_unreachable,
+        )
 
     layers = [by_frame[frame] for frame in frames]
     if any(not layer for layer in layers):
-        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
+        return viterbi_select(
+            by_frame,
+            max_jump_px,
+            transition_weight,
+            size_jump_weight,
+            backfill_unreachable=backfill_unreachable,
+        )
 
     def frame_gap(fi: int) -> int:
         if fi <= 0:
@@ -367,7 +373,13 @@ def viterbi_select_constant_velocity(
             cost, _allowed = transition
             states[(i, j)] = row_score(prev) + row_score(cur) - cost
     if not states:
-        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
+        return viterbi_select(
+            by_frame,
+            max_jump_px,
+            transition_weight,
+            size_jump_weight,
+            backfill_unreachable=backfill_unreachable,
+        )
     if state_beam > 0 and len(states) > state_beam:
         states = dict(sorted(states.items(), key=lambda item: item[1], reverse=True)[:state_beam])
 
@@ -399,7 +411,13 @@ def viterbi_select_constant_velocity(
                     new_states[state] = score
                     new_backptrs[state] = (h, i)
         if not new_states:
-            return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
+            return viterbi_select(
+                by_frame,
+                max_jump_px,
+                transition_weight,
+                size_jump_weight,
+                backfill_unreachable=backfill_unreachable,
+            )
         if state_beam > 0 and len(new_states) > state_beam:
             keep = {
                 state
@@ -421,7 +439,13 @@ def viterbi_select_constant_velocity(
         state = prev_state
 
     if any(idx is None for idx in selected_idx):
-        return viterbi_select(by_frame, max_jump_px, transition_weight, size_jump_weight)
+        return viterbi_select(
+            by_frame,
+            max_jump_px,
+            transition_weight,
+            size_jump_weight,
+            backfill_unreachable=backfill_unreachable,
+        )
     return {frame: layers[fi][int(idx)] for fi, (frame, idx) in enumerate(zip(frames, selected_idx))}
 
 
@@ -483,20 +507,28 @@ def main() -> None:
 
     best_rows = prediction_rows(labels, baseline_selected, args.center_tol_px, args.loose_tol_px)
     best_summary = base
+    viterbi_suffix = "" if args.viterbi_backfill_unreachable else "_no_backfill"
     for max_jump in parse_float_list(args.max_jump_px):
         for weight in parse_float_list(args.transition_weight):
             for size_weight in parse_float_list(args.size_jump_weight):
-                selected = viterbi_select(by_frame, max_jump, weight, size_weight)
+                selected = viterbi_select(
+                    by_frame,
+                    max_jump,
+                    weight,
+                    size_weight,
+                    backfill_unreachable=args.viterbi_backfill_unreachable,
+                )
                 summary = summarize_selection(
                     labels,
                     selected,
                     args.center_tol_px,
                     args.loose_tol_px,
-                    f"viterbi_jump{max_jump:g}_w{weight:g}_sz{size_weight:g}",
+                    f"viterbi_jump{max_jump:g}_w{weight:g}_sz{size_weight:g}{viterbi_suffix}",
                 )
                 summary["max_jump_px"] = max_jump
                 summary["transition_weight"] = weight
                 summary["size_jump_weight"] = size_weight
+                summary["backfill_unreachable"] = args.viterbi_backfill_unreachable
                 summaries.append(summary)
                 if (summary["strict_recall"], summary["loose_recall"]) > (
                     best_summary["strict_recall"],
@@ -513,13 +545,14 @@ def main() -> None:
                         size_weight,
                         accel_weight,
                         args.state_beam,
+                        backfill_unreachable=args.viterbi_backfill_unreachable,
                     )
                     summary = summarize_selection(
                         labels,
                         selected,
                         args.center_tol_px,
                         args.loose_tol_px,
-                        f"cv_viterbi_jump{max_jump:g}_w{weight:g}_sz{size_weight:g}_a{accel_weight:g}",
+                        f"cv_viterbi_jump{max_jump:g}_w{weight:g}_sz{size_weight:g}_a{accel_weight:g}{viterbi_suffix}",
                     )
                     summary["max_jump_px"] = max_jump
                     summary["transition_weight"] = weight
@@ -527,6 +560,7 @@ def main() -> None:
                     summary["accel_weight"] = accel_weight
                     summary["sequence_beam"] = args.sequence_beam
                     summary["state_beam"] = args.state_beam
+                    summary["backfill_unreachable"] = args.viterbi_backfill_unreachable
                     summaries.append(summary)
                     if (summary["strict_recall"], summary["loose_recall"]) > (
                         best_summary["strict_recall"],
@@ -547,6 +581,7 @@ def main() -> None:
                 "clip": args.clip,
                 "model": args.model,
                 "frames": len(labels),
+                "viterbi_backfill_unreachable": args.viterbi_backfill_unreachable,
                 "best_summary": summaries[0] if summaries else {},
                 **meta,
             },

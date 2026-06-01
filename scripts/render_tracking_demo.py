@@ -44,7 +44,8 @@ def main() -> None:
     video_path = Path(args.video)
     clip = args.clip or video_path.stem
     selections = pd.read_csv(args.selections)
-    selections = selections[selections["clip"].eq(clip)].copy()
+    selections["clip"] = selections["clip"].astype(str)
+    selections = selections[selections["clip"].eq(str(clip))].copy()
     if selections.empty:
         raise SystemExit(f"no selections for clip {clip}")
     by_frame = {int(row.frame): row for row in selections.itertuples(index=False)}
