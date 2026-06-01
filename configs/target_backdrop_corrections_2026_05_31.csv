@@ -1,0 +1,2 @@
+clip_pattern,frame_start,frame_end,target_backdrop,frame_context,audit_status,label_provenance,evidence_class,exclude_from_true_ground,notes
+aaf1*,288,640,skyline_above_terrain,skyline,contact_sheet_reviewed,backdrop_correction_2026_05_31,backdrop_correction_2026_05_31,1,"Corrects previously promoted aaf1 288-640/480-640 surface rows: target is skyline/above-terrain, not true ground."

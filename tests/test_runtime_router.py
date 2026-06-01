@@ -1,7 +1,11 @@
 import argparse
 import math
+import sys
 import unittest
 from unittest import mock
+
+import cv2
+import numpy as np
 
 from scripts import motion_detector_v2 as base
 from scripts import tbd_motion_detector as tbd
@@ -54,6 +58,49 @@ def args(**overrides):
         "density_penalty_weight": 0.0,
         "selection_margin": 0.0,
         "sky_rescue": False,
+        "hybrid_coast_highres_recenter": False,
+        "hybrid_coast_recenter_radius_det_px": 6.0,
+        "hybrid_coast_recenter_radii": "2,3,4",
+        "hybrid_coast_recenter_peaks": 3,
+        "hybrid_coast_recenter_texture_weight": 0.010,
+        "hybrid_coast_recenter_shift_penalty": 0.20,
+        "hybrid_coast_recenter_score_weight": 0.70,
+        "target_local_recovery_proposals": False,
+        "target_local_recovery_top_k": 8,
+        "target_local_recovery_max_seed_gap": 5,
+        "target_local_recovery_min_hits": 3,
+        "target_local_recovery_min_verified_score": 6.0,
+        "target_local_recovery_search_radius_det_px": 18.0,
+        "target_local_recovery_radii": "2,3,4",
+        "target_local_recovery_texture_weight": 0.010,
+        "target_local_recovery_shift_penalty": 0.020,
+        "target_local_recovery_score_weight": 0.95,
+        "target_local_recovery_state_score_weight": 0.10,
+        "target_local_recovery_box_det_px": 4.0,
+        "target_local_recovery_predictor": "clamped_velocity",
+        "target_local_recovery_max_velocity_px": 3.0,
+        "target_local_state_select": False,
+        "target_local_state_select_error_px": 9.0,
+        "target_local_state_select_improvement_px": 6.0,
+        "target_local_state_select_max_pred_error_px": 6.0,
+        "target_local_state_select_anchor_px": 18.0,
+        "target_local_state_select_min_side": 7.0,
+        "target_local_state_select_max_side": 18.0,
+        "target_local_state_select_top_n": 80,
+        "target_local_state_select_sources": "target_local_recovery",
+        "target_local_state_select_allow_missed_anchor": False,
+        "target_local_state_select_missed_max_misses": 1,
+        "candidate_local_recenter_proposals": False,
+        "candidate_local_recenter_seed_top_k": 24,
+        "candidate_local_recenter_top_k": 48,
+        "candidate_local_recenter_radius_det_px": 16.0,
+        "candidate_local_recenter_radii": "2,3,4",
+        "candidate_local_recenter_texture_weight": 0.010,
+        "candidate_local_recenter_shift_penalty": 0.025,
+        "candidate_local_recenter_score_weight": 1.10,
+        "candidate_local_recenter_seed_score_weight": 0.035,
+        "candidate_local_recenter_box_det_px": 4.0,
+        "candidate_local_recenter_router_scope": "surface_context",
     }
     vals.update(overrides)
     return argparse.Namespace(**vals)
@@ -77,6 +124,195 @@ def cand(score, state="clean_sky", source="map", bbox=(10, 10, 3, 3)):
     out.router_state = state
     out.router_confidence = 1.0
     return out
+
+
+class HybridCoastHighresTests(unittest.TestCase):
+    def test_motion_model_fallback_identity_is_opt_in(self):
+        with mock.patch.object(sys, "argv", ["tbd_motion_detector.py", "clip.mp4"]):
+            self.assertFalse(tbd.parse_args().motion_model_fallback_identity)
+
+        with mock.patch.object(sys, "argv", ["tbd_motion_detector.py", "--motion_model_fallback_identity", "clip.mp4"]):
+            self.assertTrue(tbd.parse_args().motion_model_fallback_identity)
+
+    def test_target_local_state_select_is_opt_in(self):
+        with mock.patch.object(sys, "argv", ["tbd_motion_detector.py", "clip.mp4"]):
+            parsed = tbd.parse_args()
+            self.assertFalse(parsed.target_local_state_select)
+            self.assertEqual(parsed.target_local_state_select_sources, "target_local_recovery")
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "tbd_motion_detector.py",
+                "--target_local_state_select",
+                "--target_local_state_select_error_px",
+                "11",
+                "--target_local_state_select_top_n",
+                "12",
+                "clip.mp4",
+            ],
+        ):
+            parsed = tbd.parse_args()
+            self.assertTrue(parsed.target_local_state_select)
+            self.assertEqual(parsed.target_local_state_select_error_px, 11.0)
+            self.assertEqual(parsed.target_local_state_select_top_n, 12)
+
+    def test_local_native_peaks_near_prefers_dark_peak_close_to_prediction(self):
+        gray = np.full((80, 80), 150, dtype=np.uint8)
+        yy, xx = np.mgrid[:80, :80]
+        gray[np.hypot(xx - 42, yy - 39) <= 2.0] = 25
+        score_map = tbd.compact_dark_map_native(gray, 2, texture_weight=0.0)
+
+        peaks = tbd.local_native_peaks_near({2: score_map}, (40.0, 40.0), 8.0, 3)
+
+        self.assertGreaterEqual(len(peaks), 1)
+        _score, x, y, radius = peaks[0]
+        self.assertEqual(radius, 2)
+        self.assertLess(math.hypot(x - 42.0, y - 39.0), 3.0)
+
+    def test_target_local_recovery_requires_recent_seed(self):
+        opts = args(target_local_recovery_proposals=True)
+        gray = np.full((80, 80, 3), 160, dtype=np.uint8)
+        det = np.full((40, 40), 160, dtype=np.uint8)
+        empty = np.zeros((40, 40), dtype=np.float32)
+
+        old_seed = tbd.TargetLocalRecoverySeed(
+            sid=1,
+            bbox=(18, 18, 4, 4),
+            vx=0.0,
+            vy=0.0,
+            frame_no=0,
+            hits=5,
+            verified_score=10.0,
+        )
+
+        self.assertEqual(
+            tbd.target_local_recovery_candidates(
+                old_seed,
+                10,
+                40,
+                40,
+                gray,
+                0.5,
+                empty,
+                empty,
+                det,
+                opts,
+            ),
+            [],
+        )
+
+    def test_target_local_recovery_finds_dark_peak_near_predicted_track(self):
+        opts = args(
+            target_local_recovery_proposals=True,
+            target_local_recovery_radii="2",
+            target_local_recovery_texture_weight=0.0,
+            target_local_recovery_shift_penalty=0.0,
+            target_local_recovery_top_k=3,
+        )
+        full = np.full((80, 80, 3), 160, dtype=np.uint8)
+        yy, xx = np.mgrid[:80, :80]
+        full[np.hypot(xx - 42, yy - 39) <= 2.0] = 25
+        det = cv2.resize(full, (40, 40), interpolation=cv2.INTER_AREA)
+        det_g = base.ensure_gray(det)
+        empty = np.zeros((40, 40), dtype=np.float32)
+        seed = tbd.TargetLocalRecoverySeed(
+            sid=1,
+            bbox=(18, 18, 4, 4),
+            vx=1.0,
+            vy=0.0,
+            frame_no=1,
+            hits=5,
+            verified_score=10.0,
+        )
+
+        cands = tbd.target_local_recovery_candidates(
+            seed,
+            2,
+            40,
+            40,
+            full,
+            0.5,
+            empty,
+            empty,
+            det_g,
+            opts,
+        )
+
+        self.assertGreaterEqual(len(cands), 1)
+        self.assertEqual(cands[0].source, "target_local_recovery")
+        cx, cy = base.bbox_center(cands[0].bbox)
+        self.assertLess(math.hypot(cx - 21.0, cy - 19.5), 3.0)
+
+    def test_target_local_recovery_clamps_poisoned_seed_velocity(self):
+        opts = args(
+            target_local_recovery_predictor="clamped_velocity",
+            target_local_recovery_max_velocity_px=3.0,
+        )
+        seed = tbd.TargetLocalRecoverySeed(
+            sid=1,
+            bbox=(18, 18, 4, 4),
+            vx=0.0,
+            vy=-30.0,
+            frame_no=1,
+            hits=5,
+            verified_score=10.0,
+        )
+
+        predicted = tbd.target_local_seed_prediction_bbox(seed, 2, 80, 80, opts)
+
+        _cx, cy = base.bbox_center(predicted)
+        self.assertGreater(cy, 16.0)
+
+    def test_target_local_recovery_state_velocity_predictor_preserves_old_behavior(self):
+        opts = args(target_local_recovery_predictor="state_velocity")
+        seed = tbd.TargetLocalRecoverySeed(
+            sid=1,
+            bbox=(18, 18, 4, 4),
+            vx=0.0,
+            vy=-10.0,
+            frame_no=1,
+            hits=5,
+            verified_score=10.0,
+        )
+
+        predicted = tbd.target_local_seed_prediction_bbox(seed, 2, 80, 80, opts)
+
+        _cx, cy = base.bbox_center(predicted)
+        self.assertLess(cy, 14.0)
+
+    def test_candidate_local_recenter_finds_peak_near_loose_seed(self):
+        opts = args(
+            candidate_local_recenter_proposals=True,
+            candidate_local_recenter_radii="2",
+            candidate_local_recenter_texture_weight=0.0,
+            candidate_local_recenter_shift_penalty=0.0,
+            candidate_local_recenter_top_k=4,
+            candidate_local_recenter_seed_top_k=2,
+        )
+        full = np.full((80, 80, 3), 160, dtype=np.uint8)
+        yy, xx = np.mgrid[:80, :80]
+        full[np.hypot(xx - 42, yy - 39) <= 2.0] = 25
+        det = cv2.resize(full, (40, 40), interpolation=cv2.INTER_AREA)
+        det_g = base.ensure_gray(det)
+        empty = np.zeros((40, 40), dtype=np.float32)
+        seed = cand(10.0, state="surface_backed", source="large_dark", bbox=(26, 18, 4, 4))
+
+        cands = tbd.candidate_local_recenter_candidates(
+            [seed],
+            full,
+            0.5,
+            empty,
+            empty,
+            det_g,
+            opts,
+        )
+
+        self.assertGreaterEqual(len(cands), 1)
+        self.assertEqual(cands[0].source, "candidate_local_recenter")
+        cx, cy = base.bbox_center(cands[0].bbox)
+        self.assertLess(math.hypot(cx - 21.0, cy - 19.5), 3.0)
 
 
 class RuntimeRouterTests(unittest.TestCase):

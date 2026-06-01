@@ -90,6 +90,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Append candidate box geometry and candidate-source one-hot flags. Off by default for legacy model compatibility.",
     )
+    p.add_argument(
+        "--save_loco_models",
+        action="store_true",
+        help="Save one held-out-clip model bundle per model/clip for honest downstream replay.",
+    )
     p.add_argument("--detector_scale", type=float, default=0.5)
     p.add_argument("--orb_features", type=int, default=900)
     p.add_argument("--min_matches", type=int, default=18)
@@ -463,6 +468,31 @@ def score_mode_for_model(model_name: str) -> str:
     return "decision_function" if model_name == "pairwise_logistic" else "auto"
 
 
+def model_bundle(
+    model: Pipeline,
+    model_name: str,
+    args: argparse.Namespace,
+    *,
+    heldout_clip: str | None = None,
+) -> dict[str, Any]:
+    bundle: dict[str, Any] = {
+        "model": model,
+        "best_model_loco": model_name,
+        "window_radius": args.window_radius,
+        "crop_size": args.crop_size,
+        "patch_size": args.patch_size,
+        "detector_scale": args.detector_scale,
+        "scalar_columns": SCALAR_COLUMNS,
+        "score_mode": score_mode_for_model(model_name),
+        "source_geometry_features": bool(args.source_geometry_features),
+        "source_categories": SOURCE_CATEGORIES,
+    }
+    if heldout_clip is not None:
+        bundle["heldout_clip"] = heldout_clip
+        bundle["training_mode"] = "leave_one_clip_out"
+    return bundle
+
+
 def auc_score(y: np.ndarray, score: np.ndarray) -> float:
     pos = score[y == 1]
     neg = score[y == 0]
@@ -657,6 +687,13 @@ def main() -> None:
             model = clone(models[model_name])
             train_rows = [rows[int(idx)] for idx in train_idx]
             model = fit_verifier_model(model_name, model, x[train_idx], y[train_idx], train_rows)
+            if args.save_loco_models:
+                loco_dir = out_dir / "loco_models" / model_name
+                loco_dir.mkdir(parents=True, exist_ok=True)
+                joblib.dump(
+                    model_bundle(model, model_name, args, heldout_clip=held_clip),
+                    loco_dir / f"{held_clip}.joblib",
+                )
             scores = predict_model_score(model, x[test_idx], score_mode_for_model(model_name))
             for idx, score in zip(test_idx, scores):
                 out = dict(rows[int(idx)])
@@ -671,18 +708,7 @@ def main() -> None:
     final_model = fit_verifier_model(best_model_name, final_model, x, y, rows)
     model_path = out_dir / f"{best_model_name}_crop_stack_verifier.joblib"
     joblib.dump(
-        {
-            "model": final_model,
-            "best_model_loco": best_model_name,
-            "window_radius": args.window_radius,
-            "crop_size": args.crop_size,
-            "patch_size": args.patch_size,
-            "detector_scale": args.detector_scale,
-            "scalar_columns": SCALAR_COLUMNS,
-            "score_mode": score_mode_for_model(best_model_name),
-            "source_geometry_features": bool(args.source_geometry_features),
-            "source_categories": SOURCE_CATEGORIES,
-        },
+        model_bundle(final_model, best_model_name, args),
         model_path,
     )
 

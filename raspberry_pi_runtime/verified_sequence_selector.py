@@ -12,8 +12,13 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.append(str(REPO_ROOT / "scripts"))
+from selector_core import SequenceItem, select_viterbi_sequence  # noqa: E402
 
 
 OUTPUT_FIELDS = [
@@ -44,6 +49,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--threshold", type=float, default=0.0)
     p.add_argument("--allow_ineligible", action="store_true", help="Allow rows failing detector eligible=1.")
     p.add_argument("--require_floor", action="store_true", help="Require rows to pass detector passes_floor=1.")
+    p.add_argument(
+        "--emit_no_box_rows",
+        action="store_true",
+        help="Write one row for every candidate frame, using selected=0 and blank boxes when no output is emitted.",
+    )
     return p.parse_args()
 
 
@@ -130,50 +140,30 @@ def viterbi_select(
     frames = sorted(by_frame)
     if not frames:
         return {}
-    layers: list[list[dict[str, Any]]] = []
-    backptrs: list[list[int | None]] = []
-    prev_scores: list[float] = []
-    for fi, frame in enumerate(frames):
-        rows = by_frame[frame]
-        layers.append(rows)
-        current: list[float] = []
-        current_bp: list[int | None] = []
-        if fi == 0:
-            for row in rows:
-                current.append(fnum(row.get("selector_score")))
-                current_bp.append(None)
-        else:
-            prev_rows = layers[fi - 1]
-            gap = max(1, frame - frames[fi - 1])
-            allowed = max_jump_px * gap
-            for row in rows:
-                best_score = -1e18
-                best_idx: int | None = None
-                for pi, prev in enumerate(prev_rows):
-                    jump = center_dist(row, prev)
-                    if jump > allowed:
-                        continue
-                    cost = transition_weight * (jump / max(1e-6, allowed)) ** 2
-                    score = prev_scores[pi] + fnum(row.get("selector_score")) - cost
-                    if score > best_score:
-                        best_score = score
-                        best_idx = pi
-                if best_idx is None:
-                    best_score = fnum(row.get("selector_score")) - 1.0
-                current.append(best_score)
-                current_bp.append(best_idx)
-        prev_scores = current
-        backptrs.append(current_bp)
-    best_last = max(range(len(prev_scores)), key=lambda i: prev_scores[i])
-    selected_pairs: list[tuple[int, int]] = []
-    fi = len(frames) - 1
-    idx: int | None = best_last
-    while fi >= 0 and idx is not None:
-        selected_pairs.append((fi, idx))
-        idx = backptrs[fi][idx]
-        fi -= 1
-    selected_pairs.reverse()
-    return {frames[fi]: layers[fi][idx] for fi, idx in selected_pairs}
+    frame_items: list[tuple[int, list[SequenceItem]]] = []
+    for frame in frames:
+        items: list[SequenceItem] = []
+        for row in by_frame[frame]:
+            items.append(
+                SequenceItem(
+                    frame=frame,
+                    bbox=(
+                        fnum(row.get("x")),
+                        fnum(row.get("y")),
+                        fnum(row.get("w"), 1.0),
+                        fnum(row.get("h"), 1.0),
+                    ),
+                    score=fnum(row.get("selector_score")),
+                    payload=row,
+                )
+            )
+        frame_items.append((frame, items))
+    selected = select_viterbi_sequence(
+        frame_items,
+        max_jump_px=max_jump_px,
+        transition_weight=transition_weight,
+    )
+    return {frame: item.payload for frame, item in selected.items() if isinstance(item.payload, dict)}
 
 
 def output_rows(
@@ -181,6 +171,7 @@ def output_rows(
     by_frame: dict[int, list[dict[str, Any]]],
     selected: dict[int, dict[str, Any]],
     threshold: float,
+    emit_no_box_rows: bool = False,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for frame in sorted(by_frame):
@@ -188,6 +179,24 @@ def output_rows(
         score = fnum(row.get("selector_score")) if row is not None else 0.0
         keep = row is not None and score >= threshold
         if not keep:
+            if not emit_no_box_rows:
+                continue
+            rows.append(
+                {
+                    "clip": clip,
+                    "frame": frame,
+                    "selected": 0,
+                    "rank": "",
+                    "x": "",
+                    "y": "",
+                    "w": "",
+                    "h": "",
+                    "learned_score": round(score, 6),
+                    "verified_score": "" if row is None else row.get("verified_score", ""),
+                    "source": "" if row is None else row.get("cand_source", ""),
+                    "track_id": "" if row is None else row.get("track_id", ""),
+                }
+            )
             continue
         rows.append(
             {
@@ -218,7 +227,7 @@ def main() -> None:
         require_floor=args.require_floor,
     )
     selected = viterbi_select(by_frame, args.max_jump_px, args.transition_weight)
-    rows = output_rows(args.clip, by_frame, selected, args.threshold)
+    rows = output_rows(args.clip, by_frame, selected, args.threshold, emit_no_box_rows=args.emit_no_box_rows)
     out_path = Path(args.out_csv)
     write_csv(out_path, rows, OUTPUT_FIELDS)
     summary = {
@@ -232,6 +241,7 @@ def main() -> None:
         "transition_weight": args.transition_weight,
         "score_column": args.score_column,
         "threshold": args.threshold,
+        "emit_no_box_rows": args.emit_no_box_rows,
     }
     (out_path.parent / "verified_sequence_summary.json").write_text(json.dumps(summary, indent=2))
     print(out_path)

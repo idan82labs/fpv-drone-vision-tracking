@@ -50,6 +50,41 @@ class TubeAlignmentProfileTests(unittest.TestCase):
         self.assertGreaterEqual(sigma, 0.25)
         self.assertGreater(z, 0.0)
 
+    def test_matched_controls_prefer_same_router_candidates(self):
+        row = {
+            "x": "10",
+            "y": "10",
+            "w": "3",
+            "h": "3",
+            "cand_router_state": "surface_backed",
+            "cand_texture": "0.5",
+            "cand_sky_like": "0.1",
+            "cand_line_context": "0.2",
+            "track_id": "a",
+        }
+        same = {
+            **row,
+            "x": "30",
+            "track_id": "b",
+        }
+        different = {
+            **row,
+            "x": "40",
+            "cand_router_state": "clean_sky",
+            "track_id": "c",
+        }
+
+        offsets, matched = augment.matched_control_offsets(row, [row, same, different], [(50.0, 0.0)], 4)
+
+        self.assertEqual(matched, 1)
+        self.assertIn((20.0, 0.0), offsets)
+        self.assertNotIn((30.0, 0.0), offsets)
+
+    def test_low_matched_control_count_shrinks_gain(self):
+        self.assertAlmostEqual(augment.shrink_low_control_gain(3.0, matched_count=0), 0.0)
+        self.assertAlmostEqual(augment.shrink_low_control_gain(3.0, matched_count=3), 1.5)
+        self.assertAlmostEqual(augment.shrink_low_control_gain(3.0, matched_count=6), 3.0)
+
     def test_load_rows_can_filter_to_reviewed_frames(self):
         with TemporaryDirectory() as tmp:
             path = Path(tmp) / "top.csv"

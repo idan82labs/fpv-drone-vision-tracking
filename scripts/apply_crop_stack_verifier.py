@@ -84,6 +84,25 @@ def predict_score(model: Any, x: np.ndarray, score_mode: str = "auto") -> np.nda
     return model.decision_function(x)
 
 
+def bounded_logit(prob: float) -> float:
+    p = float(np.clip(prob, 1e-6, 1.0 - 1e-6))
+    return float(np.log(p / (1.0 - p)))
+
+
+def class_probabilities(model: Any, x: np.ndarray, class_names: list[str]) -> dict[str, np.ndarray]:
+    if not hasattr(model, "predict_proba"):
+        raise SystemExit("multi-class crop-stack bundle requires a model with predict_proba")
+    probs = model.predict_proba(x)
+    model_classes = [str(c) for c in getattr(model, "classes_", class_names)]
+    out: dict[str, np.ndarray] = {}
+    for name in class_names:
+        if name in model_classes:
+            out[name] = probs[:, model_classes.index(name)]
+        else:
+            out[name] = np.zeros((x.shape[0],), dtype=np.float32)
+    return out
+
+
 def load_bundle(path: Path) -> dict[str, Any]:
     bundle = joblib.load(path)
     required = {"model", "window_radius", "crop_size", "patch_size", "detector_scale"}
@@ -131,13 +150,30 @@ def score_rows(
         vectors.append(vector)
         vector_indexes.append(len(out_rows) - 1)
     if vectors:
-        scores = predict_score(model, np.vstack(vectors).astype(np.float32), score_mode)
-        for idx, score in zip(vector_indexes, scores):
-            out = out_rows[idx]
-            out["crop_stack_score"] = round(float(score), 6)
-            if overwrite_learned_score:
-                out["base_learned_score"] = out.get("learned_score", "")
-                out["learned_score"] = round(float(score), 6)
+        x = np.vstack(vectors).astype(np.float32)
+        class_names = [str(v) for v in bundle.get("class_names", [])]
+        if class_names:
+            probs = class_probabilities(model, x, class_names)
+            for vector_idx, out_idx in enumerate(vector_indexes):
+                out = out_rows[out_idx]
+                for cls in class_names:
+                    prob = float(probs.get(cls, np.zeros((x.shape[0],), dtype=np.float32))[vector_idx])
+                    out[f"crop_{cls.lower()}_prob"] = round(prob, 6)
+                    out[f"crop_{cls.lower()}_logit"] = round(bounded_logit(prob), 6)
+                score = float(probs.get("T", np.zeros((x.shape[0],), dtype=np.float32))[vector_idx])
+                out["crop_stack_score"] = round(score, 6)
+                out["crop_pred_class"] = max(class_names, key=lambda cls: float(probs[cls][vector_idx]))
+                if overwrite_learned_score:
+                    out["base_learned_score"] = out.get("learned_score", "")
+                    out["learned_score"] = round(score, 6)
+        else:
+            scores = predict_score(model, x, score_mode)
+            for idx, score in zip(vector_indexes, scores):
+                out = out_rows[idx]
+                out["crop_stack_score"] = round(float(score), 6)
+                if overwrite_learned_score:
+                    out["base_learned_score"] = out.get("learned_score", "")
+                    out["learned_score"] = round(float(score), 6)
     return out_rows
 
 

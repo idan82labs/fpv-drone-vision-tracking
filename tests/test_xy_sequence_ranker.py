@@ -4,6 +4,37 @@ from scripts import evaluate_xy_sequence_ranker as seq
 
 
 class XYSequenceRankerTests(unittest.TestCase):
+    def test_viterbi_legacy_backfills_unreachable_late_restart_prefix(self):
+        by_frame = {
+            1: [{"frame": "1", "x": "0", "y": "0", "w": "4", "h": "4", "learned_score": 9.0}],
+            2: [{"frame": "2", "x": "100", "y": "100", "w": "4", "h": "4", "learned_score": 20.0}],
+            3: [{"frame": "3", "x": "102", "y": "100", "w": "4", "h": "4", "learned_score": 20.0}],
+        }
+
+        selected = seq.viterbi_select(by_frame, max_jump_px=5.0, transition_weight=1.5)
+
+        self.assertEqual(selected[1]["x"], "0")
+        self.assertEqual(selected[2]["x"], "100")
+        self.assertEqual(selected[3]["x"], "102")
+
+    def test_viterbi_no_backfill_omits_unreachable_late_restart_prefix(self):
+        by_frame = {
+            1: [{"frame": "1", "x": "0", "y": "0", "w": "4", "h": "4", "learned_score": 9.0}],
+            2: [{"frame": "2", "x": "100", "y": "100", "w": "4", "h": "4", "learned_score": 20.0}],
+            3: [{"frame": "3", "x": "102", "y": "100", "w": "4", "h": "4", "learned_score": 20.0}],
+        }
+
+        selected = seq.viterbi_select(
+            by_frame,
+            max_jump_px=5.0,
+            transition_weight=1.5,
+            backfill_unreachable=False,
+        )
+
+        self.assertNotIn(1, selected)
+        self.assertEqual(selected[2]["x"], "100")
+        self.assertEqual(selected[3]["x"], "102")
+
     def test_viterbi_rejects_single_frame_jump(self):
         by_frame = {
             1: [
