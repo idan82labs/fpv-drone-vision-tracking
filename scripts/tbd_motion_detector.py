@@ -16,7 +16,7 @@ import json
 import math
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -27,6 +27,14 @@ import numpy as np
 sys.path.append(str(Path(__file__).resolve().parent))
 import motion_detector_v2 as base  # noqa: E402
 from selector_core import SequenceItem, StreamingViterbiSelector  # noqa: E402
+from stabilized_residual_path_source import (  # noqa: E402
+    BaseState as SRPSBaseState,
+    ResidualCandidate as SRPSResidualCandidate,
+    SRPSCandidate,
+    SRPSConfig,
+    SourceCandidate as SRPSSourceCandidate,
+    StabilizedResidualPathSource,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -164,11 +172,129 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--target_local_recovery_box_det_px", type=float, default=4.0)
     p.add_argument(
         "--target_local_recovery_predictor",
-        choices=("previous", "state_velocity", "clamped_velocity"),
+        choices=("previous", "state_velocity", "clamped_velocity", "path_bank"),
         default="clamped_velocity",
         help="Prediction used to center target-local recovery. Clamped avoids poisoned beam velocity jumps.",
     )
     p.add_argument("--target_local_recovery_max_velocity_px", type=float, default=3.0)
+    p.add_argument(
+        "--target_local_recovery_path_bank_offsets",
+        default="0:0,4:0,-4:0,0:4,0:-4,4:4,4:-4,-4:4,-4:-4",
+        help="Detector-pixel dx:dy offsets for path-bank target-local recovery.",
+    )
+    p.add_argument(
+        "--target_local_recovery_path_bank_velocity_scales",
+        default="0,0.5,1",
+        help="Velocity multipliers for path-bank target-local recovery.",
+    )
+    p.add_argument(
+        "--target_local_anchor_bank_proposals",
+        action="store_true",
+        help="Opt-in bounded target-local anchor-bank proposal source decoupled from selected-state feedback.",
+    )
+    p.add_argument("--target_local_anchor_bank_max_anchors", type=int, default=2)
+    p.add_argument("--target_local_anchor_bank_max_predictions", type=int, default=10)
+    p.add_argument("--target_local_anchor_bank_peaks_per_prediction", type=int, default=2)
+    p.add_argument("--target_local_anchor_bank_top_k", type=int, default=8)
+    p.add_argument("--target_local_anchor_bank_max_ms", type=float, default=4.0)
+    p.add_argument("--target_local_anchor_bank_max_pending", type=int, default=8)
+    p.add_argument("--target_local_anchor_bank_max_promotion_candidates", type=int, default=24)
+    p.add_argument(
+        "--target_local_anchor_bank_allowed_sources",
+        default="candidate_local_recenter,target_local_recovery",
+        help=(
+            "Comma-separated candidate sources allowed to create/refresh runtime target-local anchors. "
+            "Default excludes target_local_anchor_bank so anchors cannot self-promote."
+        ),
+    )
+    p.add_argument("--target_local_anchor_bank_promotion_hits", type=int, default=3)
+    p.add_argument("--target_local_anchor_bank_offsets", default="0:0,4:0,-4:0,0:4,0:-4")
+    p.add_argument("--target_local_anchor_bank_radii", default="2,3,4")
+    p.add_argument("--target_local_anchor_bank_texture_weight", type=float, default=0.010)
+    p.add_argument("--target_local_anchor_bank_shift_penalty", type=float, default=0.020)
+    p.add_argument("--target_local_anchor_bank_score_weight", type=float, default=0.95)
+    p.add_argument("--target_local_anchor_bank_anchor_trust_weight", type=float, default=0.20)
+    p.add_argument("--target_local_anchor_bank_min_map_score", type=float, default=0.20)
+    p.add_argument("--target_local_anchor_bank_min_side", type=float, default=4.0)
+    p.add_argument("--target_local_anchor_bank_max_side", type=float, default=12.0)
+    p.add_argument("--target_local_anchor_bank_max_line_context", type=float, default=0.85)
+    p.add_argument("--target_local_anchor_bank_max_attached_support", type=float, default=16.0)
+    p.add_argument("--target_local_anchor_bank_continuity_px", type=float, default=8.0)
+    p.add_argument("--target_local_anchor_bank_pending_ttl", type=int, default=3)
+    p.add_argument("--target_local_anchor_bank_anchor_ttl", type=int, default=12)
+    p.add_argument("--target_local_anchor_bank_quarantine_ttl", type=int, default=18)
+    p.add_argument("--target_local_anchor_bank_quarantine_radius_px", type=float, default=12.0)
+    p.add_argument(
+        "--stabilized_residual_path_source",
+        action="store_true",
+        help="Opt-in seed-gated stabilized residual path source. Emits candidates only; no selected-output override.",
+    )
+    p.add_argument(
+        "--srps_recovery_mode",
+        choices=("terrain_no_sky_only", "surface_or_low_confidence", "all"),
+        default="terrain_no_sky_only",
+    )
+    p.add_argument("--srps_source_top_k", type=int, default=80)
+    p.add_argument(
+        "--srps_source_candidates",
+        default="large_dark,map,candidate,motion,appearance,native_map,candidate_local_recenter,target_local_recovery",
+        help="Comma-separated candidate sources allowed to create SRPS seeds.",
+    )
+    p.add_argument(
+        "--srps_residual_source",
+        choices=("temporal_combo", "temporal_dark_fullres", "residual_blur"),
+        default="temporal_combo",
+        help=(
+            "SRPS residual peak source. temporal_combo keeps the legacy detector-space "
+            "resized temporal map; temporal_dark_fullres extracts causal temporal-dark "
+            "peaks at full resolution before projecting to detector coordinates."
+        ),
+    )
+    p.add_argument("--srps_residual_top", type=int, default=200)
+    p.add_argument("--srps_residual_nms_px", type=float, default=4.0)
+    p.add_argument("--srps_residual_score_floor", type=float, default=0.0)
+    p.add_argument("--srps_residual_box_det_px", type=float, default=8.0)
+    p.add_argument("--srps_snap_radius", type=float, default=12.0)
+    p.add_argument("--srps_gate", type=float, default=12.0)
+    p.add_argument("--srps_seed_window", type=int, default=3)
+    p.add_argument("--srps_seed_required_hits", type=int, default=2)
+    p.add_argument("--srps_max_misses", type=int, default=2)
+    p.add_argument("--srps_max_confirmed_age", type=int, default=90)
+    p.add_argument("--srps_max_emit_per_frame", type=int, default=3)
+    p.add_argument("--srps_seed_score_weight", type=float, default=1.2)
+    p.add_argument("--srps_seed_rank_penalty", type=float, default=0.5)
+    p.add_argument("--srps_seed_beta", type=float, default=0.8)
+    p.add_argument("--srps_follow_beta", type=float, default=0.8)
+    p.add_argument("--srps_score_weight", type=float, default=1.0)
+    p.add_argument("--srps_disable_global_residual_seed", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--srps_do_not_hijack_stable_track", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--srps_teacher_residual_proposals_csv", default="")
+    p.add_argument("--srps_teacher_candidate_csv", default="")
+    p.add_argument(
+        "--srps_teacher_coord_scale",
+        type=float,
+        default=-1.0,
+        help="Scale teacher residual/candidate centers into detector coordinates. <=0 uses --downscale.",
+    )
+    p.add_argument(
+        "--srps_teacher_candidate_coord_scale",
+        type=float,
+        default=1.0,
+        help="Scale teacher candidate boxes into detector coordinates. Existing detector top_tubes use 1.0.",
+    )
+    p.add_argument("--srps_dump_runtime_residual_proposals", action="store_true")
+    p.add_argument("--srps_dump_seed_candidates", action="store_true")
+    p.add_argument("--srps_dump_path_candidates", action="store_true")
+    p.add_argument("--srps_multi_seed_compete", action="store_true")
+    p.add_argument("--srps_confirm_requires_verified_seed", action="store_true")
+    p.add_argument("--srps_reconfirm_on_recovery_epoch", action="store_true")
+    p.add_argument("--srps_disable_stale_confirmed_paths", action="store_true")
+    p.add_argument("--srps_false_path_veto", action="store_true")
+    p.add_argument("--srps_verified_candidate_priority", action="store_true")
+    p.add_argument("--srps_verified_seed_score", type=float, default=1.5)
+    p.add_argument("--srps_verified_replacement_margin", type=float, default=1.0)
+    p.add_argument("--srps_residual_density_radius", type=float, default=12.0)
+    p.add_argument("--srps_residual_density_threshold", type=int, default=10)
     p.add_argument(
         "--target_local_state_select",
         action="store_true",
@@ -193,6 +319,37 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--target_local_state_select_missed_max_misses", type=int, default=1)
     p.add_argument(
+        "--replay_handoff_select",
+        action="store_true",
+        help=(
+            "Opt-in selected-output override for source-scoped replay/recenter states. "
+            "This is a bounded handoff over existing states; it does not create proposals "
+            "or feed the chosen state back into BeamTBD."
+        ),
+    )
+    p.add_argument("--replay_handoff_sources", default="candidate_local_recenter,track_only")
+    p.add_argument("--replay_handoff_max_rank", type=int, default=80)
+    p.add_argument("--replay_handoff_min_hits", type=int, default=1)
+    p.add_argument("--replay_handoff_max_misses", type=int, default=2)
+    p.add_argument("--replay_handoff_promote_hits", type=int, default=2)
+    p.add_argument("--replay_handoff_window", type=int, default=3)
+    p.add_argument("--replay_handoff_min_side", type=float, default=3.0)
+    p.add_argument("--replay_handoff_max_side", type=float, default=14.0)
+    p.add_argument("--replay_handoff_max_line_context", type=float, default=1.3)
+    p.add_argument("--replay_handoff_max_attached_support", type=float, default=16.0)
+    p.add_argument("--replay_handoff_min_map_score", type=float, default=0.20)
+    p.add_argument("--replay_handoff_max_shift_det", type=float, default=18.0)
+    p.add_argument(
+        "--replay_handoff_diagnostic_same_frame",
+        action="store_true",
+        help="Emit eligible handoff states without waiting for the 2-of-N continuity commit.",
+    )
+    p.add_argument(
+        "--replay_handoff_allow_target_local_recovery",
+        action="store_true",
+        help="Allow target_local_recovery states only when they pass local evidence confirmation.",
+    )
+    p.add_argument(
         "--candidate_local_recenter_proposals",
         action="store_true",
         help="Opt-in high-res local recentering around top cheap proposals before TBD ranking.",
@@ -201,6 +358,60 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--candidate_local_recenter_top_k", type=int, default=48)
     p.add_argument("--candidate_local_recenter_radius_det_px", type=float, default=16.0)
     p.add_argument("--candidate_local_recenter_radii", default="2,3,4")
+    p.add_argument(
+        "--candidate_local_recenter_seed_families",
+        default="cheap",
+        help="Comma-separated recenter seed families: cheap,track_state,previous_recenter.",
+    )
+    p.add_argument(
+        "--candidate_local_recenter_seed_family_quota",
+        default="",
+        help="Comma-separated family:N seed quotas before global fill, e.g. cheap:24,track_state:24.",
+    )
+    p.add_argument("--candidate_local_recenter_track_state_seed_top_k", type=int, default=24)
+    p.add_argument("--candidate_local_recenter_track_state_min_hits", type=int, default=2)
+    p.add_argument("--candidate_local_recenter_track_state_max_misses", type=int, default=2)
+    p.add_argument("--candidate_local_recenter_track_state_max_age", type=int, default=3)
+    p.add_argument("--candidate_local_recenter_track_state_min_verified_score", type=float, default=-5.0)
+    p.add_argument("--candidate_local_recenter_track_state_max_velocity_px", type=float, default=4.0)
+    p.add_argument(
+        "--candidate_local_recenter_track_only_replay",
+        action="store_true",
+        help=(
+            "Opt-in one-frame-delayed recenter parents from post-update track_only states. "
+            "This uses weak TBD path hypotheses on the next frame; it does not feed back into the same update."
+        ),
+    )
+    p.add_argument("--candidate_local_recenter_track_only_replay_delay", type=int, default=1)
+    p.add_argument("--candidate_local_recenter_track_only_replay_top_k", type=int, default=32)
+    p.add_argument("--candidate_local_recenter_track_only_replay_rank_max", type=int, default=80)
+    p.add_argument("--candidate_local_recenter_track_only_replay_max_misses", type=int, default=2)
+    p.add_argument("--candidate_local_recenter_track_only_replay_min_hits", type=int, default=1)
+    p.add_argument("--candidate_local_recenter_track_only_replay_max_age", type=int, default=4)
+    p.add_argument("--candidate_local_recenter_track_only_replay_min_side", type=float, default=3.0)
+    p.add_argument("--candidate_local_recenter_track_only_replay_max_side", type=float, default=14.0)
+    p.add_argument("--candidate_local_recenter_raw_seed_top_k", type=int, default=48)
+    p.add_argument("--candidate_local_recenter_raw_seed_rank_min", type=int, default=25)
+    p.add_argument("--candidate_local_recenter_raw_seed_rank_max", type=int, default=400)
+    p.add_argument("--candidate_local_recenter_raw_seed_grid_px", type=float, default=12.0)
+    p.add_argument(
+        "--candidate_local_recenter_raw_seed_source_quota",
+        default="motion:20,appearance:12,map:12,native:12,large_dark:8",
+        help="Comma-separated source-family:N quotas for raw_low_rank seed-only parents.",
+    )
+    p.add_argument(
+        "--candidate_local_recenter_seed_mode",
+        choices=("score", "spatial_grid"),
+        default="score",
+        help="How to choose recenter seed candidates. spatial_grid keeps local coverage for low-score terrain targets.",
+    )
+    p.add_argument("--candidate_local_recenter_seed_grid_px", type=float, default=24.0)
+    p.add_argument(
+        "--candidate_local_recenter_response_maps",
+        default="compact_dark",
+        help="Comma-separated recenter response maps: compact_dark,dog,blackhat.",
+    )
+    p.add_argument("--candidate_local_recenter_peaks_per_seed", type=int, default=4)
     p.add_argument("--candidate_local_recenter_texture_weight", type=float, default=0.010)
     p.add_argument("--candidate_local_recenter_shift_penalty", type=float, default=0.025)
     p.add_argument("--candidate_local_recenter_score_weight", type=float, default=1.10)
@@ -480,6 +691,370 @@ class TargetLocalRecoverySeed:
         return base.clip_bbox_float((x + self.vx * dt, y + self.vy * dt, w, h), w_img, h_img)
 
 
+@dataclass
+class AnchorQuarantine:
+    cx: float
+    cy: float
+    frame_no: int
+    ttl: int
+    radius_px: float
+    reason: str
+
+    def active(self, frame_no: int) -> bool:
+        return frame_no - self.frame_no <= self.ttl
+
+    def contains(self, bbox: tuple[int, int, int, int], frame_no: int) -> bool:
+        if not self.active(frame_no):
+            return False
+        cx, cy = base.bbox_center(bbox)
+        return math.hypot(cx - self.cx, cy - self.cy) <= self.radius_px
+
+
+@dataclass
+class RuntimeLocalAnchor:
+    aid: int
+    bbox: tuple[int, int, int, int]
+    frame_no: int
+    vx: float = 0.0
+    vy: float = 0.0
+    trust_score: float = 1.0
+    hit_streak: int = 1
+    miss_streak: int = 0
+    source: str = ""
+    router_state: str = "unrouted"
+    last_selected_sid: int | None = None
+    poison_flags: set[str] = field(default_factory=set)
+
+    def age(self, frame_no: int) -> int:
+        return int(frame_no - self.frame_no)
+
+    def center(self) -> tuple[float, float]:
+        return base.bbox_center(self.bbox)
+
+    def update_from_candidate(self, frame_no: int, cand: base.Candidate, trust_delta: float) -> None:
+        prev_cx, prev_cy = self.center()
+        cx, cy = base.bbox_center(cand.bbox)
+        dt = max(1, frame_no - self.frame_no)
+        self.vx = (cx - prev_cx) / dt
+        self.vy = (cy - prev_cy) / dt
+        self.bbox = cand.bbox
+        self.frame_no = frame_no
+        self.source = cand.source
+        self.router_state = getattr(cand, "router_state", "unrouted")
+        self.hit_streak += 1
+        self.miss_streak = 0
+        self.trust_score = min(6.0, self.trust_score + trust_delta)
+
+
+@dataclass
+class PendingLocalAnchor:
+    pid: int
+    bbox: tuple[int, int, int, int]
+    frame_no: int
+    source: str
+    router_state: str
+    hit_streak: int = 1
+    score: float = 0.0
+    distinct_hit_frames: set[int] = field(default_factory=set)
+
+    def __post_init__(self) -> None:
+        if not self.distinct_hit_frames:
+            self.distinct_hit_frames.add(self.frame_no)
+
+    def center(self) -> tuple[float, float]:
+        return base.bbox_center(self.bbox)
+
+
+class RuntimeAnchorBank:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.anchors: list[RuntimeLocalAnchor] = []
+        self.pending: list[PendingLocalAnchor] = []
+        self.quarantines: list[AnchorQuarantine] = []
+        self.next_aid = 1
+        self.next_pid = 1
+        self.last_events: list[dict[str, object]] = []
+
+    def prune(self, frame_no: int) -> None:
+        ttl = max(1, int(getattr(self.args, "target_local_anchor_bank_anchor_ttl", 12)))
+        self.anchors = [
+            anchor
+            for anchor in self.anchors
+            if anchor.age(frame_no) <= ttl and anchor.trust_score > 0.0 and anchor.miss_streak <= ttl
+        ]
+        pending_ttl = max(1, int(getattr(self.args, "target_local_anchor_bank_pending_ttl", 3)))
+        self.pending = [p for p in self.pending if frame_no - p.frame_no <= pending_ttl]
+        max_pending = max(1, int(getattr(self.args, "target_local_anchor_bank_max_pending", 8)))
+        self.pending.sort(key=lambda p: (p.hit_streak, p.score), reverse=True)
+        self.pending = self.pending[:max_pending]
+        self.quarantines = [q for q in self.quarantines if q.active(frame_no)]
+
+    def in_quarantine(self, bbox: tuple[int, int, int, int], frame_no: int) -> bool:
+        return any(q.contains(bbox, frame_no) for q in self.quarantines)
+
+    def candidate_allowed(self, cand: base.Candidate, frame_no: int) -> tuple[bool, str]:
+        allowed_sources = _parse_source_set(
+            getattr(
+                self.args,
+                "target_local_anchor_bank_allowed_sources",
+                "candidate_local_recenter,target_local_recovery",
+            )
+        )
+        if allowed_sources and cand.source not in allowed_sources:
+            return False, "source"
+        w = float(cand.bbox[2])
+        h = float(cand.bbox[3])
+        side = max(w, h)
+        if side < getattr(self.args, "target_local_anchor_bank_min_side", 4.0):
+            return False, "small"
+        if side > getattr(self.args, "target_local_anchor_bank_max_side", 12.0):
+            return False, "large"
+        if float(getattr(cand, "line_context", 0.0)) > getattr(self.args, "target_local_anchor_bank_max_line_context", 0.85):
+            return False, "line"
+        if float(getattr(cand, "attached_support", 0.0)) > getattr(
+            self.args,
+            "target_local_anchor_bank_max_attached_support",
+            16.0,
+        ):
+            return False, "attached"
+        if float(getattr(cand, "map_score", 0.0)) < getattr(self.args, "target_local_anchor_bank_min_map_score", 0.20):
+            return False, "map"
+        if self.in_quarantine(cand.bbox, frame_no):
+            return False, "quarantine"
+        return True, "ok"
+
+    @staticmethod
+    def _candidate_event_fields(cand: base.Candidate) -> dict[str, object]:
+        cx, cy = base.bbox_center(cand.bbox)
+        parent_source = getattr(cand, "recenter_parent_source", getattr(cand, "target_local_anchor_source", ""))
+        out: dict[str, object] = {
+            "candidate_source": cand.source,
+            "parent_source": parent_source,
+            "candidate_box": list(cand.bbox),
+            "candidate_cx": round(cx, 3),
+            "candidate_cy": round(cy, 3),
+            "map_score": round(float(getattr(cand, "map_score", 0.0)), 3),
+            "score": round(float(getattr(cand, "score", 0.0)), 3),
+            "line_context": round(float(getattr(cand, "line_context", 0.0)), 3),
+            "attached_support": round(float(getattr(cand, "attached_support", 0.0)), 3),
+            "router_state": getattr(cand, "router_state", "unrouted"),
+        }
+        for attr in (
+            "recenter_shift_det",
+            "recenter_peak_radius",
+            "recenter_peak_score",
+            "recenter_second_peak_margin",
+            "recenter_seed_rank",
+            "recenter_seed_score",
+        ):
+            if hasattr(cand, attr):
+                value = getattr(cand, attr)
+                out[attr] = round(float(value), 3) if isinstance(value, (float, int)) else value
+        return out
+
+    def add_quarantine(self, bbox: tuple[int, int, int, int], frame_no: int, reason: str) -> None:
+        cx, cy = base.bbox_center(bbox)
+        self.quarantines.append(
+            AnchorQuarantine(
+                cx=cx,
+                cy=cy,
+                frame_no=frame_no,
+                ttl=max(1, int(getattr(self.args, "target_local_anchor_bank_quarantine_ttl", 18))),
+                radius_px=float(getattr(self.args, "target_local_anchor_bank_quarantine_radius_px", 12.0)),
+                reason=reason,
+            )
+        )
+        self.last_events.append({"event": "quarantine", "frame": frame_no, "reason": reason, "x": round(cx, 3), "y": round(cy, 3)})
+
+    def create_anchor(
+        self,
+        cand: base.Candidate,
+        frame_no: int,
+        trust: float,
+        pending_id: int | None = None,
+    ) -> RuntimeLocalAnchor:
+        anchor = RuntimeLocalAnchor(
+            aid=self.next_aid,
+            bbox=cand.bbox,
+            frame_no=frame_no,
+            trust_score=trust,
+            source=cand.source,
+            router_state=getattr(cand, "router_state", "unrouted"),
+        )
+        self.next_aid += 1
+        self.anchors.append(anchor)
+        self.last_events.append(
+            {
+                "event": "anchor_created",
+                "event_type": "promote",
+                "frame": frame_no,
+                "aid": anchor.aid,
+                "pending_id": pending_id if pending_id is not None else "",
+                "source": cand.source,
+                "anchor_trust": round(anchor.trust_score, 3),
+                **self._candidate_event_fields(cand),
+            }
+        )
+        return anchor
+
+    def update_from_candidates(self, frame_no: int, candidates: list[base.Candidate]) -> None:
+        self.last_events = []
+        self.prune(frame_no)
+        continuity_px = float(getattr(self.args, "target_local_anchor_bank_continuity_px", 8.0))
+        rejected: dict[str, int] = {}
+        max_promotion_candidates = max(1, int(getattr(self.args, "target_local_anchor_bank_max_promotion_candidates", 24)))
+        sorted_candidates = sorted(candidates, key=lambda c: float(getattr(c, "map_score", c.score)), reverse=True)[
+            :max_promotion_candidates
+        ]
+        for cand in sorted_candidates:
+            ok, reason = self.candidate_allowed(cand, frame_no)
+            if not ok:
+                rejected[reason] = rejected.get(reason, 0) + 1
+                self.last_events.append(
+                    {
+                        "event": "anchor_candidate_rejected",
+                        "event_type": "reject",
+                        "frame": frame_no,
+                        "rejection_reason": reason,
+                        **self._candidate_event_fields(cand),
+                    }
+                )
+                continue
+            matched = False
+            for anchor in self.anchors:
+                if center_distance(anchor.bbox, cand.bbox) <= continuity_px:
+                    anchor.update_from_candidate(frame_no, cand, trust_delta=0.6)
+                    self.last_events.append(
+                        {
+                            "event": "anchor_refreshed",
+                            "event_type": "anchor_hit",
+                            "frame": frame_no,
+                            "aid": anchor.aid,
+                            "anchor_age": anchor.age(frame_no),
+                            "anchor_trust": round(anchor.trust_score, 3),
+                            **self._candidate_event_fields(cand),
+                        }
+                    )
+                    matched = True
+                    break
+            if matched:
+                continue
+            for pending in self.pending:
+                if center_distance(pending.bbox, cand.bbox) <= continuity_px:
+                    if pending.frame_no == frame_no:
+                        rejected["same_frame_pending"] = rejected.get("same_frame_pending", 0) + 1
+                        self.last_events.append(
+                            {
+                                "event": "anchor_candidate_rejected",
+                                "event_type": "reject",
+                                "frame": frame_no,
+                                "rejection_reason": "same_frame_pending",
+                                "pending_id": pending.pid,
+                                **self._candidate_event_fields(cand),
+                            }
+                        )
+                        matched = True
+                        break
+                    distinct_frame = frame_no not in pending.distinct_hit_frames
+                    pending.bbox = cand.bbox
+                    pending.frame_no = frame_no
+                    pending.source = cand.source
+                    pending.router_state = getattr(cand, "router_state", "unrouted")
+                    if distinct_frame:
+                        pending.hit_streak += 1
+                        pending.distinct_hit_frames.add(frame_no)
+                    pending.score = max(pending.score, float(getattr(cand, "map_score", cand.score)))
+                    matched = True
+                    self.last_events.append(
+                        {
+                            "event": "pending_anchor_hit",
+                            "event_type": "pending_hit",
+                            "frame": frame_no,
+                            "pending_id": pending.pid,
+                            "hit_streak": pending.hit_streak,
+                            "distinct_hit_frames": len(pending.distinct_hit_frames),
+                            "distinct_frame": int(distinct_frame),
+                            **self._candidate_event_fields(cand),
+                        }
+                    )
+                    promotion_hits = max(2, int(getattr(self.args, "target_local_anchor_bank_promotion_hits", 3)))
+                    if pending.hit_streak >= promotion_hits and len(pending.distinct_hit_frames) >= promotion_hits:
+                        self.create_anchor(cand, frame_no, trust=max(1.0, min(3.0, pending.score)), pending_id=pending.pid)
+                        self.pending.remove(pending)
+                    break
+            if matched:
+                continue
+            max_pending = max(1, int(getattr(self.args, "target_local_anchor_bank_max_pending", 8)))
+            if len(self.pending) >= max_pending:
+                weakest = min(self.pending, key=lambda p: (p.hit_streak, p.score))
+                cand_score = float(getattr(cand, "map_score", cand.score))
+                if (weakest.hit_streak, weakest.score) >= (1, cand_score):
+                    rejected["pending_full"] = rejected.get("pending_full", 0) + 1
+                    self.last_events.append(
+                        {
+                            "event": "anchor_candidate_rejected",
+                            "event_type": "reject",
+                            "frame": frame_no,
+                            "rejection_reason": "pending_full",
+                            **self._candidate_event_fields(cand),
+                        }
+                    )
+                    continue
+                self.pending.remove(weakest)
+            pending_id = self.next_pid
+            self.next_pid += 1
+            self.pending.append(
+                PendingLocalAnchor(
+                    pid=pending_id,
+                    bbox=cand.bbox,
+                    frame_no=frame_no,
+                    source=cand.source,
+                    router_state=getattr(cand, "router_state", "unrouted"),
+                    score=float(getattr(cand, "map_score", cand.score)),
+                )
+            )
+            self.last_events.append(
+                {
+                    "event": "pending_anchor_started",
+                    "event_type": "pending_start",
+                    "frame": frame_no,
+                    "pending_id": pending_id,
+                    **self._candidate_event_fields(cand),
+                }
+            )
+        if rejected:
+            self.last_events.append({"event": "anchor_rejected", "frame": frame_no, "reasons": rejected})
+        self.anchors.sort(key=lambda a: (a.trust_score, a.hit_streak), reverse=True)
+        max_anchors = max(1, int(getattr(self.args, "target_local_anchor_bank_max_anchors", 2)))
+        self.anchors = self.anchors[:max_anchors]
+
+    def confirm_selected(self, frame_no: int, selected: "PathState | None") -> None:
+        if selected is None:
+            for anchor in self.anchors:
+                anchor.trust_score = max(0.0, anchor.trust_score - 0.1)
+            return
+        selected_source = selected.last_candidate.source if selected.last_candidate is not None else ""
+        if selected_source not in {"candidate_local_recenter", "target_local_recovery", "target_local_anchor_bank"}:
+            return
+        for anchor in self.anchors:
+            if center_distance(anchor.bbox, selected.bbox) <= float(
+                getattr(self.args, "target_local_anchor_bank_continuity_px", 8.0)
+            ):
+                anchor.last_selected_sid = selected.sid
+                anchor.trust_score = min(6.0, anchor.trust_score + 0.25)
+            else:
+                anchor.trust_score = max(0.0, anchor.trust_score - 0.05)
+
+    def poison_static_or_attached(self, frame_no: int) -> None:
+        kept: list[RuntimeLocalAnchor] = []
+        for anchor in self.anchors:
+            if "attached" in anchor.poison_flags or "static" in anchor.poison_flags:
+                self.add_quarantine(anchor.bbox, frame_no, ",".join(sorted(anchor.poison_flags)))
+                continue
+            kept.append(anchor)
+        self.anchors = kept
+
+
 def target_local_seed_prediction_bbox(
     seed: TargetLocalRecoverySeed,
     frame_no: int,
@@ -504,6 +1079,48 @@ def target_local_seed_prediction_bbox(
         vx *= scale
         vy *= scale
     return base.clip_bbox_float((x + vx * dt, y + vy * dt, w, h), w_img, h_img)
+
+
+def target_local_seed_prediction_bank(
+    seed: TargetLocalRecoverySeed,
+    frame_no: int,
+    w_img: int,
+    h_img: int,
+    args: argparse.Namespace,
+) -> list[tuple[tuple[int, int, int, int], str]]:
+    predictor = getattr(args, "target_local_recovery_predictor", "clamped_velocity")
+    if predictor != "path_bank":
+        return [(target_local_seed_prediction_bbox(seed, frame_no, w_img, h_img, args), predictor)]
+
+    x, y, w, h = seed.bbox
+    dt = max(1, seed.age(frame_no))
+    vx = float(seed.vx)
+    vy = float(seed.vy)
+    max_step = max(0.0, float(getattr(args, "target_local_recovery_max_velocity_px", 3.0))) * dt
+    speed = math.hypot(vx * dt, vy * dt)
+    if max_step > 0.0 and speed > max_step:
+        scale = max_step / max(1e-6, speed)
+        vx *= scale
+        vy *= scale
+
+    offsets = parse_xy_offsets(getattr(args, "target_local_recovery_path_bank_offsets", "0:0"))
+    velocity_scales = parse_float_list(getattr(args, "target_local_recovery_path_bank_velocity_scales", "0,1"))
+    bases: list[tuple[float, float, str]] = [(float(x), float(y), "previous")]
+    for vel_scale in velocity_scales:
+        bases.append((x + vx * dt * vel_scale, y + vy * dt * vel_scale, f"vel{vel_scale:g}"))
+
+    out: list[tuple[tuple[int, int, int, int], str]] = []
+    seen: set[tuple[int, int, int, int, str]] = set()
+    for bx, by, method in bases:
+        for dx, dy in offsets:
+            bbox = base.clip_bbox_float((bx + dx, by + dy, w, h), w_img, h_img)
+            suffix = "center" if abs(dx) < 1e-6 and abs(dy) < 1e-6 else f"off{dx:g}_{dy:g}"
+            key = (bbox[0], bbox[1], bbox[2], bbox[3], method)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((bbox, f"{method}_{suffix}"))
+    return out or [(target_local_seed_prediction_bbox(seed, frame_no, w_img, h_img, args), "path_bank")]
 
 
 def robust_sigma(img: np.ndarray) -> float:
@@ -668,6 +1285,16 @@ def parse_xy_offsets(text: str) -> list[tuple[float, float]]:
         x_text, y_text = part.split(":")
         offsets.append((float(x_text), float(y_text)))
     return offsets or [(0.0, 0.0)]
+
+
+def parse_float_list(text: str) -> list[float]:
+    vals: list[float] = []
+    for part in text.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        vals.append(float(part))
+    return vals or [0.0, 1.0]
 
 
 def structure_maps(gray: np.ndarray, radius: int) -> tuple[np.ndarray, np.ndarray]:
@@ -986,6 +1613,301 @@ def large_dark_candidates(
     return cands
 
 
+def srps_source_candidates_from_base(
+    frame_no: int,
+    cands: list[base.Candidate],
+    args: argparse.Namespace,
+) -> list[SRPSSourceCandidate]:
+    allowed = _parse_source_set(getattr(args, "srps_source_candidates", ""))
+    ranked = sorted(cands, key=lambda c: float(c.score), reverse=True)
+    out: list[SRPSSourceCandidate] = []
+    for rank, cand in enumerate(ranked, start=1):
+        if rank > max(1, int(getattr(args, "srps_source_top_k", 80))):
+            break
+        if allowed and cand.source not in allowed:
+            continue
+        cx, cy = base.bbox_center(cand.bbox)
+        out.append(
+            SRPSSourceCandidate(
+                frame=frame_no,
+                cx=float(cx),
+                cy=float(cy),
+                bbox=tuple(float(v) for v in cand.bbox),
+                source=cand.source,
+                rank=rank,
+                score=float(cand.score),
+                track_id=str(getattr(cand, "recenter_seed_track_id", "") or getattr(cand, "target_local_anchor_id", "")),
+                coord_space="detector",
+                payload=cand,
+            )
+        )
+    return out
+
+
+def srps_residual_candidates_from_map(
+    frame_no: int,
+    residual_map: np.ndarray,
+    args: argparse.Namespace,
+) -> list[SRPSResidualCandidate]:
+    score_map = residual_map.astype(np.float32)
+    if score_map.size == 0:
+        return []
+    border = int(round(args.border_frac * min(score_map.shape[:2])))
+    if border:
+        score_map = score_map.copy()
+        score_map[:border, :] = -999.0
+        score_map[-border:, :] = -999.0
+        score_map[:, :border] = -999.0
+        score_map[:, -border:] = -999.0
+    nms = max(3, int(round(getattr(args, "srps_residual_nms_px", 4.0))))
+    if nms % 2 == 0:
+        nms += 1
+    dilated = cv2.dilate(score_map, np.ones((nms, nms), dtype=np.uint8))
+    floor = float(getattr(args, "srps_residual_score_floor", 0.0))
+    mask = (score_map >= floor) & (score_map >= dilated - 1e-6)
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        return []
+    vals = score_map[ys, xs]
+    order = np.argsort(vals)[::-1][: max(1, int(getattr(args, "srps_residual_top", 200)))]
+    side = max(1.0, float(getattr(args, "srps_residual_box_det_px", 8.0)))
+    out: list[SRPSResidualCandidate] = []
+    for local_rank, idx in enumerate(order, start=1):
+        x = float(xs[idx])
+        y = float(ys[idx])
+        out.append(
+            SRPSResidualCandidate(
+                frame=frame_no,
+                cx=x,
+                cy=y,
+                rank=local_rank,
+                score=float(vals[idx]),
+                bbox=(x - 0.5 * side, y - 0.5 * side, side, side),
+                coord_space="detector",
+            )
+        )
+    return out
+
+
+def srps_residual_candidates_from_full_map(
+    frame_no: int,
+    residual_map_full: np.ndarray,
+    downscale: float,
+    args: argparse.Namespace,
+) -> list[SRPSResidualCandidate]:
+    """Extract SRPS residual peaks in full-res coordinates, then downscale.
+
+    The old SRPS runtime path resized the temporal residual map first and then
+    searched for detector-space maxima. On terrain-backed e271 frames that loses
+    centering evidence the offline proposal recovery path keeps. This function
+    mirrors the teacher shape more closely while remaining causal.
+    """
+
+    if residual_map_full.size == 0 or downscale <= 0:
+        return []
+    score_map = residual_map_full.astype(np.float32)
+    border = int(round(args.border_frac * min(score_map.shape[:2]) / max(1e-6, downscale)))
+    if border:
+        score_map = score_map.copy()
+        score_map[:border, :] = -999.0
+        score_map[-border:, :] = -999.0
+        score_map[:, :border] = -999.0
+        score_map[:, -border:] = -999.0
+
+    peaks: list[tuple[float, float, float, int]] = []
+    for radius in parse_radii(getattr(args, "temporal_stack_radii", "2,3,4,5,7")):
+        peaks.extend(local_maxima_peaks(score_map, radius, max(1, int(getattr(args, "srps_residual_top", 200)))))
+
+    nms_full = max(2.5, float(getattr(args, "srps_residual_nms_px", 4.0)) / max(1e-6, float(downscale)))
+    peaks = dedupe_full_peaks(peaks, nms_full, max(1, int(getattr(args, "srps_residual_top", 200))))
+    floor = float(getattr(args, "srps_residual_score_floor", 0.0))
+    side = max(1.0, float(getattr(args, "srps_residual_box_det_px", 8.0)))
+    out: list[SRPSResidualCandidate] = []
+    for local_rank, (peak_score, x_full, y_full, _radius) in enumerate(peaks, start=1):
+        if peak_score < floor:
+            continue
+        cx = float(x_full) * float(downscale)
+        cy = float(y_full) * float(downscale)
+        out.append(
+            SRPSResidualCandidate(
+                frame=frame_no,
+                cx=cx,
+                cy=cy,
+                rank=local_rank,
+                score=float(peak_score),
+                bbox=(cx - 0.5 * side, cy - 0.5 * side, side, side),
+                coord_space="detector",
+                payload={"source": "temporal_dark_fullres", "x_full": float(x_full), "y_full": float(y_full)},
+            )
+        )
+    return out
+
+
+def load_srps_teacher_residuals(path: str, coord_scale: float) -> dict[int, list[SRPSResidualCandidate]]:
+    if not path:
+        return {}
+    out: dict[int, list[SRPSResidualCandidate]] = {}
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"--srps_teacher_residual_proposals_csv not found: {path}")
+    with p.open(newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                frame = int(round(float(row.get("frame", ""))))
+                rank = int(round(float(row.get("rank", 999999))))
+                cx = float(row.get("cx", 0.0)) * coord_scale
+                cy = float(row.get("cy", 0.0)) * coord_scale
+                score = float(row.get("score", 0.0))
+            except Exception:
+                continue
+            side = max(1.0, 8.0 * coord_scale)
+            out.setdefault(frame, []).append(
+                SRPSResidualCandidate(
+                    frame=frame,
+                    cx=cx,
+                    cy=cy,
+                    rank=rank,
+                    score=score,
+                    bbox=(cx - 0.5 * side, cy - 0.5 * side, side, side),
+                    coord_space="detector",
+                    payload=row,
+                )
+            )
+    for rows in out.values():
+        rows.sort(key=lambda r: int(r.rank))
+    return out
+
+
+def load_srps_teacher_sources(
+    path: str,
+    coord_scale: float,
+    allowed_sources: set[str] | None = None,
+) -> dict[int, list[SRPSSourceCandidate]]:
+    if not path:
+        return {}
+    allowed_sources = allowed_sources or set()
+    out: dict[int, list[SRPSSourceCandidate]] = {}
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"--srps_teacher_candidate_csv not found: {path}")
+    with p.open(newline="") as f:
+        for row in csv.DictReader(f):
+            try:
+                frame = int(round(float(row.get("frame", ""))))
+                rank = int(round(float(row.get("rank", 999999))))
+                x = float(row.get("x", 0.0)) * coord_scale
+                y = float(row.get("y", 0.0)) * coord_scale
+                w = max(1.0, float(row.get("w", 1.0)) * coord_scale)
+                h = max(1.0, float(row.get("h", 1.0)) * coord_scale)
+                score = float(row.get("score", row.get("verified_score", 0.0)) or 0.0)
+            except Exception:
+                continue
+            source = str(row.get("cand_source", row.get("source", "")) or "").strip()
+            if not source:
+                continue
+            if allowed_sources and source not in allowed_sources:
+                continue
+            out.setdefault(frame, []).append(
+                SRPSSourceCandidate(
+                    frame=frame,
+                    cx=x + 0.5 * w,
+                    cy=y + 0.5 * h,
+                    bbox=(x, y, w, h),
+                    source=source,
+                    rank=rank,
+                    score=score,
+                    track_id=str(row.get("track_id", "") or ""),
+                    coord_space="detector",
+                    payload=row,
+                )
+            )
+    for rows in out.values():
+        rows.sort(key=lambda r: (int(r.rank), -float(r.score)))
+    return out
+
+
+def srps_should_run(
+    args: argparse.Namespace,
+    frame_decision: FrameRouterDecision,
+    surface_extras_allowed: bool,
+) -> bool:
+    if not getattr(args, "stabilized_residual_path_source", False):
+        return False
+    mode = getattr(args, "srps_recovery_mode", "terrain_no_sky_only")
+    if mode == "all":
+        return True
+    if mode == "surface_or_low_confidence":
+        return surface_extras_allowed or frame_decision.mode in {"surface", "boundary", "unknown"}
+    return frame_decision.mode == "surface"
+
+
+def srps_base_state_from_tbd(tbd: BeamTBD, args: argparse.Namespace) -> SRPSBaseState:
+    best = tbd.best()
+    if best is None:
+        return SRPSBaseState(state="A", stable_t=False, low_confidence=True)
+    try:
+        score = float(tbd.verified_score(best))
+    except Exception:
+        score = float(best.score())
+    stable = (
+        best.misses == 0
+        and best.hit_count() >= max(1, int(getattr(args, "min_path_hits", 3)))
+        and score >= float(getattr(args, "selected_score", 6.0))
+    )
+    return SRPSBaseState(
+        state="T" if stable else "P",
+        stable_t=stable,
+        low_confidence=not stable,
+        router="unknown",
+    )
+
+
+def srps_to_base_candidate(
+    srps: SRPSCandidate,
+    residual_blur: np.ndarray,
+    app_resp: np.ndarray,
+    cur_g: np.ndarray,
+    args: argparse.Namespace,
+) -> base.Candidate:
+    h_img, w_img = cur_g.shape[:2]
+    bbox = base.clip_bbox_float(srps.bbox, w_img, h_img)
+    x, y, w, h = bbox
+    mask = np.zeros_like(cur_g, dtype=np.uint8)
+    mask[y : y + h, x : x + w] = 255
+    cand = base.candidate_score("stabilized_residual_path", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+    instant = max(-5.0, min(15.0, float(srps.score)))
+    path_bonus = 0.15 * max(-10.0, min(40.0, float(srps.path_confidence)))
+    confirm_bonus = 2.0 if srps.srps_state == "confirmed_path" else 0.0
+    miss_penalty = 0.8 * max(0, int(srps.path_miss_count))
+    cand.score = 0.20 * float(cand.score) + float(getattr(args, "srps_score_weight", 1.0)) * (
+        instant + path_bonus + confirm_bonus - miss_penalty
+    )
+    if getattr(args, "srps_verified_candidate_priority", False) and srps.verified_path:
+        cand.score = max(float(cand.score), float(getattr(args, "selected_score", 6.0)) + 2.0)
+    cand.map_score = float(srps.snap_score)
+    cand.srps_state = srps.srps_state
+    cand.srps_path_confidence = float(srps.path_confidence)
+    cand.srps_seed_type = srps.seed_type
+    cand.srps_seed_source = srps.seed_source
+    cand.srps_seed_rank = int(srps.seed_rank)
+    cand.srps_seed_score = float(srps.seed_score)
+    cand.srps_seed_track_id = srps.seed_track_id
+    cand.srps_snap_rank = int(srps.snap_rank)
+    cand.srps_snap_score = float(srps.snap_score)
+    cand.srps_snap_distance = float(srps.snap_distance)
+    cand.srps_pred_distance = float(srps.pred_distance)
+    cand.srps_path_miss_count = int(srps.path_miss_count)
+    cand.srps_hits = int(srps.hits)
+    cand.srps_confirm_frame = -1 if srps.confirm_frame is None else int(srps.confirm_frame)
+    cand.srps_coord_space = srps.coord_space
+    cand.srps_verified_seed = int(srps.verified_seed)
+    cand.srps_verified_path = int(srps.verified_path)
+    cand.srps_verification_score = float(srps.verification_score)
+    cand.srps_support_sources = srps.support_sources
+    cand.srps_residual_density = int(srps.residual_density)
+    return cand
+
+
 def compact_dark_map_native(gray: np.ndarray, radius: int, texture_weight: float = 0.025) -> np.ndarray:
     img = gray.astype(np.float32)
     r = max(1, int(radius))
@@ -1018,6 +1940,91 @@ def compact_dark_map_native(gray: np.ndarray, radius: int, texture_weight: float
     score[:, :border] = -999.0
     score[:, -border:] = -999.0
     return score.astype(np.float32)
+
+
+def dog_dark_map_native(gray: np.ndarray, radius: int, texture_weight: float = 0.025) -> np.ndarray:
+    img = gray.astype(np.float32)
+    r = max(1, int(radius))
+    inner_sigma = max(0.6, 0.55 * r)
+    outer_sigma = max(inner_sigma + 0.5, 1.65 * r)
+    inner = cv2.GaussianBlur(img, (0, 0), inner_sigma, borderType=cv2.BORDER_REFLECT101)
+    outer = cv2.GaussianBlur(img, (0, 0), outer_sigma, borderType=cv2.BORDER_REFLECT101)
+    response = outer - inner
+    norm_k = 6 * r + 3
+    mean = cv2.boxFilter(response, cv2.CV_32F, (norm_k, norm_k), normalize=True, borderType=cv2.BORDER_REFLECT101)
+    sq = cv2.boxFilter(response * response, cv2.CV_32F, (norm_k, norm_k), normalize=True, borderType=cv2.BORDER_REFLECT101)
+    std = np.sqrt(np.maximum(4.0, sq - mean * mean))
+    score = (response - mean) / std
+    if texture_weight > 0.0:
+        gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+        texture = cv2.boxFilter(cv2.magnitude(gx, gy), cv2.CV_32F, (norm_k, norm_k), normalize=True, borderType=cv2.BORDER_REFLECT101)
+        score = score - texture_weight * texture
+    border = max(norm_k, 10)
+    score[:border, :] = -999.0
+    score[-border:, :] = -999.0
+    score[:, :border] = -999.0
+    score[:, -border:] = -999.0
+    return score.astype(np.float32)
+
+
+def blackhat_dark_map_native(gray: np.ndarray, radius: int, texture_weight: float = 0.025) -> np.ndarray:
+    img_u8 = gray.astype(np.uint8)
+    r = max(1, int(radius))
+    k = max(3, 2 * r + 1)
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    response = cv2.morphologyEx(img_u8, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
+    norm_k = 6 * r + 3
+    mean = cv2.boxFilter(response, cv2.CV_32F, (norm_k, norm_k), normalize=True, borderType=cv2.BORDER_REFLECT101)
+    sq = cv2.boxFilter(response * response, cv2.CV_32F, (norm_k, norm_k), normalize=True, borderType=cv2.BORDER_REFLECT101)
+    std = np.sqrt(np.maximum(4.0, sq - mean * mean))
+    score = (response - mean) / std
+    if texture_weight > 0.0:
+        img = gray.astype(np.float32)
+        gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+        texture = cv2.boxFilter(cv2.magnitude(gx, gy), cv2.CV_32F, (norm_k, norm_k), normalize=True, borderType=cv2.BORDER_REFLECT101)
+        score = score - texture_weight * texture
+    border = max(norm_k, 10)
+    score[:border, :] = -999.0
+    score[-border:, :] = -999.0
+    score[:, :border] = -999.0
+    score[:, -border:] = -999.0
+    return score.astype(np.float32)
+
+
+def parse_response_maps(raw: str) -> list[str]:
+    allowed = {"compact_dark", "dog", "blackhat"}
+    out: list[str] = []
+    for part in str(raw or "compact_dark").split(","):
+        name = part.strip().lower()
+        if not name:
+            continue
+        if name not in allowed:
+            continue
+        if name not in out:
+            out.append(name)
+    return out or ["compact_dark"]
+
+
+def build_recenter_score_maps(
+    gray: np.ndarray,
+    radii: list[int],
+    response_maps: list[str],
+    texture_weight: float,
+) -> dict[tuple[str, int], np.ndarray]:
+    maps: dict[tuple[str, int], np.ndarray] = {}
+    for r in radii:
+        for name in response_maps:
+            if name == "dog":
+                maps[(name, r)] = dog_dark_map_native(gray, r, texture_weight)
+            elif name == "blackhat":
+                maps[(name, r)] = blackhat_dark_map_native(gray, r, texture_weight)
+            else:
+                maps[(name, r)] = compact_dark_map_native(gray, r, texture_weight)
+    return maps
 
 
 def scale_h_to_full(h_down: np.ndarray, downscale: float) -> np.ndarray:
@@ -1174,6 +2181,88 @@ def local_native_peaks_near(
     return dedupe_full_peaks(peaks, nms_px=2.0, max_n=max(1, max_peaks))
 
 
+def refine_peak_subpixel(score_map: np.ndarray, x: float, y: float) -> tuple[float, float, str, float]:
+    xi = int(round(x))
+    yi = int(round(y))
+    h, w = score_map.shape[:2]
+    if xi <= 0 or yi <= 0 or xi >= w - 1 or yi >= h - 1:
+        return x, y, "integer", 0.0
+    crop = score_map[yi - 1 : yi + 2, xi - 1 : xi + 2].astype(np.float32)
+    if not np.all(np.isfinite(crop)):
+        return x, y, "integer", 0.0
+    weights = crop - float(np.min(crop))
+    total = float(np.sum(weights))
+    if total <= 1e-6:
+        return x, y, "integer", 0.0
+    yy, xx = np.mgrid[-1:2, -1:2]
+    dx = float(np.sum(xx * weights) / total)
+    dy = float(np.sum(yy * weights) / total)
+    if abs(dx) > 0.75 or abs(dy) > 0.75:
+        return x, y, "integer", total
+    return x + dx, y + dy, "centroid3x3", total
+
+
+def local_native_peaks_near_with_meta(
+    score_maps: dict[tuple[str, int], np.ndarray],
+    center_full: tuple[float, float],
+    search_radius_full_px: float,
+    max_peaks: int,
+) -> list[dict[str, object]]:
+    cx, cy = center_full
+    peaks: list[dict[str, object]] = []
+    for (response_name, radius), score_map in score_maps.items():
+        h, w = score_map.shape[:2]
+        x0 = max(0, int(math.floor(cx - search_radius_full_px)))
+        y0 = max(0, int(math.floor(cy - search_radius_full_px)))
+        x1 = min(w, int(math.ceil(cx + search_radius_full_px + 1)))
+        y1 = min(h, int(math.ceil(cy + search_radius_full_px + 1)))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        crop = score_map[y0:y1, x0:x1]
+        nms = max(3, int(round(2 * radius + 1)))
+        if nms % 2 == 0:
+            nms += 1
+        dilated = cv2.dilate(crop, np.ones((nms, nms), dtype=np.uint8))
+        mask = (crop >= dilated - 1e-6) & np.isfinite(crop) & (crop > -100.0)
+        ys, xs = np.nonzero(mask)
+        if len(xs) == 0:
+            continue
+        vals = crop[ys, xs]
+        order = np.argsort(vals)[::-1][: max(1, max_peaks)]
+        sorted_vals = [float(vals[i]) for i in order]
+        second = sorted_vals[1] if len(sorted_vals) > 1 else None
+        for local_rank, idx in enumerate(order, start=1):
+            x_raw = float(x0 + xs[idx])
+            y_raw = float(y0 + ys[idx])
+            x_ref, y_ref, method, condition = refine_peak_subpixel(score_map, x_raw, y_raw)
+            score = float(vals[idx])
+            margin = score - second if second is not None and local_rank == 1 else 0.0
+            peaks.append(
+                {
+                    "score": score,
+                    "x": x_ref,
+                    "y": y_ref,
+                    "radius": int(radius),
+                    "response_map": response_name,
+                    "response_family": response_name,
+                    "local_rank": local_rank,
+                    "second_peak_margin": max(0.0, float(margin)),
+                    "subpixel_dx": x_ref - x_raw,
+                    "subpixel_dy": y_ref - y_raw,
+                    "subpixel_method": method,
+                    "subpixel_condition": condition,
+                }
+            )
+    deduped: list[dict[str, object]] = []
+    for peak in sorted(peaks, key=lambda p: float(p["score"]), reverse=True):
+        if len(deduped) >= max(1, max_peaks):
+            break
+        if any(math.hypot(float(peak["x"]) - float(prev["x"]), float(peak["y"]) - float(prev["y"])) <= 2.0 for prev in deduped):
+            continue
+        deduped.append(peak)
+    return deduped
+
+
 def inverse_warp_point(
     x: float,
     y: float,
@@ -1261,7 +2350,7 @@ def temporal_stack_candidate_local_candidates(
 
     h_img, w_img = cur_g.shape[:2]
     proposals: list[tuple[float, float, float, int]] = []
-    for seed in seed_pool:
+    for seed_rank, seed in enumerate(seed_pool, start=1):
         scx, scy = base.bbox_center(seed.bbox)
         x_full = scx * inv_downscale
         y_full = scy * inv_downscale
@@ -1496,7 +2585,7 @@ def hybrid_coast_candidates(
                 cands.append(cand)
                 if len(cands) >= args.hybrid_coast_top_k:
                     return sorted(cands, key=lambda c: c.score, reverse=True)
-    return sorted(cands, key=lambda c: c.score, reverse=True)
+    return sorted(cands, key=lambda c: c.score, reverse=True)[: max(1, args.target_local_recovery_top_k)]
 
 
 def target_local_recovery_candidates(
@@ -1529,49 +2618,423 @@ def target_local_recovery_candidates(
     if cur_full is None or downscale <= 0:
         return []
 
-    predicted = target_local_seed_prediction_bbox(seed, frame_no, w_img, h_img, args)
-    pred_cx, pred_cy = base.bbox_center(predicted)
     full_g = base.ensure_gray(cur_full)
     score_maps = {
         r: compact_dark_map_native(full_g, r, args.target_local_recovery_texture_weight)
         for r in parse_radii(args.target_local_recovery_radii)
     }
-    peaks = local_native_peaks_near(
-        score_maps,
-        (pred_cx / downscale, pred_cy / downscale),
-        args.target_local_recovery_search_radius_det_px / downscale,
-        args.target_local_recovery_top_k,
-    )
-    if not peaks:
-        return []
 
     side = max(3, int(round(args.target_local_recovery_box_det_px)))
     state_score = max(0.0, min(12.0, seed.verified_score))
+    source = (
+        "target_local_path_bank"
+        if getattr(args, "target_local_recovery_predictor", "clamped_velocity") == "path_bank"
+        else "target_local_recovery"
+    )
     cands: list[base.Candidate] = []
     occupied: list[base.Candidate] = []
-    for peak_score, x_full, y_full, _radius in peaks:
-        cx = x_full * downscale
-        cy = y_full * downscale
-        bbox = base.clip_bbox_float((cx - 0.5 * side, cy - 0.5 * side, side, side), w_img, h_img)
-        shift_det = math.hypot(cx - pred_cx, cy - pred_cy)
-        recentered_score = float(peak_score - args.target_local_recovery_shift_penalty * shift_det)
-        x, y, w, h = bbox
-        mask = np.zeros_like(cur_g, dtype=np.uint8)
-        mask[y : y + h, x : x + w] = 255
-        cand = base.candidate_score("target_local_recovery", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
-        cand.map_score = recentered_score
-        cand.score = (
-            0.40 * float(cand.score)
-            + args.target_local_recovery_score_weight * recentered_score
-            + args.target_local_recovery_state_score_weight * state_score
+    for predicted, _method in target_local_seed_prediction_bank(seed, frame_no, w_img, h_img, args):
+        pred_cx, pred_cy = base.bbox_center(predicted)
+        peaks = local_native_peaks_near(
+            score_maps,
+            (pred_cx / downscale, pred_cy / downscale),
+            args.target_local_recovery_search_radius_det_px / downscale,
+            args.target_local_recovery_top_k,
         )
-        if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
-            continue
-        occupied.append(cand)
-        cands.append(cand)
-        if len(cands) >= args.target_local_recovery_top_k:
-            break
+        for peak_score, x_full, y_full, _radius in peaks:
+            cx = x_full * downscale
+            cy = y_full * downscale
+            bbox = base.clip_bbox_float((cx - 0.5 * side, cy - 0.5 * side, side, side), w_img, h_img)
+            shift_det = math.hypot(cx - pred_cx, cy - pred_cy)
+            recentered_score = float(peak_score - args.target_local_recovery_shift_penalty * shift_det)
+            x, y, w, h = bbox
+            mask = np.zeros_like(cur_g, dtype=np.uint8)
+            mask[y : y + h, x : x + w] = 255
+            cand = base.candidate_score(source, bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+            cand.map_score = recentered_score
+            cand.score = (
+                0.40 * float(cand.score)
+                + args.target_local_recovery_score_weight * recentered_score
+                + args.target_local_recovery_state_score_weight * state_score
+            )
+            if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
+                continue
+            occupied.append(cand)
+            cands.append(cand)
     return sorted(cands, key=lambda c: c.score, reverse=True)
+
+
+def parse_family_quota(raw: str) -> dict[str, int]:
+    quotas: dict[str, int] = {}
+    for part in str(raw or "").split(","):
+        part = part.strip()
+        if not part or ":" not in part:
+            continue
+        key, value = part.split(":", 1)
+        key = key.strip()
+        try:
+            quotas[key] = max(0, int(value.strip()))
+        except ValueError:
+            continue
+    return quotas
+
+
+def candidate_seed_family(cand: base.Candidate) -> str:
+    return str(getattr(cand, "recenter_seed_family", "cheap") or "cheap")
+
+
+def raw_seed_source_family(source: str) -> str:
+    source = str(source or "").strip()
+    if source == "native_map":
+        return "native"
+    return source or "unknown"
+
+
+def clone_recenter_seed(
+    cand: base.Candidate,
+    source: str,
+    family: str,
+) -> base.Candidate:
+    seed = base.Candidate(
+        source=source,
+        bbox=cand.bbox,
+        area=cand.area,
+        fill=cand.fill,
+        aspect=cand.aspect,
+        mean_residual=cand.mean_residual,
+        mean_appearance=cand.mean_appearance,
+        local_contrast=cand.local_contrast,
+        texture=cand.texture,
+        line_context=cand.line_context,
+        isolation=cand.isolation,
+        score=cand.score,
+    )
+    for attr in (
+        "map_score",
+        "attached_support",
+        "native_dark_score",
+        "sky_like",
+        "local_flow_score",
+        "local_flow_delta_px",
+        "local_flow_bg_sigma",
+        "local_flow_inside_n",
+        "local_flow_annulus_n",
+        "local_bg_residual",
+        "local_residual_ratio",
+        "local_comp_score",
+        "stab_x",
+        "stab_y",
+        "router_state",
+        "router_confidence",
+        "router_close_sky_like",
+        "router_close_texture",
+        "router_far_sky_like",
+        "router_far_texture",
+    ):
+        if hasattr(cand, attr):
+            setattr(seed, attr, getattr(cand, attr))
+    seed.recenter_seed_family = family
+    return seed
+
+
+def raw_low_rank_recenter_seed_candidates(
+    cheap_cands: list[base.Candidate],
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    families = _parse_source_set(getattr(args, "candidate_local_recenter_seed_families", "cheap"))
+    if "raw_low_rank" not in families or not cheap_cands:
+        return []
+
+    rank_min = max(1, int(getattr(args, "candidate_local_recenter_raw_seed_rank_min", 25)))
+    rank_max = max(rank_min, int(getattr(args, "candidate_local_recenter_raw_seed_rank_max", 400)))
+    top_k = max(0, int(getattr(args, "candidate_local_recenter_raw_seed_top_k", 48)))
+    if top_k <= 0:
+        return []
+    grid_px = max(1.0, float(getattr(args, "candidate_local_recenter_raw_seed_grid_px", 12.0)))
+    source_quota = parse_family_quota(getattr(args, "candidate_local_recenter_raw_seed_source_quota", ""))
+    if not source_quota:
+        source_quota = {"motion": 20, "appearance": 12, "map": 12, "native": 12, "large_dark": 8}
+    source_counts: dict[str, int] = {key: 0 for key in source_quota}
+    seen_cells: set[tuple[str, int, int]] = set()
+    out: list[base.Candidate] = []
+
+    ranked = sorted(cheap_cands, key=lambda cand: candidate_obs(cand, args), reverse=True)
+    for raw_rank, cand in enumerate(ranked, start=1):
+        if raw_rank < rank_min:
+            continue
+        if raw_rank > rank_max:
+            break
+        source_family = raw_seed_source_family(cand.source)
+        quota = source_quota.get(source_family, 0)
+        if quota <= 0 or source_counts.get(source_family, 0) >= quota:
+            continue
+        cx, cy = base.bbox_center(cand.bbox)
+        cell = (source_family, int(cx // grid_px), int(cy // grid_px))
+        if cell in seen_cells:
+            continue
+
+        seed = clone_recenter_seed(cand, "raw_low_rank_seed", "raw_low_rank")
+        seed.recenter_seed_raw_source = cand.source
+        seed.recenter_seed_raw_source_family = source_family
+        seed.recenter_seed_raw_rank = raw_rank
+        seed.recenter_seed_raw_score = float(cand.score)
+        seed.recenter_seed_raw_obs = float(candidate_obs(cand, args))
+        out.append(seed)
+        seen_cells.add(cell)
+        source_counts[source_family] = source_counts.get(source_family, 0) + 1
+        if len(out) >= top_k:
+            break
+
+    return out
+
+
+def path_state_recenter_seed_candidates(
+    states: list[PathState],
+    tbd: BeamTBD,
+    frame_no: int,
+    w_img: int,
+    h_img: int,
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    families = _parse_source_set(getattr(args, "candidate_local_recenter_seed_families", "cheap"))
+    if not ({"track_state", "previous_recenter"} & families):
+        return []
+
+    max_age = max(0, int(getattr(args, "candidate_local_recenter_track_state_max_age", 3)))
+    min_hits = max(0, int(getattr(args, "candidate_local_recenter_track_state_min_hits", 2)))
+    max_misses = max(0, int(getattr(args, "candidate_local_recenter_track_state_max_misses", 2)))
+    min_score = float(getattr(args, "candidate_local_recenter_track_state_min_verified_score", -5.0))
+    max_velocity = max(0.0, float(getattr(args, "candidate_local_recenter_track_state_max_velocity_px", 4.0)))
+    out: list[base.Candidate] = []
+
+    for st in states:
+        age = max(0, frame_no - st.last_frame)
+        if age > max_age or st.misses > max_misses or st.hit_count() < min_hits:
+            continue
+        score = float(tbd.verified_score(st))
+        if score < min_score:
+            continue
+
+        last_source = st.last_candidate.source if st.last_candidate is not None else "track_only"
+        family = "previous_recenter" if last_source == "candidate_local_recenter" else "track_state"
+        if family not in families:
+            continue
+
+        x, y, bw, bh = st.bbox
+        dt = max(1, age)
+        vx = float(st.vx)
+        vy = float(st.vy)
+        step = math.hypot(vx * dt, vy * dt)
+        if max_velocity > 0.0 and step > max_velocity * dt:
+            scale = (max_velocity * dt) / max(1e-6, step)
+            vx *= scale
+            vy *= scale
+        bbox = base.clip_bbox_float((x + vx * dt, y + vy * dt, bw, bh), w_img, h_img)
+        last = st.last_candidate
+        cand = base.Candidate(
+            source=f"{family}_seed",
+            bbox=bbox,
+            area=max(1, int(bbox[2] * bbox[3])),
+            fill=float(getattr(last, "fill", 1.0)) if last is not None else 1.0,
+            aspect=float(getattr(last, "aspect", 1.0)) if last is not None else 1.0,
+            mean_residual=float(getattr(last, "mean_residual", 0.0)) if last is not None else 0.0,
+            mean_appearance=float(getattr(last, "mean_appearance", 0.0)) if last is not None else 0.0,
+            local_contrast=float(getattr(last, "local_contrast", 0.0)) if last is not None else 0.0,
+            texture=float(getattr(last, "texture", 0.0)) if last is not None else 0.0,
+            line_context=float(getattr(last, "line_context", 0.0)) if last is not None else 0.0,
+            isolation=float(getattr(last, "isolation", 0.0)) if last is not None else 0.0,
+            score=score,
+        )
+        for attr in (
+            "map_score",
+            "attached_support",
+            "native_dark_score",
+            "sky_like",
+            "router_state",
+            "router_confidence",
+            "router_close_sky_like",
+            "router_close_texture",
+            "router_far_sky_like",
+            "router_far_texture",
+        ):
+            if last is not None and hasattr(last, attr):
+                setattr(cand, attr, getattr(last, attr))
+        cand.recenter_seed_family = family
+        cand.recenter_seed_track_id = st.sid
+        cand.recenter_seed_hits = st.hit_count()
+        cand.recenter_seed_misses = st.misses
+        cand.recenter_seed_age = age
+        cand.recenter_seed_verified_score = score
+        cand.recenter_seed_last_source = last_source
+        cand.recenter_seed_vx = st.vx
+        cand.recenter_seed_vy = st.vy
+        out.append(cand)
+
+    out.sort(key=lambda cand: float(getattr(cand, "score", 0.0)), reverse=True)
+    return out[: max(0, int(getattr(args, "candidate_local_recenter_track_state_seed_top_k", 24)))]
+
+
+def track_only_replay_seed_candidates(
+    states: list[PathState],
+    tbd: BeamTBD,
+    frame_no: int,
+    target_frame_no: int,
+    w_img: int,
+    h_img: int,
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    if not getattr(args, "candidate_local_recenter_track_only_replay", False):
+        return []
+
+    top_k = max(0, int(getattr(args, "candidate_local_recenter_track_only_replay_top_k", 32)))
+    rank_max = max(1, int(getattr(args, "candidate_local_recenter_track_only_replay_rank_max", 80)))
+    if top_k <= 0:
+        return []
+    max_misses = max(0, int(getattr(args, "candidate_local_recenter_track_only_replay_max_misses", 2)))
+    min_hits = max(0, int(getattr(args, "candidate_local_recenter_track_only_replay_min_hits", 1)))
+    max_age = max(0, int(getattr(args, "candidate_local_recenter_track_only_replay_max_age", 4)))
+    min_side = max(0.0, float(getattr(args, "candidate_local_recenter_track_only_replay_min_side", 3.0)))
+    max_side = max(min_side, float(getattr(args, "candidate_local_recenter_track_only_replay_max_side", 14.0)))
+    max_velocity = max(0.0, float(getattr(args, "candidate_local_recenter_track_state_max_velocity_px", 4.0)))
+    dt = max(1, int(target_frame_no - frame_no))
+    if dt > max_age:
+        return []
+
+    def has_replay_ancestry(st: PathState) -> bool:
+        last = st.last_candidate
+        if last is not None and getattr(last, "recenter_seed_family", "") == "track_only_replay":
+            return True
+        for hist in st.candidate_history[-4:]:
+            if hist and hist.get("recenter_seed_family") == "track_only_replay":
+                return True
+        return False
+
+    ranked = sorted(((float(tbd.verified_score(st)), st) for st in states), key=lambda item: item[0], reverse=True)
+    out: list[base.Candidate] = []
+    for rank, (score, st) in enumerate(ranked[:rank_max], start=1):
+        cand_is_current = st.misses == 0 and st.last_candidate is not None
+        if cand_is_current:
+            continue
+        if has_replay_ancestry(st):
+            continue
+        if st.misses > max_misses or st.hit_count() < min_hits:
+            continue
+        _x, _y, bw, bh = st.bbox
+        side = max(float(bw), float(bh))
+        if side < min_side or side > max_side:
+            continue
+
+        vx = float(st.vx)
+        vy = float(st.vy)
+        step = math.hypot(vx * dt, vy * dt)
+        if max_velocity > 0.0 and step > max_velocity * dt:
+            scale = (max_velocity * dt) / max(1e-6, step)
+            vx *= scale
+            vy *= scale
+        bbox = base.clip_bbox_float((st.bbox[0] + vx * dt, st.bbox[1] + vy * dt, bw, bh), w_img, h_img)
+        last = st.last_candidate
+        cand = base.Candidate(
+            source="track_only_replay_seed",
+            bbox=bbox,
+            area=max(1, int(bbox[2] * bbox[3])),
+            fill=float(getattr(last, "fill", 1.0)) if last is not None else 1.0,
+            aspect=float(getattr(last, "aspect", 1.0)) if last is not None else float(bbox[2]) / max(1.0, float(bbox[3])),
+            mean_residual=float(getattr(last, "mean_residual", 0.0)) if last is not None else 0.0,
+            mean_appearance=float(getattr(last, "mean_appearance", 0.0)) if last is not None else 0.0,
+            local_contrast=float(getattr(last, "local_contrast", 0.0)) if last is not None else 0.0,
+            texture=float(getattr(last, "texture", 0.0)) if last is not None else 0.0,
+            line_context=float(getattr(last, "line_context", 0.0)) if last is not None else 0.0,
+            isolation=float(getattr(last, "isolation", 1.0)) if last is not None else 1.0,
+            score=score,
+        )
+        for attr in (
+            "map_score",
+            "attached_support",
+            "native_dark_score",
+            "sky_like",
+            "router_state",
+            "router_confidence",
+            "router_close_sky_like",
+            "router_close_texture",
+            "router_far_sky_like",
+            "router_far_texture",
+        ):
+            if last is not None and hasattr(last, attr):
+                setattr(cand, attr, getattr(last, attr))
+        cand.recenter_seed_family = "track_only_replay"
+        cand.recenter_seed_track_id = st.sid
+        cand.recenter_seed_hits = st.hit_count()
+        cand.recenter_seed_misses = st.misses
+        cand.recenter_seed_age = dt
+        cand.recenter_seed_verified_score = score
+        cand.recenter_seed_last_source = "track_only"
+        cand.recenter_seed_vx = st.vx
+        cand.recenter_seed_vy = st.vy
+        cand.recenter_seed_raw_rank = rank
+        out.append(cand)
+        if len(out) >= top_k:
+            break
+
+    return out
+
+
+def select_candidate_local_recenter_seeds(
+    seed_cands: list[base.Candidate],
+    args: argparse.Namespace,
+) -> list[base.Candidate]:
+    limit = max(1, int(args.candidate_local_recenter_seed_top_k))
+    allowed_families = _parse_source_set(getattr(args, "candidate_local_recenter_seed_families", "cheap"))
+    if getattr(args, "candidate_local_recenter_track_only_replay", False):
+        allowed_families.add("track_only_replay")
+    if allowed_families:
+        seed_cands = [cand for cand in seed_cands if candidate_seed_family(cand) in allowed_families]
+    scored = sorted(seed_cands, key=lambda cand: candidate_obs(cand, args), reverse=True)
+    quotas = parse_family_quota(getattr(args, "candidate_local_recenter_seed_family_quota", ""))
+    if quotas:
+        kept: list[base.Candidate] = []
+        seen: set[int] = set()
+        for family, quota in quotas.items():
+            if quota <= 0:
+                continue
+            family_rows = [cand for cand in scored if candidate_seed_family(cand) == family]
+            for cand in family_rows[:quota]:
+                if len(kept) >= limit:
+                    break
+                kept.append(cand)
+                seen.add(id(cand))
+        for cand in scored:
+            if len(kept) >= limit:
+                break
+            if id(cand) not in seen:
+                kept.append(cand)
+                seen.add(id(cand))
+        return kept[:limit]
+
+    mode = getattr(args, "candidate_local_recenter_seed_mode", "score")
+    if mode != "spatial_grid":
+        return scored[:limit]
+
+    grid_px = max(4.0, float(getattr(args, "candidate_local_recenter_seed_grid_px", 24.0)))
+    best_by_cell: dict[tuple[int, int], tuple[float, base.Candidate]] = {}
+    for cand in scored:
+        cx, cy = base.bbox_center(cand.bbox)
+        cell = (int(cx // grid_px), int(cy // grid_px))
+        obs = candidate_obs(cand, args)
+        previous = best_by_cell.get(cell)
+        if previous is None or obs > previous[0]:
+            best_by_cell[cell] = (obs, cand)
+
+    kept: list[base.Candidate] = [
+        cand for _obs, cand in sorted(best_by_cell.values(), key=lambda item: item[0], reverse=True)
+    ][:limit]
+    seen = {id(cand) for cand in kept}
+    for cand in scored:
+        if len(kept) >= limit:
+            break
+        if id(cand) not in seen:
+            kept.append(cand)
+            seen.add(id(cand))
+    return kept
 
 
 def candidate_local_recenter_candidates(
@@ -1596,29 +3059,33 @@ def candidate_local_recenter_candidates(
         ]
         if scoped:
             seed_pool = scoped
-    seed_pool = sorted(seed_pool, key=lambda cand: candidate_obs(cand, args), reverse=True)[
-        : max(1, args.candidate_local_recenter_seed_top_k)
-    ]
+    seed_pool = select_candidate_local_recenter_seeds(seed_pool, args)
 
     full_g = base.ensure_gray(cur_full)
-    score_maps = {
-        r: compact_dark_map_native(full_g, r, args.candidate_local_recenter_texture_weight)
-        for r in parse_radii(args.candidate_local_recenter_radii)
-    }
+    score_maps = build_recenter_score_maps(
+        full_g,
+        parse_radii(args.candidate_local_recenter_radii),
+        parse_response_maps(getattr(args, "candidate_local_recenter_response_maps", "compact_dark")),
+        args.candidate_local_recenter_texture_weight,
+    )
     side = max(3, int(round(args.candidate_local_recenter_box_det_px)))
     h_img, w_img = cur_g.shape[:2]
     cands: list[base.Candidate] = []
     occupied: list[base.Candidate] = []
-    for seed in seed_pool:
+    for seed_rank, seed in enumerate(seed_pool, start=1):
         seed_cx, seed_cy = base.bbox_center(seed.bbox)
-        peaks = local_native_peaks_near(
+        peaks = local_native_peaks_near_with_meta(
             score_maps,
             (seed_cx / downscale, seed_cy / downscale),
             args.candidate_local_recenter_radius_det_px / downscale,
-            max(1, min(4, args.candidate_local_recenter_top_k)),
+            max(1, min(getattr(args, "candidate_local_recenter_peaks_per_seed", 4), args.candidate_local_recenter_top_k)),
         )
         seed_score = max(0.0, min(30.0, candidate_obs(seed, args)))
-        for peak_score, x_full, y_full, _radius in peaks:
+        for peak in peaks:
+            peak_score = float(peak["score"])
+            x_full = float(peak["x"])
+            y_full = float(peak["y"])
+            radius = int(peak["radius"])
             cx = x_full * downscale
             cy = y_full * downscale
             shift_det = math.hypot(cx - seed_cx, cy - seed_cy)
@@ -1634,17 +3101,192 @@ def candidate_local_recenter_candidates(
                 + args.candidate_local_recenter_score_weight * recentered_score
                 + args.candidate_local_recenter_seed_score_weight * seed_score
             )
+            cand.router_state = getattr(seed, "router_state", cand.router_state)
+            cand.router_confidence = getattr(seed, "router_confidence", cand.router_confidence)
+            cand.sky_like = getattr(seed, "sky_like", cand.sky_like)
+            cand.router_close_sky_like = getattr(seed, "router_close_sky_like", cand.router_close_sky_like)
+            cand.router_close_texture = getattr(seed, "router_close_texture", cand.router_close_texture)
+            cand.router_far_sky_like = getattr(seed, "router_far_sky_like", cand.router_far_sky_like)
+            cand.router_far_texture = getattr(seed, "router_far_texture", cand.router_far_texture)
+            cand.recenter_parent_source = seed.source
+            cand.recenter_parent_router_state = getattr(seed, "router_state", "unrouted")
+            cand.recenter_parent_score = float(getattr(seed, "score", 0.0))
+            cand.recenter_parent_bbox = tuple(seed.bbox)
+            cand.recenter_seed_family = candidate_seed_family(seed)
+            cand.recenter_seed_track_id = getattr(seed, "recenter_seed_track_id", "")
+            cand.recenter_seed_hits = getattr(seed, "recenter_seed_hits", "")
+            cand.recenter_seed_misses = getattr(seed, "recenter_seed_misses", "")
+            cand.recenter_seed_age = getattr(seed, "recenter_seed_age", "")
+            cand.recenter_seed_verified_score = getattr(seed, "recenter_seed_verified_score", "")
+            cand.recenter_seed_last_source = getattr(seed, "recenter_seed_last_source", "")
+            cand.recenter_seed_raw_source = getattr(seed, "recenter_seed_raw_source", "")
+            cand.recenter_seed_raw_source_family = getattr(seed, "recenter_seed_raw_source_family", "")
+            cand.recenter_seed_raw_rank = getattr(seed, "recenter_seed_raw_rank", "")
+            cand.recenter_seed_raw_score = getattr(seed, "recenter_seed_raw_score", "")
+            cand.recenter_seed_raw_obs = getattr(seed, "recenter_seed_raw_obs", "")
+            cand.recenter_shift_det = shift_det
+            cand.recenter_peak_radius = radius
+            cand.recenter_peak_score = float(peak_score)
+            cand.recenter_second_peak_margin = float(peak.get("second_peak_margin", 0.0))
+            cand.recenter_seed_rank = int(seed_rank)
+            cand.recenter_seed_score = seed_score
+            cand.recenter_response_family = str(peak.get("response_family", "compact_dark"))
+            cand.recenter_response_map = str(peak.get("response_map", "compact_dark"))
+            cand.recenter_response_radius = radius
+            cand.recenter_response_score = float(peak_score)
+            cand.recenter_response_local_rank = int(peak.get("local_rank", 0))
+            cand.recenter_subpixel_dx = float(peak.get("subpixel_dx", 0.0)) * downscale
+            cand.recenter_subpixel_dy = float(peak.get("subpixel_dy", 0.0)) * downscale
+            cand.recenter_subpixel_method = str(peak.get("subpixel_method", "integer"))
+            cand.recenter_subpixel_condition = float(peak.get("subpixel_condition", 0.0))
             if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
                 continue
             occupied.append(cand)
             cands.append(cand)
-            if len(cands) >= args.candidate_local_recenter_top_k:
-                return sorted(cands, key=lambda c: c.score, reverse=True)
-    return sorted(cands, key=lambda c: c.score, reverse=True)
+    return sorted(cands, key=lambda c: c.score, reverse=True)[: args.candidate_local_recenter_top_k]
+
+
+def target_local_anchor_bank_predictions(
+    anchor: RuntimeLocalAnchor,
+    frame_no: int,
+    w_img: int,
+    h_img: int,
+    args: argparse.Namespace,
+) -> list[tuple[tuple[int, int, int, int], str]]:
+    dt = max(1, anchor.age(frame_no))
+    x, y, w, h = anchor.bbox
+    vx = float(anchor.vx)
+    vy = float(anchor.vy)
+    max_step = max(0.0, float(getattr(args, "target_local_recovery_max_velocity_px", 3.0))) * dt
+    speed = math.hypot(vx * dt, vy * dt)
+    if max_step > 0.0 and speed > max_step:
+        scale = max_step / max(1e-6, speed)
+        vx *= scale
+        vy *= scale
+    base_preds = [
+        ((x, y, w, h), "previous"),
+        ((x + vx * dt, y + vy * dt, w, h), "clamped_velocity"),
+    ]
+    offsets = parse_xy_offsets(getattr(args, "target_local_anchor_bank_offsets", "0:0"))
+    out: list[tuple[tuple[int, int, int, int], str]] = []
+    seen: set[tuple[int, int, int, int, str]] = set()
+    for raw_bbox, method in base_preds:
+        bx, by, bw, bh = raw_bbox
+        for dx, dy in offsets:
+            bbox = base.clip_bbox_float((bx + dx, by + dy, bw, bh), w_img, h_img)
+            suffix = "center" if abs(dx) < 1e-6 and abs(dy) < 1e-6 else f"off{dx:g}_{dy:g}"
+            key = (bbox[0], bbox[1], bbox[2], bbox[3], method)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((bbox, f"{method}_{suffix}"))
+    return out
+
+
+def target_local_anchor_bank_candidates(
+    anchor_bank: RuntimeAnchorBank,
+    frame_no: int,
+    w_img: int,
+    h_img: int,
+    cur_full: np.ndarray | None,
+    downscale: float,
+    residual_blur: np.ndarray,
+    app_resp: np.ndarray,
+    cur_g: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[list[base.Candidate], dict[str, object]]:
+    if not args.target_local_anchor_bank_proposals or cur_full is None or downscale <= 0:
+        return [], {"enabled": bool(args.target_local_anchor_bank_proposals), "used": False}
+    start = time.perf_counter()
+    budget_ms = max(0.0, float(getattr(args, "target_local_anchor_bank_max_ms", 4.0)))
+    full_g = base.ensure_gray(cur_full)
+    score_maps = {
+        r: compact_dark_map_native(full_g, r, args.target_local_anchor_bank_texture_weight)
+        for r in parse_radii(args.target_local_anchor_bank_radii)
+    }
+    max_predictions = max(1, int(getattr(args, "target_local_anchor_bank_max_predictions", 10)))
+    peaks_per_prediction = max(1, int(getattr(args, "target_local_anchor_bank_peaks_per_prediction", 2)))
+    top_k = max(1, int(getattr(args, "target_local_anchor_bank_top_k", 8)))
+    side_floor = max(3, int(round(getattr(args, "target_local_anchor_bank_min_side", 4.0))))
+    cands: list[base.Candidate] = []
+    occupied: list[base.Candidate] = []
+    prediction_count = 0
+    budget_hit = False
+    for anchor in anchor_bank.anchors[: max(1, int(getattr(args, "target_local_anchor_bank_max_anchors", 2)))]:
+        predictions = target_local_anchor_bank_predictions(anchor, frame_no, w_img, h_img, args)
+        for predicted, method in predictions:
+            if prediction_count >= max_predictions:
+                break
+            elapsed_ms = (time.perf_counter() - start) * 1000.0
+            if budget_ms > 0.0 and elapsed_ms > budget_ms:
+                budget_hit = True
+                break
+            prediction_count += 1
+            pred_cx, pred_cy = base.bbox_center(predicted)
+            peaks = local_native_peaks_near(
+                score_maps,
+                (pred_cx / downscale, pred_cy / downscale),
+                args.target_local_recovery_search_radius_det_px / downscale,
+                peaks_per_prediction,
+            )
+            for peak_score, x_full, y_full, _radius in peaks:
+                cx = x_full * downscale
+                cy = y_full * downscale
+                side = max(side_floor, int(round(anchor.bbox[2])))
+                bbox = base.clip_bbox_float((cx - 0.5 * side, cy - 0.5 * side, side, side), w_img, h_img)
+                if anchor_bank.in_quarantine(bbox, frame_no):
+                    continue
+                shift_det = math.hypot(cx - pred_cx, cy - pred_cy)
+                recentered_score = float(peak_score - args.target_local_anchor_bank_shift_penalty * shift_det)
+                if recentered_score < args.target_local_anchor_bank_min_map_score:
+                    continue
+                x, y, w, h = bbox
+                mask = np.zeros_like(cur_g, dtype=np.uint8)
+                mask[y : y + h, x : x + w] = 255
+                cand = base.candidate_score("target_local_anchor_bank", bbox, max(1, w * h), residual_blur, app_resp, mask, cur_g)
+                cand.map_score = recentered_score
+                cand.score = (
+                    0.35 * float(cand.score)
+                    + args.target_local_anchor_bank_score_weight * recentered_score
+                    + args.target_local_anchor_bank_anchor_trust_weight * anchor.trust_score
+                )
+                cand.anchor_id = anchor.aid
+                cand.anchor_source = anchor.source
+                cand.anchor_age = anchor.age(frame_no)
+                cand.anchor_trust = anchor.trust_score
+                cand.anchor_prediction = method
+                cand.anchor_shift_px = shift_det
+                cand.target_local_anchor_id = anchor.aid
+                cand.target_local_anchor_source = anchor.source
+                cand.target_local_anchor_age = anchor.age(frame_no)
+                cand.target_local_anchor_trust = anchor.trust_score
+                cand.target_local_anchor_method = method
+                cand.target_local_anchor_shift_px = shift_det
+                if cand.score <= 0.1 or candidate_duplicate(cand, occupied):
+                    continue
+                occupied.append(cand)
+                cands.append(cand)
+                if len(cands) >= top_k:
+                    break
+            if len(cands) >= top_k or budget_hit:
+                break
+        if len(cands) >= top_k or budget_hit or prediction_count >= max_predictions:
+            break
+    cands = sorted(cands, key=lambda c: c.score, reverse=True)[:top_k]
+    elapsed_ms = (time.perf_counter() - start) * 1000.0
+    return cands, {
+        "enabled": True,
+        "used": bool(cands),
+        "anchors": len(anchor_bank.anchors),
+        "predictions": prediction_count,
+        "candidates": len(cands),
+        "budget_hit": budget_hit,
+        "elapsed_ms": round(elapsed_ms, 3),
+    }
 
 
 def candidate_scenario(cand: base.Candidate, use_router: bool = False) -> str:
-    if cand.source in {"hybrid_coast", "target_local_recovery"}:
+    if cand.source in {"hybrid_coast", "target_local_recovery", "target_local_anchor_bank", "target_local_path_bank"}:
         return "coast"
     if cand.source == "large_dark" or max(cand.bbox[2], cand.bbox[3]) >= 10:
         return "large"
@@ -2536,6 +4178,8 @@ def state_feature_row(
         for key, value in cand_json.items():
             if isinstance(value, (int, float, str)):
                 row[f"cand_{key}"] = value
+            elif isinstance(value, (list, tuple)):
+                row[f"cand_{key}"] = json.dumps(value)
     for key, value in features.items():
         row[f"tube_{key}"] = float(value)
     return row
@@ -3155,6 +4799,238 @@ def target_local_state_select_override(
     return chosen, info
 
 
+def srps_verified_state_select_override(
+    selected: PathState | None,
+    states: list[PathState],
+    tbd: BeamTBD,
+    args: argparse.Namespace,
+) -> tuple[PathState | None, dict[str, object]]:
+    info: dict[str, object] = {"enabled": bool(getattr(args, "srps_verified_candidate_priority", False)), "used": False}
+    if not getattr(args, "srps_verified_candidate_priority", False):
+        return selected, info
+    current: list[PathState] = []
+    for st in states:
+        if st.misses != 0 or st.last_candidate is None:
+            continue
+        cand = st.last_candidate
+        if int(getattr(cand, "srps_verified_path", 0) or 0) != 1:
+            continue
+        if str(getattr(cand, "srps_state", "")) not in {"confirmed_path", "coast"}:
+            continue
+        current.append(st)
+    info["candidates"] = len(current)
+    if not current:
+        info["reason"] = "no_current_verified_srps"
+        return selected, info
+
+    def srps_key(st: PathState) -> tuple[float, float, float, int]:
+        cand = st.last_candidate
+        return (
+            float(getattr(cand, "srps_verification_score", 0.0) or 0.0),
+            float(getattr(cand, "srps_path_confidence", 0.0) or 0.0),
+            float(tbd.verified_score(st)),
+            st.hit_count(),
+        )
+
+    best = max(current, key=srps_key)
+    if selected is not None and selected.sid == best.sid and selected.bbox == best.bbox:
+        info["reason"] = "already_selected"
+        return selected, info
+    selected_has_verified_srps = (
+        selected is not None
+        and selected.misses == 0
+        and selected.last_candidate is not None
+        and int(getattr(selected.last_candidate, "srps_verified_path", 0) or 0) == 1
+    )
+    if selected_has_verified_srps and srps_key(selected) >= srps_key(best):
+        info["reason"] = "selected_verified_srps_stronger"
+        return selected, info
+    cand = best.last_candidate
+    info.update(
+        {
+            "used": True,
+            "reason": "srps_verified_priority",
+            "selected_track_id": None if selected is None else selected.sid,
+            "srps_track_id": best.sid,
+            "srps_state": str(getattr(cand, "srps_state", "")),
+            "srps_seed_source": str(getattr(cand, "srps_seed_source", "")),
+            "srps_verification_score": round(float(getattr(cand, "srps_verification_score", 0.0) or 0.0), 6),
+        }
+    )
+    return best, info
+
+
+def replay_handoff_source(st: PathState) -> str:
+    if st.misses > 0 or st.last_candidate is None:
+        return "track_only"
+    return st.last_candidate.source or "track_only"
+
+
+def replay_handoff_candidate_json(st: PathState) -> dict:
+    if st.misses == 0 and st.last_candidate is not None:
+        return st.last_candidate.to_json()
+    for cand in reversed(st.candidate_history):
+        if isinstance(cand, dict):
+            return cand
+    return {}
+
+
+def replay_handoff_metric(st: PathState, features: dict[str, float], key: str) -> float:
+    cand = replay_handoff_candidate_json(st)
+    if key == "line_context":
+        return max(float(cand.get("line_context", 0.0) or 0.0), float(features.get("mean_line_context", 0.0)))
+    if key == "attached_support":
+        return max(
+            float(cand.get("attached_support", 0.0) or 0.0),
+            float(features.get("mean_attached_support", 0.0)),
+        )
+    if key == "map_score":
+        return max(
+            float(cand.get("map_score", 0.0) or 0.0),
+            float(cand.get("recenter_peak_score", 0.0) or 0.0),
+            float(cand.get("recenter_response_score", 0.0) or 0.0),
+            float(features.get("mean_map_score", 0.0)),
+        )
+    if key == "recenter_shift":
+        return float(cand.get("recenter_shift_det", 0.0) or 0.0)
+    return 0.0
+
+
+def replay_handoff_key(st: PathState) -> str:
+    cand = replay_handoff_candidate_json(st)
+    seed = str(cand.get("recenter_seed_track_id", "")).strip()
+    if seed:
+        return f"seed:{seed}"
+    return f"track:{st.sid}"
+
+
+def replay_handoff_target_local_confirmed(st: PathState, features: dict[str, float]) -> bool:
+    return (
+        replay_handoff_source(st) == "target_local_recovery"
+        and st.hit_count() >= 2
+        and float(features.get("positive_pair_rate", 0.0)) >= 0.25
+    )
+
+
+class ReplayHandoffSelector:
+    """Bounded source-scoped selected-output handoff over existing TBD states."""
+
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.recent: deque[tuple[int, str]] = deque(maxlen=max(1, int(args.replay_handoff_window)))
+        self.last_info: dict[str, object] = {"enabled": bool(args.replay_handoff_select), "used": False}
+
+    def state_reject_reasons(self, st: PathState, rank: int, features: dict[str, float]) -> list[str]:
+        args = self.args
+        reasons: list[str] = []
+        source = replay_handoff_source(st)
+        allowed_sources = _parse_source_set(args.replay_handoff_sources)
+        if rank > args.replay_handoff_max_rank:
+            reasons.append("rank")
+        if source not in allowed_sources:
+            if not (
+                getattr(args, "replay_handoff_allow_target_local_recovery", False)
+                and replay_handoff_target_local_confirmed(st, features)
+            ):
+                reasons.append("source")
+        if source == "target_local_recovery" and not replay_handoff_target_local_confirmed(st, features):
+            reasons.append("target_local_recovery_unconfirmed")
+        if st.hit_count() < args.replay_handoff_min_hits:
+            reasons.append("hits")
+        if st.misses > args.replay_handoff_max_misses:
+            reasons.append("misses")
+        _x, _y, bw, bh = st.bbox
+        side = max(float(bw), float(bh))
+        if side < args.replay_handoff_min_side or side > args.replay_handoff_max_side:
+            reasons.append("side")
+        line = replay_handoff_metric(st, features, "line_context")
+        support = replay_handoff_metric(st, features, "attached_support")
+        if line > args.replay_handoff_max_line_context:
+            reasons.append("line_context")
+        if support > args.replay_handoff_max_attached_support:
+            reasons.append("attached_support")
+        if source == "candidate_local_recenter":
+            if replay_handoff_metric(st, features, "map_score") < args.replay_handoff_min_map_score:
+                reasons.append("map_score")
+            if replay_handoff_metric(st, features, "recenter_shift") > args.replay_handoff_max_shift_det:
+                reasons.append("recenter_shift")
+        return reasons
+
+    def state_score(self, st: PathState, rank: int, features: dict[str, float]) -> float:
+        line = replay_handoff_metric(st, features, "line_context")
+        support = replay_handoff_metric(st, features, "attached_support")
+        shift = replay_handoff_metric(st, features, "recenter_shift")
+        map_score = replay_handoff_metric(st, features, "map_score")
+        return float(
+            map_score
+            + 0.05 * min(10, st.hit_count())
+            + (0.20 if replay_handoff_key(st).startswith("seed:") else 0.0)
+            - 0.012 * max(0, rank - 1)
+            - 0.80 * line
+            - 0.04 * support
+            - 0.03 * shift
+        )
+
+    def choose(
+        self,
+        frame_no: int,
+        selected: PathState | None,
+        states: list[PathState],
+        tbd: BeamTBD,
+    ) -> tuple[PathState | None, dict[str, object]]:
+        info: dict[str, object] = {"enabled": bool(self.args.replay_handoff_select), "used": False}
+        self.last_info = info
+        if not self.args.replay_handoff_select:
+            return selected, info
+
+        ranked = sorted(states, key=lambda st: tbd.verified_score(st), reverse=True)
+        eligible: list[tuple[float, int, PathState, dict[str, float]]] = []
+        reject_counts: Counter[str] = Counter()
+        for rank, st in enumerate(ranked, start=1):
+            features = tube_features(st)
+            reasons = self.state_reject_reasons(st, rank, features)
+            if reasons:
+                reject_counts.update(reasons)
+                continue
+            eligible.append((self.state_score(st, rank, features), rank, st, features))
+
+        info["eligible_count"] = len(eligible)
+        info["reject_counts"] = dict(sorted(reject_counts.items()))
+        if not eligible:
+            info["reason"] = "no_eligible"
+            return selected, info
+
+        score, rank, chosen, features = max(eligible, key=lambda item: item[0])
+        key = replay_handoff_key(chosen)
+        self.recent.append((frame_no, key))
+        recent_window = max(1, int(self.args.replay_handoff_window))
+        recent_hits = sum(1 for f, k in self.recent if frame_no - f < recent_window and k == key)
+        info.update(
+            {
+                "reason": "candidate",
+                "candidate_rank": rank,
+                "candidate_track_id": chosen.sid,
+                "candidate_source": replay_handoff_source(chosen),
+                "candidate_key": key,
+                "candidate_score": round(float(score), 3),
+                "candidate_hits": chosen.hit_count(),
+                "candidate_misses": chosen.misses,
+                "line_context": round(replay_handoff_metric(chosen, features, "line_context"), 3),
+                "attached_support": round(replay_handoff_metric(chosen, features, "attached_support"), 3),
+                "map_score": round(replay_handoff_metric(chosen, features, "map_score"), 3),
+                "recenter_shift": round(replay_handoff_metric(chosen, features, "recenter_shift"), 3),
+                "continuity_hits": recent_hits,
+            }
+        )
+        if not self.args.replay_handoff_diagnostic_same_frame and recent_hits < self.args.replay_handoff_promote_hits:
+            info["reason"] = "continuity_wait"
+            return selected, info
+
+        info["used"] = True
+        info["reason"] = "replay_handoff_select"
+        return chosen, info
+
+
 class DelayedSequenceSelector:
     """Small delayed Viterbi selector over recent detector states.
 
@@ -3443,6 +5319,8 @@ def tube_state_payload(
         for key, value in cand_json.items():
             if isinstance(value, (int, float, str)):
                 row[f"cand_{key}"] = value
+            elif isinstance(value, (list, tuple)):
+                row[f"cand_{key}"] = json.dumps(value)
     for key, value in features.items():
         row[f"tube_{key}"] = round(float(value), 6)
     return payload, row
@@ -3509,6 +5387,7 @@ def append_selected_output(
     if not args.stream_only:
         selected_rows.append([frame_no, selected.sid, *selected.bbox, selected.score(), selected.misses])
         _payload, row = tube_state_payload(frame_no, 1, selected, tbd, args, selected)
+        row["selected_source"] = selected_source
         selected_feature_rows.append(row)
     if selected_jsonl_handle is not None:
         record = {
@@ -3646,6 +5525,7 @@ def run(args: argparse.Namespace) -> None:
     px_per_frame = base.kinematic_px_per_frame(w_img, fps_src, args)
     tbd = BeamTBD(args, px_per_frame)
     delayed_selector = DelayedSequenceSelector(args) if args.delayed_sequence_select else None
+    replay_handoff_selector = ReplayHandoffSelector(args) if args.replay_handoff_select else None
     selected_jsonl_handle = None
     if args.selected_jsonl:
         selected_jsonl_path = Path(args.selected_jsonl)
@@ -3679,7 +5559,51 @@ def run(args: argparse.Namespace) -> None:
     candidate_router_counts_total: dict[str, int] = {}
     motion_model_mask_boxes: list[tuple[int, int, int, int]] = []
     target_local_recovery_seed: TargetLocalRecoverySeed | None = None
+    target_local_anchor_bank = RuntimeAnchorBank(args)
+    teacher_scale = args.srps_teacher_coord_scale if args.srps_teacher_coord_scale > 0 else args.downscale
+    srps_teacher_residuals = load_srps_teacher_residuals(args.srps_teacher_residual_proposals_csv, teacher_scale)
+    srps_teacher_sources = load_srps_teacher_sources(
+        args.srps_teacher_candidate_csv,
+        args.srps_teacher_candidate_coord_scale,
+        _parse_source_set(args.srps_source_candidates),
+    )
+    srps_source = StabilizedResidualPathSource(
+        SRPSConfig(
+            residual_top=args.srps_residual_top,
+            snap_radius=args.srps_snap_radius,
+            follow_gate=args.srps_gate,
+            seed_gate=args.srps_gate,
+            seed_window=args.srps_seed_window,
+            seed_required_hits=args.srps_seed_required_hits,
+            max_misses_after_confirm=args.srps_max_misses,
+            max_confirmed_age=args.srps_max_confirmed_age if args.srps_disable_stale_confirmed_paths else 10**9,
+            max_emit_per_frame=args.srps_max_emit_per_frame,
+            seed_score_weight=args.srps_seed_score_weight,
+            seed_rank_penalty=args.srps_seed_rank_penalty,
+            seed_beta=args.srps_seed_beta,
+            follow_beta=args.srps_follow_beta,
+            default_box_size=args.srps_residual_box_det_px,
+            multi_seed_compete=args.srps_multi_seed_compete,
+            confirm_requires_verified_seed=args.srps_confirm_requires_verified_seed,
+            reconfirm_on_recovery_epoch=args.srps_reconfirm_on_recovery_epoch,
+            false_path_veto=args.srps_false_path_veto,
+            verified_seed_score=args.srps_verified_seed_score,
+            verified_replacement_margin=args.srps_verified_replacement_margin,
+            residual_density_radius=args.srps_residual_density_radius,
+            residual_density_threshold=args.srps_residual_density_threshold,
+            disable_global_residual_seed=args.srps_disable_global_residual_seed,
+            do_not_hijack_stable_track=args.srps_do_not_hijack_stable_track,
+            coord_space="detector",
+        )
+    )
+    srps_was_active = False
+    srps_runtime_residual_rows: list[dict] = []
+    srps_seed_rows: list[dict] = []
+    srps_path_rows: list[dict] = []
     target_local_state_select_count = 0
+    srps_verified_select_count = 0
+    replay_handoff_select_count = 0
+    pending_track_only_replay_seeds: list[tuple[int, list[base.Candidate]]] = []
 
     while True:
         if args.max_frames is not None and fno >= args.max_frames:
@@ -3804,7 +5728,15 @@ def run(args: argparse.Namespace) -> None:
         stack_cands: list[base.Candidate] = []
         hybrid_coast_cands: list[base.Candidate] = []
         target_local_recovery_cands: list[base.Candidate] = []
+        target_local_anchor_bank_cands: list[base.Candidate] = []
+        srps_cands: list[base.Candidate] = []
+        target_local_anchor_bank_info: dict[str, object] = {
+            "enabled": bool(args.target_local_anchor_bank_proposals),
+            "used": False,
+        }
+        target_local_anchor_bank_ms = 0.0
         candidate_local_recenter_cands: list[base.Candidate] = []
+        track_only_replay_seed_cands: list[base.Candidate] = []
         routed_cheap: list[base.Candidate] = []
         cheap_limit = (
             max(args.top_k_candidates, int(round(args.top_k_candidates * args.scenario_pool_factor)))
@@ -3868,8 +5800,34 @@ def run(args: argparse.Namespace) -> None:
                 cur_g,
                 args,
             )
+        if args.candidate_local_recenter_track_only_replay:
+            still_pending: list[tuple[int, list[base.Candidate]]] = []
+            max_age = max(0, int(getattr(args, "candidate_local_recenter_track_only_replay_max_age", 4)))
+            for target_frame, seeds in pending_track_only_replay_seeds:
+                if target_frame == fno:
+                    track_only_replay_seed_cands.extend(seeds)
+                elif target_frame > fno:
+                    still_pending.append((target_frame, seeds))
+                elif fno - target_frame <= max_age:
+                    track_only_replay_seed_cands.extend(seeds)
+            pending_track_only_replay_seeds = still_pending
         if args.candidate_local_recenter_proposals:
             recenter_seed_cands = routed_cheap if routed_cheap else dedupe_candidates(cheap_cands, cheap_limit, None)
+            raw_seed_cands = raw_low_rank_recenter_seed_candidates(cheap_cands, args)
+            state_seed_cands = path_state_recenter_seed_candidates(
+                tbd.states,
+                tbd,
+                fno,
+                w_img,
+                h_img,
+                args,
+            )
+            if raw_seed_cands:
+                recenter_seed_cands = list(recenter_seed_cands) + raw_seed_cands
+            if state_seed_cands:
+                recenter_seed_cands = list(recenter_seed_cands) + state_seed_cands
+            if track_only_replay_seed_cands:
+                recenter_seed_cands = list(recenter_seed_cands) + track_only_replay_seed_cands
             candidate_local_recenter_cands = candidate_local_recenter_candidates(
                 recenter_seed_cands,
                 cur_full,
@@ -3892,8 +5850,123 @@ def run(args: argparse.Namespace) -> None:
                 cur_g,
                 args,
             )
+        if args.target_local_anchor_bank_proposals:
+            anchor_start = time.perf_counter()
+            target_local_anchor_bank.update_from_candidates(
+                fno,
+                candidate_local_recenter_cands + target_local_recovery_cands,
+            )
+            target_local_anchor_bank_cands, target_local_anchor_bank_info = target_local_anchor_bank_candidates(
+                target_local_anchor_bank,
+                fno,
+                w_img,
+                h_img,
+                cur_full,
+                args.downscale,
+                residual_blur,
+                app_resp,
+                cur_g,
+                args,
+            )
+            target_local_anchor_bank_ms = (time.perf_counter() - anchor_start) * 1000.0
+        srps_active = srps_should_run(args, frame_decision, surface_extras_allowed)
+        if srps_active:
+            srps_seed_pool = cheap_cands + candidate_local_recenter_cands + target_local_recovery_cands
+            if srps_teacher_residuals:
+                srps_residuals = srps_teacher_residuals.get(fno, [])
+            else:
+                srps_residual_map = residual_blur
+                if args.srps_residual_source in {"temporal_combo", "temporal_dark_fullres"} and cur_full is not None:
+                    temp_map_full = temporal_stack_residual_map(
+                        base.ensure_gray(cur_full),
+                        temporal_history,
+                        parse_int_offsets(args.temporal_stack_offsets),
+                        max(2, int(args.temporal_stack_min_frames)),
+                        args.downscale,
+                        args,
+                    )
+                    if args.srps_residual_source == "temporal_dark_fullres" and temp_map_full is not None:
+                        srps_residuals = srps_residual_candidates_from_full_map(
+                            fno,
+                            temp_map_full,
+                            args.downscale,
+                            args,
+                        )
+                    elif temp_map_full is not None:
+                        srps_residual_map = cv2.resize(
+                            temp_map_full,
+                            (w_img, h_img),
+                            interpolation=cv2.INTER_AREA if args.downscale < 1.0 else cv2.INTER_LINEAR,
+                        )
+                        srps_residuals = srps_residual_candidates_from_map(fno, srps_residual_map, args)
+                    else:
+                        srps_residuals = srps_residual_candidates_from_map(fno, srps_residual_map, args)
+                else:
+                    srps_residuals = srps_residual_candidates_from_map(fno, srps_residual_map, args)
+            srps_sources = (
+                srps_teacher_sources.get(fno, [])
+                if srps_teacher_sources
+                else srps_source_candidates_from_base(fno, srps_seed_pool, args)
+            )
+            if args.srps_dump_runtime_residual_proposals:
+                for prop in srps_residuals[: args.srps_residual_top]:
+                    srps_runtime_residual_rows.append(
+                        {
+                            "frame": fno,
+                            "rank": prop.rank,
+                            "cx": round(float(prop.cx), 3),
+                            "cy": round(float(prop.cy), 3),
+                            "score": round(float(prop.score), 6),
+                            "source": str(
+                                prop.payload.get("source", args.srps_residual_source)
+                                if isinstance(prop.payload, dict)
+                                else args.srps_residual_source
+                            ),
+                            "teacher_injected": int(bool(srps_teacher_residuals)),
+                        }
+                    )
+            if args.srps_dump_seed_candidates:
+                for src_cand in srps_sources[: args.srps_source_top_k]:
+                    srps_seed_rows.append(
+                        {
+                            "frame": fno,
+                            "source": src_cand.source,
+                            "rank": src_cand.rank,
+                            "cx": round(float(src_cand.cx), 3),
+                            "cy": round(float(src_cand.cy), 3),
+                            "score": round(float(src_cand.score), 6),
+                        }
+                    )
+            srps_base_state = srps_base_state_from_tbd(tbd, args)
+            srps_emitted = srps_source.update(
+                fno,
+                srps_sources,
+                srps_residuals,
+                SRPSBaseState(
+                    state=srps_base_state.state,
+                    stable_t=srps_base_state.stable_t,
+                    low_confidence=srps_base_state.low_confidence,
+                    router=srps_base_state.router,
+                    recovery_epoch=not srps_was_active,
+                ),
+            )
+            if args.srps_dump_path_candidates:
+                srps_path_rows.extend(cand.to_row() for cand in srps_emitted)
+            srps_cands = [
+                srps_to_base_candidate(srps, residual_blur, app_resp, cur_g, args)
+                for srps in srps_emitted[: max(1, int(args.srps_max_emit_per_frame))]
+            ]
+        srps_was_active = srps_active
         t_proposals = time.perf_counter()
-        raw_cands = cheap_cands + stack_cands + hybrid_coast_cands + candidate_local_recenter_cands + target_local_recovery_cands
+        raw_cands = (
+            cheap_cands
+            + stack_cands
+            + hybrid_coast_cands
+            + candidate_local_recenter_cands
+            + target_local_recovery_cands
+            + target_local_anchor_bank_cands
+            + srps_cands
+        )
         if args.native_roi_score:
             assign_native_roi_scores(raw_cands, cur_full, args.downscale)
         preselect_score = (
@@ -3938,9 +6011,30 @@ def run(args: argparse.Namespace) -> None:
         t_scenario = time.perf_counter()
 
         states = tbd.update(fno, cands, signed_diff, signed_sigma, w_img, h_img, chosen["h"], residual_blur, app_resp)
+        if args.candidate_local_recenter_track_only_replay:
+            replay_delay = max(1, int(getattr(args, "candidate_local_recenter_track_only_replay_delay", 1)))
+            replay_seeds = track_only_replay_seed_candidates(
+                states,
+                tbd,
+                fno,
+                fno + replay_delay,
+                w_img,
+                h_img,
+                args,
+            )
+            if replay_seeds:
+                pending_track_only_replay_seeds.append((fno + replay_delay, replay_seeds))
         selected = tbd.raw_best_for_mask() if args.delayed_sequence_select else tbd.best()
         selected_source = "tbd"
         target_local_state_select_info: dict[str, object] = {"enabled": bool(args.target_local_state_select), "used": False}
+        srps_verified_select_info: dict[str, object] = {
+            "enabled": bool(args.srps_verified_candidate_priority),
+            "used": False,
+        }
+        replay_handoff_select_info: dict[str, object] = {
+            "enabled": bool(args.replay_handoff_select),
+            "used": False,
+        }
         if not args.delayed_sequence_select:
             selected, target_local_state_select_info = target_local_state_select_override(
                 selected,
@@ -3955,12 +6049,28 @@ def run(args: argparse.Namespace) -> None:
             if target_local_state_select_info.get("used"):
                 selected_source = "target_local_state_select"
                 target_local_state_select_count += 1
+            selected, srps_verified_select_info = srps_verified_state_select_override(
+                selected,
+                states,
+                tbd,
+                args,
+            )
+            if srps_verified_select_info.get("used"):
+                selected_source = "srps_verified_select"
+                srps_verified_select_count += 1
+            if replay_handoff_selector is not None:
+                selected, replay_handoff_select_info = replay_handoff_selector.choose(fno, selected, states, tbd)
+                if replay_handoff_select_info.get("used"):
+                    selected_source = "replay_handoff_select"
+                    replay_handoff_select_count += 1
         t_tbd = time.perf_counter()
 
         selected_json = selected_state_json(fno, selected, tbd, args) if selected is not None else None
         if selected_json is not None:
             selected_json["source"] = selected_source
             selected_json["target_local_state_select"] = target_local_state_select_info
+            selected_json["srps_verified_select"] = srps_verified_select_info
+            selected_json["replay_handoff_select"] = replay_handoff_select_info
         telemetry_events: list[tuple[int, PathState | None, str, str]] = []
         if selected is not None and not args.delayed_sequence_select:
             selected_output_count += append_selected_output(
@@ -3976,7 +6086,7 @@ def run(args: argparse.Namespace) -> None:
             )
         if not args.delayed_sequence_select:
             telemetry_events.append((fno, selected, selected_source, "selected" if selected is not None else "no_target"))
-        feedback_selected = None if args.delayed_sequence_select else selected
+        feedback_selected = None if args.delayed_sequence_select or selected_source == "replay_handoff_select" else selected
         if args.target_local_recovery_proposals:
             if feedback_selected is not None:
                 selected_verified = tbd.verified_score(feedback_selected)
@@ -3994,6 +6104,8 @@ def run(args: argparse.Namespace) -> None:
                 and target_local_recovery_seed.age(fno) > args.target_local_recovery_max_seed_gap
             ):
                 target_local_recovery_seed = None
+        if args.target_local_anchor_bank_proposals:
+            target_local_anchor_bank.confirm_selected(fno, feedback_selected)
         motion_model_mask_boxes = (
             [feedback_selected.bbox] if feedback_selected is not None and feedback_selected.misses == 0 else []
         )
@@ -4059,6 +6171,7 @@ def run(args: argparse.Namespace) -> None:
             "residual_masks": round((t_residual - t_motion_model) * 1000.0, 3),
             "cheap_proposals": round((t_cheap_proposals - t_residual) * 1000.0, 3),
             "surface_extra_proposals": round((t_proposals - t_cheap_proposals) * 1000.0, 3),
+            "target_local_anchor_bank": round(target_local_anchor_bank_ms, 3),
             "context_router": round((t_context_router - t_proposals) * 1000.0, 3),
             "scenario_balance": round((t_scenario - t_context_router) * 1000.0, 3),
             "tbd_update": round((t_tbd - t_scenario) * 1000.0, 3),
@@ -4101,8 +6214,23 @@ def run(args: argparse.Namespace) -> None:
             "n_temporal_stack_candidates": len(stack_cands),
             "n_hybrid_coast_candidates": len(hybrid_coast_cands),
             "n_candidate_local_recenter_candidates": len(candidate_local_recenter_cands),
+            "n_candidate_local_recenter_track_only_replay_seeds": len(track_only_replay_seed_cands),
+            "n_candidate_local_recenter_track_only_replay_pending": sum(
+                len(seeds) for _target_frame, seeds in pending_track_only_replay_seeds
+            ),
             "n_target_local_recovery_candidates": len(target_local_recovery_cands),
+            "n_target_local_anchor_bank_candidates": len(target_local_anchor_bank_cands),
+            "n_srps_candidates": len(srps_cands),
+            "srps_trace": srps_source.trace[-1].to_row() if srps_source.trace else None,
+            "target_local_anchor_bank": {
+                **target_local_anchor_bank_info,
+                "events": target_local_anchor_bank.last_events,
+                "active_anchors": len(target_local_anchor_bank.anchors),
+                "quarantines": len(target_local_anchor_bank.quarantines),
+            },
             "target_local_state_select": target_local_state_select_info,
+            "srps_verified_select": srps_verified_select_info,
+            "replay_handoff_select": replay_handoff_select_info,
             "candidate_router_counts": candidate_router_counts,
             "n_tracks": len(states),
             "selected": selected_json,
@@ -4252,6 +6380,8 @@ def run(args: argparse.Namespace) -> None:
             "selected_output_rows": selected_output_count,
             "selected_output_frame_rate": round(selected_output_count / processed_count, 3),
             "target_local_state_select_count": target_local_state_select_count,
+            "srps_verified_select_count": srps_verified_select_count,
+            "replay_handoff_select_count": replay_handoff_select_count,
             "kinematic_gate_px_per_frame": round(px_per_frame, 3),
             "kinematic_rejections": 0,
             "multi_candidate_frames": multi_candidate_frames,
@@ -4292,6 +6422,26 @@ def run(args: argparse.Namespace) -> None:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(top_tube_rows)
+    if srps_runtime_residual_rows:
+        with (out_dir / "srps_runtime_residual_proposals.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(srps_runtime_residual_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(srps_runtime_residual_rows)
+    if srps_seed_rows:
+        with (out_dir / "srps_seed_candidates.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(srps_seed_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(srps_seed_rows)
+    if srps_path_rows:
+        fieldnames = []
+        for row in srps_path_rows:
+            for key in row:
+                if key not in fieldnames:
+                    fieldnames.append(key)
+        with (out_dir / "srps_path_candidates.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(srps_path_rows)
     if timing_keys:
         with (out_dir / "timing_summary.csv").open("w", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=["block", "avg_ms", "p90_ms", "p95_ms", "p99_ms", "max_ms"])

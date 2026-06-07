@@ -225,7 +225,7 @@ class Candidate:
     router_far_texture: float = 0.0
 
     def to_json(self) -> dict:
-        return {
+        data = {
             "bbox": list(self.bbox),
             "source": self.source,
             "area": self.area,
@@ -260,6 +260,76 @@ class Candidate:
             "router_far_sky_like": round(self.router_far_sky_like, 4),
             "router_far_texture": round(self.router_far_texture, 3),
         }
+        for attr in (
+            "target_local_anchor_id",
+            "target_local_anchor_source",
+            "target_local_anchor_age",
+            "target_local_anchor_trust",
+            "target_local_anchor_method",
+            "target_local_anchor_shift_px",
+            "recenter_parent_source",
+            "recenter_parent_router_state",
+            "recenter_parent_score",
+            "recenter_parent_bbox",
+            "recenter_seed_family",
+            "recenter_seed_track_id",
+            "recenter_seed_hits",
+            "recenter_seed_misses",
+            "recenter_seed_age",
+            "recenter_seed_verified_score",
+            "recenter_seed_last_source",
+            "recenter_seed_vx",
+            "recenter_seed_vy",
+            "recenter_seed_raw_source",
+            "recenter_seed_raw_source_family",
+            "recenter_seed_raw_rank",
+            "recenter_seed_raw_score",
+            "recenter_seed_raw_obs",
+            "recenter_shift_det",
+            "recenter_peak_radius",
+            "recenter_peak_score",
+            "recenter_second_peak_margin",
+            "recenter_seed_rank",
+            "recenter_seed_score",
+            "recenter_response_family",
+            "recenter_response_map",
+            "recenter_response_radius",
+            "recenter_response_score",
+            "recenter_response_local_rank",
+            "recenter_subpixel_dx",
+            "recenter_subpixel_dy",
+            "recenter_subpixel_method",
+            "recenter_subpixel_condition",
+            "srps_state",
+            "srps_path_confidence",
+            "srps_seed_type",
+            "srps_seed_source",
+            "srps_seed_rank",
+            "srps_seed_score",
+            "srps_seed_track_id",
+            "srps_snap_rank",
+            "srps_snap_score",
+            "srps_snap_distance",
+            "srps_pred_distance",
+            "srps_path_miss_count",
+            "srps_hits",
+            "srps_confirm_frame",
+            "srps_coord_space",
+            "srps_verified_seed",
+            "srps_verified_path",
+            "srps_verification_score",
+            "srps_support_sources",
+            "srps_residual_density",
+        ):
+            if hasattr(self, attr):
+                value = getattr(self, attr)
+                if isinstance(value, float):
+                    data[attr] = round(value, 3)
+                elif isinstance(value, tuple):
+                    data[attr] = list(value)
+                else:
+                    data[attr] = value
+        return data
 
 
 @dataclass

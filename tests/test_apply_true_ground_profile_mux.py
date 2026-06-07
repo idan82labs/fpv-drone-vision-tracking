@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import pytest
+import numpy as np
 
 from scripts.apply_true_ground_profile_mux import (
     DEFAULT_WEIGHTS,
     CandidatePayload,
+    SourcePromoterPolicy,
+    add_target_source_promoter_candidates,
+    apply_target_reacquisition,
     bridge_selected_gaps,
     dedupe_items,
     recenter_emitted_boxes,
@@ -13,6 +17,42 @@ from scripts.apply_true_ground_profile_mux import (
     top_tube_score,
 )
 from scripts.selector_core import SequenceItem
+
+
+class FixedSeedPolicy:
+    def __init__(self, scores: dict[int, float], threshold: float = 0.5) -> None:
+        self.scores = scores
+        self.threshold = threshold
+
+    def score_payload(self, payload: CandidatePayload, *, row_source: str, source_reappearance_count_5: int) -> float:
+        return self.scores.get(int(payload.frame), 0.0)
+
+
+class FixedReacquisitionPolicy:
+    def __init__(self, scores: dict[str, float], threshold: float = 0.5) -> None:
+        self.scores = scores
+        self.threshold = threshold
+
+    def score_payload(
+        self,
+        payload: CandidatePayload,
+        *,
+        current: CandidatePayload | None,
+        candidate_slot: int,
+        seed_score: float | None = None,
+    ) -> float:
+        return self.scores.get(payload.mux_source, 0.0)
+
+
+class FixedSourcePromoterModel:
+    classes_ = [0, 1]
+
+    def predict_proba(self, df):  # noqa: ANN001 - mirrors sklearn duck type
+        out = []
+        for _idx, row in df.iterrows():
+            score = float(row.get("promote_score", 0.0))
+            out.append([1.0 - score, score])
+        return np.asarray(out)
 
 
 def test_large_dark_selected_track_scores_above_generic() -> None:
@@ -62,6 +102,38 @@ def test_dedupe_keeps_highest_scoring_same_source_box() -> None:
     assert len(deduped) == 2
     assert {item.payload.mux_source for item in deduped} == {"score084", "cropw9"}
     assert max(item.score for item in deduped if item.payload.mux_source == "score084") == 2.0
+
+
+def test_target_source_promoter_materializes_top_scored_pi_rows(tmp_path) -> None:
+    rows = tmp_path / "source_rows.csv"
+    rows.write_text(
+        "clip,frame,candidate_id,rank,x,y,w,h,score,verified_score,source,track_id,promote_score\n"
+        "clip,10,a,1,0,0,4,4,10,5,map,1,0.1\n"
+        "clip,10,b,2,20,20,4,4,8,5,large_dark,2,0.9\n"
+        "clip,10,c,3,40,40,4,4,7,5,map,3,0.8\n"
+    )
+    frame_items = {}
+    policy = SourcePromoterPolicy(
+        model=FixedSourcePromoterModel(),
+        threshold=0.5,
+        feature_columns=["promote_score"],
+    )
+
+    add_target_source_promoter_candidates(
+        "clip",
+        rows,
+        frame_items,
+        policy=policy,
+        top_k=1,
+        threshold=policy.threshold,
+        trace=[],
+    )
+
+    assert list(frame_items) == [10]
+    assert len(frame_items[10]) == 1
+    payload = frame_items[10][0].payload
+    assert payload.mux_source == "target_source_promoter"
+    assert payload.track_id == "2"
 
 
 def test_bridge_selected_gaps_interpolates_short_high_score_gap() -> None:
@@ -126,6 +198,209 @@ def test_recover_target_local_gaps_uses_recent_motion_prediction() -> None:
     assert 12 in recovered
     assert recovered[12].payload.mux_source == "target_local_recovery"
     assert recovered[12].bbox == (18.0, 10.0, 4.0, 4.0)
+
+
+def test_recover_target_local_can_materialize_prediction_when_no_candidate_exists() -> None:
+    first = CandidatePayload("clip", 10, (10.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    second = CandidatePayload("clip", 11, (14.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    selected = {
+        10: SequenceItem(10, first.bbox, first.mux_score, first),
+        11: SequenceItem(11, second.bbox, second.mux_score, second),
+    }
+    tubes = {
+        12: [
+            {"clip": "clip", "frame": "12", "rank": "1", "x": "70", "y": "70", "w": "4", "h": "4", "score": "40"},
+        ]
+    }
+
+    disabled = recover_target_local_gaps(
+        selected,
+        tubes,
+        min_emit_score=3.45,
+        max_recovery_frames=2,
+        top_k=1,
+        max_pred_error=6.0,
+        last_anchor_px=0.0,
+        anchor_mux_sources=None,
+        raw_min=10.0,
+    )
+    enabled = recover_target_local_gaps(
+        selected,
+        tubes,
+        min_emit_score=3.45,
+        max_recovery_frames=2,
+        top_k=1,
+        max_pred_error=6.0,
+        last_anchor_px=0.0,
+        anchor_mux_sources=None,
+        raw_min=10.0,
+        materialize_prediction=True,
+        prediction_score_delta=0.7,
+    )
+
+    assert sorted(disabled) == [10, 11]
+    assert enabled[12].payload.mux_source == "target_local_path_prediction"
+    assert enabled[12].bbox == (18.0, 10.0, 4.0, 4.0)
+    assert enabled[12].score == pytest.approx(4.15)
+
+
+def test_recover_target_local_seed_gate_blocks_low_trust_materialized_prediction() -> None:
+    first = CandidatePayload("clip", 10, (10.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    second = CandidatePayload("clip", 11, (14.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    selected = {
+        10: SequenceItem(10, first.bbox, first.mux_score, first),
+        11: SequenceItem(11, second.bbox, second.mux_score, second),
+    }
+    trace: list[dict[str, object]] = []
+
+    recovered = recover_target_local_gaps(
+        selected,
+        {12: []},
+        min_emit_score=3.45,
+        max_recovery_frames=2,
+        top_k=1,
+        max_pred_error=6.0,
+        last_anchor_px=0.0,
+        anchor_mux_sources=None,
+        raw_min=10.0,
+        materialize_prediction=True,
+        prediction_score_delta=0.7,
+        seed_policy=FixedSeedPolicy({10: 0.9, 11: 0.1}),
+        seed_streak=2,
+        identity_trace=trace,
+    )
+
+    assert sorted(recovered) == [10, 11]
+    assert any(row["action"] == "materialize_blocked_seed_gate" for row in trace)
+
+
+def test_recover_target_local_seed_gate_requires_two_trusted_frames() -> None:
+    first = CandidatePayload("clip", 10, (10.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    second = CandidatePayload("clip", 11, (14.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    selected = {
+        10: SequenceItem(10, first.bbox, first.mux_score, first),
+        11: SequenceItem(11, second.bbox, second.mux_score, second),
+    }
+    trace: list[dict[str, object]] = []
+
+    recovered = recover_target_local_gaps(
+        selected,
+        {12: []},
+        min_emit_score=3.45,
+        max_recovery_frames=2,
+        top_k=1,
+        max_pred_error=6.0,
+        last_anchor_px=0.0,
+        anchor_mux_sources=None,
+        raw_min=10.0,
+        materialize_prediction=True,
+        prediction_score_delta=0.7,
+        seed_policy=FixedSeedPolicy({10: 0.9, 11: 0.9}),
+        seed_streak=2,
+        identity_trace=trace,
+    )
+
+    assert recovered[12].payload.mux_source == "target_local_path_prediction"
+    assert any(row["action"] == "materialize_allowed" for row in trace)
+
+
+def test_recover_target_local_path_prediction_cannot_self_seed_next_prediction() -> None:
+    first = CandidatePayload("clip", 10, (10.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    second = CandidatePayload("clip", 11, (14.0, 10.0, 4.0, 4.0), "score084", 4.0)
+    selected = {
+        10: SequenceItem(10, first.bbox, first.mux_score, first),
+        11: SequenceItem(11, second.bbox, second.mux_score, second),
+    }
+    trace: list[dict[str, object]] = []
+
+    recovered = recover_target_local_gaps(
+        selected,
+        {12: [], 13: []},
+        min_emit_score=3.45,
+        max_recovery_frames=3,
+        top_k=1,
+        max_pred_error=6.0,
+        last_anchor_px=0.0,
+        anchor_mux_sources=None,
+        raw_min=10.0,
+        materialize_prediction=True,
+        prediction_score_delta=0.7,
+        seed_policy=FixedSeedPolicy({10: 0.9, 11: 0.9, 12: 0.9}),
+        seed_streak=2,
+        identity_trace=trace,
+    )
+
+    assert recovered[12].payload.mux_source == "target_local_path_prediction"
+    assert 13 not in recovered
+    blocked = [row for row in trace if row["action"] == "materialize_blocked_seed_gate"]
+    assert blocked
+
+
+def test_target_reacquisition_switches_from_low_score_current_to_high_candidate() -> None:
+    current = CandidatePayload("clip", 12, (70.0, 70.0, 8.0, 8.0), "score084", 2.0)
+    target = CandidatePayload("clip", 12, (18.0, 10.0, 8.0, 8.0), "cs_proposal", 1.2)
+    selected = {12: SequenceItem(12, current.bbox, current.mux_score, current)}
+    frame_items = {12: [SequenceItem(12, target.bbox, target.mux_score, target)]}
+    trace: list[dict[str, object]] = []
+
+    recovered = apply_target_reacquisition(
+        selected,
+        frame_items,
+        min_emit_score=3.0,
+        reacquisition_policy=FixedReacquisitionPolicy({"cs_proposal": 0.9}, threshold=0.5),
+        seed_policy=None,
+        top_k=5,
+        margin=0.0,
+        trace=trace,
+    )
+
+    assert recovered[12].payload.mux_source == "cs_proposal+reacquire"
+    assert recovered[12].score > 3.0
+    assert trace[-1]["action"] == "switch_to_candidate"
+
+
+def test_target_reacquisition_keeps_trusted_current() -> None:
+    current = CandidatePayload("clip", 12, (18.0, 10.0, 8.0, 8.0), "score084", 4.0)
+    target = CandidatePayload("clip", 12, (19.0, 10.0, 8.0, 8.0), "cs_proposal", 1.2)
+    selected = {12: SequenceItem(12, current.bbox, current.mux_score, current)}
+    frame_items = {12: [SequenceItem(12, target.bbox, target.mux_score, target)]}
+    trace: list[dict[str, object]] = []
+
+    recovered = apply_target_reacquisition(
+        selected,
+        frame_items,
+        min_emit_score=3.0,
+        reacquisition_policy=FixedReacquisitionPolicy({"cs_proposal": 0.95}, threshold=0.5),
+        seed_policy=None,
+        top_k=5,
+        margin=0.0,
+        trace=trace,
+    )
+
+    assert recovered[12].payload.mux_source == "score084"
+    assert trace[-1]["action"] == "keep_current"
+
+
+def test_target_reacquisition_rejects_path_prediction_candidate() -> None:
+    current = CandidatePayload("clip", 12, (70.0, 70.0, 8.0, 8.0), "score084", 2.0)
+    predicted = CandidatePayload("clip", 12, (18.0, 10.0, 8.0, 8.0), "target_local_path_prediction", 4.0)
+    selected = {12: SequenceItem(12, current.bbox, current.mux_score, current)}
+    frame_items = {12: [SequenceItem(12, predicted.bbox, predicted.mux_score, predicted)]}
+    trace: list[dict[str, object]] = []
+
+    recovered = apply_target_reacquisition(
+        selected,
+        frame_items,
+        min_emit_score=3.0,
+        reacquisition_policy=FixedReacquisitionPolicy({"target_local_path_prediction": 0.99}, threshold=0.5),
+        seed_policy=None,
+        top_k=5,
+        margin=0.0,
+        trace=trace,
+    )
+
+    assert recovered[12].payload.mux_source == "score084"
+    assert trace[-1]["action"] == "no_safe_candidate"
 
 
 def test_recover_target_local_gaps_does_not_start_without_history() -> None:

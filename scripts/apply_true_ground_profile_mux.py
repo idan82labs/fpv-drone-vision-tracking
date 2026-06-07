@@ -11,10 +11,11 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import math
 import sys
 from collections import defaultdict
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -68,6 +69,134 @@ class CandidatePayload:
     track_id: str = ""
     reason: str = ""
     source_path: str = ""
+
+
+@dataclass
+class IdentitySeedPolicy:
+    model: Any
+    threshold: float
+    feature_columns: list[str] = field(default_factory=list)
+    model_path: str = ""
+    policy_path: str = ""
+
+    def score_payload(
+        self,
+        payload: CandidatePayload,
+        *,
+        row_source: str,
+        source_reappearance_count_5: int,
+    ) -> float:
+        try:
+            import pandas as pd
+        except ImportError as exc:  # pragma: no cover - environment guard
+            raise RuntimeError("pandas is required for identity seed arbiter scoring") from exc
+        row = identity_seed_feature_row(
+            payload,
+            row_source=row_source,
+            source_reappearance_count_5=source_reappearance_count_5,
+        )
+        for col in self.feature_columns:
+            row.setdefault(col, math.nan)
+        df = pd.DataFrame([row])
+        proba = self.model.predict_proba(df)
+        classes = [str(c) for c in self.model.classes_]
+        if "1" not in classes:
+            return 0.0
+        return float(proba[0, classes.index("1")])
+
+
+@dataclass
+class ReacquisitionPolicy:
+    model: Any
+    threshold: float
+    feature_columns: list[str] = field(default_factory=list)
+    model_path: str = ""
+    policy_path: str = ""
+
+    def score_payload(
+        self,
+        payload: CandidatePayload,
+        *,
+        current: CandidatePayload | None,
+        candidate_slot: int,
+        seed_score: float | None = None,
+    ) -> float:
+        try:
+            import pandas as pd
+        except ImportError as exc:  # pragma: no cover - environment guard
+            raise RuntimeError("pandas is required for reacquisition arbiter scoring") from exc
+        row = reacquisition_feature_row(
+            payload,
+            current=current,
+            candidate_slot=candidate_slot,
+            seed_score=seed_score,
+        )
+        for col in self.feature_columns:
+            row.setdefault(col, math.nan)
+        df = pd.DataFrame([row])
+        proba = self.model.predict_proba(df)
+        classes = [str(c) for c in self.model.classes_]
+        if "1" not in classes:
+            return 0.0
+        return float(proba[0, classes.index("1")])
+
+
+@dataclass
+class CurrentTrustPolicy:
+    model: Any
+    threshold: float
+    feature_columns: list[str] = field(default_factory=list)
+    model_path: str = ""
+    policy_path: str = ""
+
+    def score_payload(self, payload: CandidatePayload) -> float:
+        try:
+            import pandas as pd
+        except ImportError as exc:  # pragma: no cover - environment guard
+            raise RuntimeError("pandas is required for current trust scoring") from exc
+        row = current_trust_feature_row(payload)
+        for col in self.feature_columns:
+            row.setdefault(col, math.nan)
+        df = pd.DataFrame([row])
+        proba = self.model.predict_proba(df)
+        classes = [str(c) for c in self.model.classes_]
+        if "1" not in classes:
+            return 0.0
+        return float(proba[0, classes.index("1")])
+
+
+@dataclass
+class SourcePromoterPolicy:
+    model: Any
+    threshold: float
+    feature_columns: list[str] = field(default_factory=list)
+    numeric_feature_columns: list[str] = field(default_factory=list)
+    model_path: str = ""
+    policy_path: str = ""
+
+    def score_rows(self, rows: list[dict[str, str]]) -> list[float]:
+        if not rows:
+            return []
+        try:
+            import pandas as pd
+        except ImportError as exc:  # pragma: no cover - environment guard
+            raise RuntimeError("pandas is required for source promoter scoring") from exc
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            out = dict(row)
+            for col in self.feature_columns:
+                out.setdefault(col, math.nan)
+            normalized.append(out)
+        df = pd.DataFrame(normalized)
+        for col in self.numeric_feature_columns:
+            if col in df:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        proba = self.model.predict_proba(df)
+        classes = [str(c) for c in self.model.classes_]
+        if "1" not in classes:
+            return [0.0 for _ in rows]
+        idx = classes.index("1")
+        return [float(v) for v in proba[:, idx]]
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,6 +255,132 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--target_local_recovery_raw_min", type=float, default=10.0)
+    p.add_argument(
+        "--target_local_recovery_materialize_prediction",
+        action="store_true",
+        help=(
+            "When no existing top-tube candidate is close to the recent-track prediction, "
+            "materialize the predicted box itself as a bounded target-local candidate. "
+            "Disabled by default."
+        ),
+    )
+    p.add_argument(
+        "--target_local_recovery_seed_arbiter",
+        default="",
+        help=(
+            "Optional ID54 seed-arbiter policy JSON or joblib model. When set, raw "
+            "path-prediction materialization requires a trusted identity streak."
+        ),
+    )
+    p.add_argument(
+        "--target_local_recovery_seed_threshold",
+        type=float,
+        default=None,
+        help="Optional override threshold for --target_local_recovery_seed_arbiter.",
+    )
+    p.add_argument(
+        "--target_local_recovery_seed_streak",
+        type=int,
+        default=2,
+        help="Consecutive trusted non-prediction identities required before materialization.",
+    )
+    p.add_argument(
+        "--target_local_recovery_seed_trace",
+        action="store_true",
+        help="Write identity_seed_trace.csv when seed arbiter scoring is active.",
+    )
+    p.add_argument(
+        "--target_reacquisition_arbiter",
+        default="",
+        help=(
+            "Optional ID56 switch/reacquisition policy JSON or joblib model. "
+            "Scores bounded same-frame alternatives when current output is absent, low-score, or untrusted."
+        ),
+    )
+    p.add_argument(
+        "--target_reacquisition_threshold",
+        type=float,
+        default=None,
+        help="Optional override threshold for --target_reacquisition_arbiter.",
+    )
+    p.add_argument("--target_reacquisition_top_k", type=int, default=5)
+    p.add_argument("--target_reacquisition_margin", type=float, default=0.0)
+    p.add_argument(
+        "--target_reacquisition_trace",
+        action="store_true",
+        help="Write target_reacquisition_trace.csv when reacquisition scoring is active.",
+    )
+    p.add_argument(
+        "--target_current_trust_model",
+        default="",
+        help="Optional ID57 current trust policy JSON or joblib model.",
+    )
+    p.add_argument(
+        "--target_current_release_all",
+        action="store_true",
+        help=(
+            "Diagnostic-only: do not protect any current track during target reacquisition. "
+            "Useful when current-trust labels contain only wrong current tracks."
+        ),
+    )
+    p.add_argument(
+        "--target_current_trust_threshold",
+        type=float,
+        default=None,
+        help="Optional override threshold for --target_current_trust_model.",
+    )
+    p.add_argument(
+        "--target_reacquisition_source_bridge",
+        action="store_true",
+        help="Expose a bounded top-tube source bridge to the reacquisition scorer.",
+    )
+    p.add_argument("--target_reacquisition_source_bridge_top_k", type=int, default=5)
+    p.add_argument("--target_reacquisition_source_bridge_min_seed", type=float, default=0.0)
+    p.add_argument(
+        "--target_reacquisition_external_bridge_csv",
+        default="",
+        help=(
+            "Optional diagnostic-only candidate CSV used as an external source bridge. "
+            "This is for source-parity replay, not a production default."
+        ),
+    )
+    p.add_argument("--target_reacquisition_external_bridge_top_k", type=int, default=5)
+    p.add_argument(
+        "--target_source_promoter_model",
+        default="",
+        help=(
+            "Optional ID58 source-promoter policy JSON/joblib. Materializes bounded candidates "
+            "from --target_source_promoter_source_table behind explicit flags only."
+        ),
+    )
+    p.add_argument(
+        "--target_source_promoter_threshold",
+        type=float,
+        default=None,
+        help="Optional override threshold for --target_source_promoter_model.",
+    )
+    p.add_argument(
+        "--target_source_promoter_source_table",
+        default="",
+        help="Pi-computable candidate table to score and materialize with the source promoter.",
+    )
+    p.add_argument("--target_source_promoter_top_k", type=int, default=5)
+    p.add_argument(
+        "--target_source_promoter_trace",
+        action="store_true",
+        help="Write target_source_promoter_trace.csv when the ID58 materializer is active.",
+    )
+    p.add_argument(
+        "--target_reacquisition_source_bridge_trace",
+        action="store_true",
+        help="Write target_reacquisition_source_bridge_trace.csv when the bridge is active.",
+    )
+    p.add_argument(
+        "--target_local_recovery_prediction_score_delta",
+        type=float,
+        default=0.65,
+        help="Score added above min_emit_score for materialized path-prediction candidates.",
+    )
     p.add_argument(
         "--target_local_recovery_replace_existing_error",
         type=float,
@@ -474,7 +729,217 @@ def add_cs_proposal_candidates(
                 reason="weak_trace_proposal",
                 source_path=str(tubes_path),
             )
-            frame_items[frame].append(candidate_from_payload(payload))
+            frame_items.setdefault(frame, []).append(candidate_from_payload(payload))
+
+
+def add_source_bridge_candidates(
+    clip: str,
+    tubes_by_frame: dict[int, list[dict[str, str]]],
+    frame_items: dict[int, list[SequenceItem]],
+    *,
+    top_k: int,
+    min_seed: float,
+    trace: list[dict[str, Any]] | None = None,
+) -> None:
+    """Expose a bounded top-tube source bank for reacquisition only.
+
+    This does not run a new detector and does not use future frames. It simply
+    surfaces a few already-computed top-tube candidates under a distinct source
+    so the reacquisition scorer can evaluate them without widening the global
+    mux path.
+    """
+
+    if top_k <= 0:
+        return
+    for frame, rows in tubes_by_frame.items():
+        added = 0
+        for row in rows[: max(1, int(top_k))]:
+            bbox = bbox_from_row(row)
+            if bbox is None:
+                continue
+            raw_score = fnum(row.get("score"), 0.0) or 0.0
+            rank = fnum(row.get("rank"), 99.0) or 99.0
+            t_prob = clip01(fnum(row.get("crop_t_prob")), 0.0)
+            seed_like = max(t_prob, clipped(raw_score / 60.0, 0.0, 1.0))
+            if seed_like < float(min_seed):
+                continue
+            payload = CandidatePayload(
+                clip=clip,
+                frame=int(frame),
+                bbox=bbox,
+                mux_source="source_bridge",
+                mux_score=1.35 + 0.25 * clipped(raw_score / 30.0, -0.5, 1.5) + 0.15 * t_prob - 0.06 * math.log1p(max(0.0, rank)),
+                rank=str(row.get("rank", "")),
+                learned_score=str(row.get("crop_t_prob", "")),
+                verified_score=str(row.get("verified_score", "")),
+                source=str(row.get("cand_source", "")),
+                track_id=str(row.get("track_id", "")),
+                reason=f"bounded_source_bridge_slot_{added + 1}",
+                source_path="cs_top_tubes_source_bridge",
+            )
+            frame_items[int(frame)].append(candidate_from_payload(payload))
+            added += 1
+            if trace is not None:
+                trace.append(
+                    {
+                        "clip": clip,
+                        "frame": frame,
+                        "rank": payload.rank,
+                        "source": payload.source,
+                        "track_id": payload.track_id,
+                        "seed_like": round(float(seed_like), 6),
+                        "mux_score": round(float(payload.mux_score), 6),
+                        "action": "materialized_source_bridge",
+                    }
+                )
+
+
+def add_external_bridge_candidates(
+    clip: str,
+    csv_path: Path,
+    frame_items: dict[int, list[SequenceItem]],
+    *,
+    top_k: int,
+    trace: list[dict[str, Any]] | None = None,
+) -> None:
+    if not csv_path.exists() or top_k <= 0:
+        return
+    rows_by_frame: dict[int, list[dict[str, str]]] = defaultdict(list)
+    for row in read_csv(csv_path):
+        row_clip = str(row.get("clip", ""))
+        if row_clip and row_clip != clip:
+            continue
+        frame = fnum(row.get("frame"))
+        if frame is None:
+            continue
+        rows_by_frame[int(frame)].append(row)
+    for frame, rows in rows_by_frame.items():
+        rows.sort(
+            key=lambda r: (
+                -clipped(fnum(r.get("hgb_allfit_score"), 0.0), 0.0, 1.0),
+                -(fnum(r.get("score"), 0.0) or 0.0),
+                fnum(r.get("rank"), 9999.0) or 9999.0,
+            )
+        )
+        for slot, row in enumerate(rows[: max(1, int(top_k))], start=1):
+            bbox = bbox_from_row(row)
+            if bbox is None:
+                continue
+            raw_score = fnum(row.get("score"), 0.0) or 0.0
+            hgb = clip01(fnum(row.get("hgb_allfit_score")), 0.0)
+            rank = fnum(row.get("rank"), 99.0) or 99.0
+            payload = CandidatePayload(
+                clip=clip,
+                frame=frame,
+                bbox=bbox,
+                mux_source="external_source_bridge",
+                mux_score=1.55 + 0.4 * hgb + 0.25 * clipped(raw_score / 60.0, 0.0, 1.5) - 0.05 * math.log1p(max(0.0, rank)),
+                rank=str(row.get("rank", "")),
+                learned_score=str(hgb),
+                verified_score=str(row.get("verified_score", "")),
+                source=str(row.get("source") or row.get("source_family") or ""),
+                track_id=str(row.get("track_id", "")),
+                reason=f"external_source_bridge_slot_{slot}",
+                source_path=str(csv_path),
+            )
+            frame_items.setdefault(frame, []).append(candidate_from_payload(payload))
+            if trace is not None:
+                trace.append(
+                    {
+                        "clip": clip,
+                        "frame": frame,
+                        "rank": payload.rank,
+                        "source": payload.source,
+                        "track_id": payload.track_id,
+                        "seed_like": round(float(hgb), 6),
+                        "mux_score": round(float(payload.mux_score), 6),
+                        "action": "materialized_external_source_bridge",
+                    }
+                )
+
+
+def add_target_source_promoter_candidates(
+    clip: str,
+    csv_path: Path,
+    frame_items: dict[int, list[SequenceItem]],
+    *,
+    policy: SourcePromoterPolicy | None,
+    top_k: int,
+    threshold: float,
+    trace: list[dict[str, Any]] | None = None,
+) -> None:
+    """Materialize a bounded source-promoter candidate bank from Pi rows."""
+
+    if policy is None or top_k <= 0 or not csv_path.exists():
+        return
+    rows_by_frame: dict[int, list[dict[str, str]]] = defaultdict(list)
+    all_rows = read_csv(csv_path)
+    for row in all_rows:
+        row_clip = str(row.get("clip", ""))
+        if row_clip and row_clip != clip:
+            continue
+        frame = fnum(row.get("frame"))
+        if frame is None:
+            continue
+        rows_by_frame[int(frame)].append(row)
+    for frame, rows in rows_by_frame.items():
+        scores = policy.score_rows(rows)
+        scored = []
+        for row, promoter_score in zip(rows, scores):
+            bbox = bbox_from_row(row)
+            if bbox is None:
+                continue
+            scored.append((float(promoter_score), row, bbox))
+        scored.sort(
+            key=lambda item: (
+                -item[0],
+                fnum(item[1].get("rank"), 9999.0) or 9999.0,
+                -(fnum(item[1].get("score"), 0.0) or 0.0),
+            )
+        )
+        for slot, (promoter_score, row, bbox) in enumerate(scored[: max(1, int(top_k))], start=1):
+            if promoter_score < threshold:
+                continue
+            raw_score = fnum(row.get("score"), 0.0) or 0.0
+            verified = fnum(row.get("verified_score"), 0.0) or 0.0
+            rank = fnum(row.get("rank"), 99.0) or 99.0
+            mux_score = (
+                1.5
+                + 0.9 * clipped(promoter_score, 0.0, 1.0)
+                + 0.18 * clipped(raw_score / 60.0, 0.0, 1.5)
+                + 0.06 * clipped(verified / 70.0, 0.0, 1.5)
+                - 0.04 * math.log1p(max(0.0, rank))
+            )
+            payload = CandidatePayload(
+                clip=clip,
+                frame=frame,
+                bbox=bbox,
+                mux_source="target_source_promoter",
+                mux_score=mux_score,
+                rank=str(row.get("rank", "")),
+                learned_score=str(round(float(promoter_score), 8)),
+                verified_score=str(row.get("verified_score", "")),
+                source=str(row.get("source") or row.get("source_family") or ""),
+                track_id=str(row.get("track_id", "")),
+                reason=f"target_source_promoter_slot_{slot}",
+                source_path=str(csv_path),
+            )
+            frame_items.setdefault(frame, []).append(candidate_from_payload(payload))
+            if trace is not None:
+                trace.append(
+                    {
+                        "clip": clip,
+                        "frame": frame,
+                        "candidate_id": row.get("candidate_id", ""),
+                        "rank": payload.rank,
+                        "source": payload.source,
+                        "track_id": payload.track_id,
+                        "source_promoter_score": round(float(promoter_score), 8),
+                        "threshold": round(float(threshold), 8),
+                        "mux_score": round(float(mux_score), 6),
+                        "action": "materialized_target_source_promoter",
+                    }
+                )
 
 
 def add_selected_track_candidates(
@@ -617,6 +1082,618 @@ def bridge_selected_gaps(
     return out
 
 
+def resolve_root_path(value: str | Path) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else ROOT / path
+
+
+def load_identity_seed_policy(path_text: str, threshold_override: float | None = None) -> IdentitySeedPolicy | None:
+    if not path_text:
+        return None
+    try:
+        import joblib
+    except ImportError as exc:  # pragma: no cover - environment guard
+        raise RuntimeError("joblib is required to load --target_local_recovery_seed_arbiter") from exc
+
+    path = resolve_root_path(path_text)
+    feature_columns: list[str] = []
+    model_path = path
+    threshold = 0.5 if threshold_override is None else float(threshold_override)
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text())
+        model_path = resolve_root_path(str(payload.get("model_path", "")))
+        if threshold_override is None:
+            threshold = float(payload.get("threshold", threshold))
+        feature_path_text = str(payload.get("feature_columns_path", ""))
+        if feature_path_text:
+            feature_path = resolve_root_path(feature_path_text)
+            if feature_path.exists():
+                feature_payload = json.loads(feature_path.read_text())
+                feature_columns = [str(c) for c in feature_payload.get("columns", [])]
+        if payload.get("feature_columns"):
+            feature_columns = [str(c) for c in payload.get("feature_columns", [])]
+    model = joblib.load(model_path)
+    return IdentitySeedPolicy(
+        model=model,
+        threshold=threshold,
+        feature_columns=feature_columns,
+        model_path=str(model_path),
+        policy_path=str(path),
+    )
+
+
+def load_reacquisition_policy(path_text: str, threshold_override: float | None = None) -> ReacquisitionPolicy | None:
+    if not path_text:
+        return None
+    try:
+        import joblib
+    except ImportError as exc:  # pragma: no cover - environment guard
+        raise RuntimeError("joblib is required to load --target_reacquisition_arbiter") from exc
+
+    path = resolve_root_path(path_text)
+    feature_columns: list[str] = []
+    model_path = path
+    threshold = 0.5 if threshold_override is None else float(threshold_override)
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text())
+        model_text = str(payload.get("model_path") or payload.get("model") or "")
+        model_candidate = Path(model_text)
+        if model_candidate.is_absolute():
+            model_path = model_candidate
+        elif (path.parent / model_candidate).exists():
+            model_path = path.parent / model_candidate
+        else:
+            model_path = resolve_root_path(model_text)
+        if threshold_override is None:
+            threshold = float(payload.get("threshold", threshold))
+        feature_path_text = str(payload.get("feature_columns_path", ""))
+        if feature_path_text:
+            feature_path = resolve_root_path(feature_path_text)
+            if feature_path.exists():
+                feature_payload = json.loads(feature_path.read_text())
+                feature_columns = [str(c) for c in feature_payload.get("columns", [])]
+        if payload.get("feature_columns"):
+            feature_columns = [str(c) for c in payload.get("feature_columns", [])]
+    model = joblib.load(model_path)
+    return ReacquisitionPolicy(
+        model=model,
+        threshold=threshold,
+        feature_columns=feature_columns,
+        model_path=str(model_path),
+        policy_path=str(path),
+    )
+
+
+def load_current_trust_policy(path_text: str, threshold_override: float | None = None) -> CurrentTrustPolicy | None:
+    if not path_text:
+        return None
+    try:
+        import joblib
+    except ImportError as exc:  # pragma: no cover - environment guard
+        raise RuntimeError("joblib is required to load --target_current_trust_model") from exc
+
+    path = resolve_root_path(path_text)
+    feature_columns: list[str] = []
+    model_path = path
+    threshold = 0.5 if threshold_override is None else float(threshold_override)
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text())
+        model_text = str(payload.get("model_path") or payload.get("model") or "")
+        model_candidate = Path(model_text)
+        if model_candidate.is_absolute():
+            model_path = model_candidate
+        elif (path.parent / model_candidate).exists():
+            model_path = path.parent / model_candidate
+        else:
+            model_path = resolve_root_path(model_text)
+        if threshold_override is None:
+            threshold = float(payload.get("threshold", threshold))
+        feature_path_text = str(payload.get("feature_columns_path", ""))
+        if feature_path_text:
+            feature_path = resolve_root_path(feature_path_text)
+            if feature_path.exists():
+                feature_payload = json.loads(feature_path.read_text())
+                feature_columns = [str(c) for c in feature_payload.get("columns", [])]
+        if payload.get("feature_columns"):
+            feature_columns = [str(c) for c in payload.get("feature_columns", [])]
+    model = joblib.load(model_path)
+    return CurrentTrustPolicy(
+        model=model,
+        threshold=threshold,
+        feature_columns=feature_columns,
+        model_path=str(model_path),
+        policy_path=str(path),
+    )
+
+
+def load_source_promoter_policy(path_text: str, threshold_override: float | None = None) -> SourcePromoterPolicy | None:
+    if not path_text:
+        return None
+    try:
+        import joblib
+    except ImportError as exc:  # pragma: no cover - environment guard
+        raise RuntimeError("joblib is required to load --target_source_promoter_model") from exc
+
+    path = resolve_root_path(path_text)
+    feature_columns: list[str] = []
+    model_path = path
+    threshold = 0.0 if threshold_override is None else float(threshold_override)
+    if path.suffix.lower() == ".json":
+        payload = json.loads(path.read_text())
+        model_text = str(payload.get("model_path") or payload.get("model") or "")
+        model_candidate = Path(model_text)
+        if model_candidate.is_absolute():
+            model_path = model_candidate
+        elif (path.parent / model_candidate).exists():
+            model_path = path.parent / model_candidate
+        else:
+            model_path = resolve_root_path(model_text)
+        if threshold_override is None:
+            threshold = float(payload.get("threshold", threshold))
+        if payload.get("feature_columns"):
+            feature_columns = [str(c) for c in payload.get("feature_columns", [])]
+        numeric_feature_columns = [str(c) for c in payload.get("numeric_feature_columns", [])]
+        feature_path_text = str(payload.get("feature_columns_path", ""))
+        if feature_path_text:
+            feature_path = resolve_root_path(feature_path_text)
+            if feature_path.exists():
+                feature_payload = json.loads(feature_path.read_text())
+                feature_columns = [str(c) for c in feature_payload.get("columns", [])]
+                numeric_feature_columns = [str(c) for c in feature_payload.get("numeric", [])]
+    else:
+        numeric_feature_columns = []
+    model = joblib.load(model_path)
+    return SourcePromoterPolicy(
+        model=model,
+        threshold=threshold,
+        feature_columns=feature_columns,
+        numeric_feature_columns=numeric_feature_columns,
+        model_path=str(model_path),
+        policy_path=str(path),
+    )
+
+
+def payload_source_key(payload: CandidatePayload) -> str:
+    return f"{payload.mux_source}:{payload.source}:{payload.track_id}"
+
+
+def identity_seed_feature_row(
+    payload: CandidatePayload,
+    *,
+    row_source: str,
+    source_reappearance_count_5: int,
+) -> dict[str, Any]:
+    rank = fnum(payload.rank, 9999.0) or 9999.0
+    learned = fnum(payload.learned_score)
+    verified = fnum(payload.verified_score, 0.0) or 0.0
+    score = learned if learned is not None and math.isfinite(learned) else float(payload.mux_score)
+    x, y, w, h = payload.bbox
+    p_t = learned if learned is not None and 0.0 <= learned <= 1.0 else 0.0
+    crop_prob_is_replay_safe = payload.mux_source in {
+        "cs_js1",
+        "cs_proposal",
+        "target_local_recovery",
+    }
+    model_p_t = p_t if crop_prob_is_replay_safe else 0.0
+    source_family = payload.source or payload.mux_source or "unknown"
+    frame = int(payload.frame)
+    background = "unknown"
+    if payload.clip.startswith("e271") or payload.clip == "":
+        if frame <= 668:
+            background = "road"
+        elif frame <= 683:
+            background = "mixed_ground"
+        else:
+            background = "terrain"
+    row = {
+        "row_source": row_source,
+        "source_family": source_family,
+        "source": payload.source or payload.mux_source or "unknown",
+        "mux_source": payload.mux_source or "",
+        "rank": rank,
+        "score": score,
+        "verified_score": verified,
+        "pi_selected": 0,
+        "box_area": max(0.0, float(w)) * max(0.0, float(h)),
+        "box_aspect": float(w) / max(1e-6, float(h)),
+        "is_materialized_prediction": 1 if payload.mux_source == "target_local_path_prediction" else 0,
+        "best_p_T": model_p_t,
+        "best_T_margin": model_p_t - (1.0 - model_p_t),
+        "score_rank_ratio": float(score) / math.log1p(max(1.0, float(rank))),
+        "verified_rank_ratio": float(verified) / math.log1p(max(1.0, float(rank))),
+        "source_reappearance_count_5": int(source_reappearance_count_5),
+        "mux_score": float(payload.mux_score),
+        "background_bucket": background,
+        "split_group": "mux_replay",
+        "x": float(x),
+        "y": float(y),
+        "w": float(w),
+        "h": float(h),
+    }
+    for prefix in ["blocked_hgb_mc", "blocked_logistic_mc", "blocked_extratrees_mc", "allfit_hgb_mc", "allfit_logistic_mc", "allfit_extratrees_mc"]:
+        row[f"{prefix}_p_T"] = model_p_t
+        row[f"{prefix}_p_S"] = 0.0
+        row[f"{prefix}_p_E"] = 0.0
+        row[f"{prefix}_p_H"] = 0.0
+        row[f"{prefix}_p_G"] = 1.0 - model_p_t
+        row[f"{prefix}_T_margin"] = model_p_t - (1.0 - model_p_t)
+        row[f"{prefix}_score"] = model_p_t
+    return row
+
+
+def reacquisition_feature_row(
+    payload: CandidatePayload,
+    *,
+    current: CandidatePayload | None,
+    candidate_slot: int,
+    seed_score: float | None = None,
+) -> dict[str, Any]:
+    rank = fnum(payload.rank, 9999.0) or 9999.0
+    learned = fnum(payload.learned_score)
+    verified = fnum(payload.verified_score, 0.0) or 0.0
+    score = learned if learned is not None and math.isfinite(learned) else float(payload.mux_score)
+    current_score = float(current.mux_score) if current is not None else 0.0
+    current_dist = center_distance(payload.bbox, current.bbox) if current is not None else 0.0
+    frame = int(payload.frame)
+    background = "unknown"
+    if payload.clip.startswith("e271") or payload.clip == "":
+        if frame <= 668:
+            background = "road"
+        elif frame <= 683:
+            background = "mixed_ground"
+        else:
+            background = "terrain"
+    model_p_t = learned if learned is not None and 0.0 <= learned <= 1.0 else 0.0
+    seed_value = 0.0 if seed_score is None else float(seed_score)
+    return {
+        "row_type": "RUNTIME_ALTERNATIVE",
+        "row_runtime_source": "mux_runtime",
+        "candidate_slot": int(candidate_slot),
+        "current_selected_present": int(current is not None),
+        "current_mux_source": "" if current is None else current.mux_source,
+        "current_mux_score": 0.0 if current is None else float(current.mux_score),
+        "rank": rank,
+        "score": score,
+        "verified_score": verified,
+        "mux_score": float(payload.mux_score),
+        "seed_score": seed_value,
+        "seed_trusted": int(seed_score is not None and seed_value > 0.0),
+        "candidate_is_current": int(current is not None and center_distance(payload.bbox, current.bbox) < 1e-6),
+        "distance_to_current_selected": current_dist,
+        "candidate_score_minus_current": float(payload.mux_score) - current_score,
+        "pred_hgb_mc_score": model_p_t,
+        "pred_logistic_mc_score": model_p_t,
+        "pred_extratrees_mc_score": model_p_t,
+        "hgb_allfit_score": model_p_t,
+        "logistic_allfit_score": model_p_t,
+        "extratrees_allfit_score": model_p_t,
+        "seed_logistic_score": seed_value,
+        "seed_logistic_threshold": 0.0,
+        "seed_hgb_score": seed_value,
+        "seed_hgb_threshold": 0.0,
+        "seed_extratrees_score": seed_value,
+        "seed_extratrees_threshold": 0.0,
+        "cross_seed_logistic_score": seed_value,
+        "cross_seed_hgb_score": seed_value,
+        "cross_seed_extratrees_score": seed_value,
+        "source_family": payload.source or payload.mux_source or "unknown",
+        "source": payload.source or payload.mux_source or "unknown",
+        "mux_source": payload.mux_source or "",
+        "candidate_role": payload.reason or "",
+        "row_source": "mux_candidate",
+        "background_bucket": background,
+        "background": background,
+    }
+
+
+def current_trust_feature_row(payload: CandidatePayload) -> dict[str, Any]:
+    rank = fnum(payload.rank, 9999.0) or 9999.0
+    learned = fnum(payload.learned_score)
+    verified = fnum(payload.verified_score, 0.0) or 0.0
+    score = learned if learned is not None and math.isfinite(learned) else float(payload.mux_score)
+    frame = int(payload.frame)
+    background = "unknown"
+    if payload.clip.startswith("e271") or payload.clip == "":
+        if frame <= 668:
+            background = "road"
+        elif frame <= 683:
+            background = "mixed_ground"
+        else:
+            background = "terrain"
+    model_p_t = learned if learned is not None and 0.0 <= learned <= 1.0 else 0.0
+    return {
+        "row_type": "CURRENT_TRACK",
+        "row_runtime_source": "selected_output",
+        "candidate_slot": 0,
+        "current_selected_present": 1,
+        "current_mux_source": payload.mux_source or "",
+        "current_mux_score": float(payload.mux_score),
+        "rank": rank,
+        "score": score,
+        "verified_score": verified,
+        "mux_score": float(payload.mux_score),
+        "seed_score": 0.0,
+        "seed_trusted": 0,
+        "candidate_is_current": 1,
+        "distance_to_current_selected": 0.0,
+        "candidate_score_minus_current": 0.0,
+        "pred_hgb_mc_score": model_p_t,
+        "pred_logistic_mc_score": model_p_t,
+        "pred_extratrees_mc_score": model_p_t,
+        "hgb_allfit_score": model_p_t,
+        "logistic_allfit_score": model_p_t,
+        "extratrees_allfit_score": model_p_t,
+        "seed_logistic_score": 0.0,
+        "seed_logistic_threshold": 0.0,
+        "seed_hgb_score": 0.0,
+        "seed_hgb_threshold": 0.0,
+        "seed_extratrees_score": 0.0,
+        "seed_extratrees_threshold": 0.0,
+        "cross_seed_logistic_score": 0.0,
+        "cross_seed_hgb_score": 0.0,
+        "cross_seed_extratrees_score": 0.0,
+        "source_family": payload.source or payload.mux_source or "unknown",
+        "source": payload.source or payload.mux_source or "unknown",
+        "mux_source": payload.mux_source or "",
+        "background_bucket": background,
+        "background": background,
+    }
+
+
+def score_identity_seed(
+    policy: IdentitySeedPolicy | None,
+    payload: CandidatePayload,
+    *,
+    source_reappearance_count_5: int,
+) -> tuple[float | None, bool]:
+    if policy is None:
+        return None, True
+    score = policy.score_payload(
+        payload,
+        row_source="mux_selected",
+        source_reappearance_count_5=source_reappearance_count_5,
+    )
+    trusted = score >= policy.threshold and payload.mux_source != "target_local_path_prediction"
+    return score, trusted
+
+
+def append_identity_trace(
+    trace: list[dict[str, Any]] | None,
+    payload: CandidatePayload,
+    *,
+    score: float | None,
+    threshold: float | None,
+    trusted: bool,
+    streak: int,
+    action: str,
+    reason: str = "",
+) -> None:
+    if trace is None:
+        return
+    trace.append(
+        {
+            "clip": payload.clip,
+            "frame": payload.frame,
+            "mux_source": payload.mux_source,
+            "source": payload.source,
+            "track_id": payload.track_id,
+            "rank": payload.rank,
+            "mux_score": round(float(payload.mux_score), 6),
+            "seed_score": "" if score is None else round(float(score), 6),
+            "seed_threshold": "" if threshold is None else round(float(threshold), 6),
+            "trusted": int(bool(trusted)),
+            "trusted_streak": int(streak),
+            "action": action,
+            "reason": reason,
+        }
+    )
+
+
+def append_reacquisition_trace(
+    trace: list[dict[str, Any]] | None,
+    *,
+    clip: str,
+    frame: int,
+    current: CandidatePayload | None,
+    candidate: CandidatePayload | None,
+    switch_score: float | None,
+    threshold: float,
+    action: str,
+    reason: str,
+    current_trust_score: float | None = None,
+    current_trust_threshold: float | None = None,
+) -> None:
+    if trace is None:
+        return
+    trace.append(
+        {
+            "clip": clip,
+            "frame": frame,
+            "current_mux_source": "" if current is None else current.mux_source,
+            "current_mux_score": "" if current is None else round(float(current.mux_score), 6),
+            "current_trust_score": "" if current_trust_score is None else round(float(current_trust_score), 6),
+            "current_trust_threshold": "" if current_trust_threshold is None else round(float(current_trust_threshold), 6),
+            "candidate_id": "" if candidate is None else payload_source_key(candidate),
+            "candidate_source": "" if candidate is None else candidate.source,
+            "candidate_mux_source": "" if candidate is None else candidate.mux_source,
+            "candidate_mux_score": "" if candidate is None else round(float(candidate.mux_score), 6),
+            "switch_score": "" if switch_score is None else round(float(switch_score), 6),
+            "switch_threshold": round(float(threshold), 6),
+            "action": action,
+            "reason": reason,
+        }
+    )
+
+
+def score_reacquisition_candidate(
+    reacquisition_policy: ReacquisitionPolicy,
+    payload: CandidatePayload,
+    *,
+    current: CandidatePayload | None,
+    candidate_slot: int,
+    seed_policy: IdentitySeedPolicy | None,
+) -> tuple[float, float | None, bool]:
+    seed_score, seed_trusted = score_identity_seed(
+        seed_policy,
+        payload,
+        source_reappearance_count_5=1,
+    )
+    score = reacquisition_policy.score_payload(
+        payload,
+        current=current,
+        candidate_slot=candidate_slot,
+        seed_score=seed_score,
+    )
+    return score, seed_score, seed_trusted
+
+
+def score_current_trust(
+    current_trust_policy: CurrentTrustPolicy | None,
+    payload: CandidatePayload,
+    *,
+    fallback_trusted: bool,
+) -> tuple[float | None, bool]:
+    if current_trust_policy is None:
+        return None, fallback_trusted
+    score = current_trust_policy.score_payload(payload)
+    return score, score >= current_trust_policy.threshold
+
+
+def apply_target_reacquisition(
+    selected: dict[int, SequenceItem],
+    frame_items: dict[int, list[SequenceItem]],
+    *,
+    min_emit_score: float,
+    reacquisition_policy: ReacquisitionPolicy | None,
+    seed_policy: IdentitySeedPolicy | None,
+    top_k: int,
+    margin: float,
+    current_trust_policy: CurrentTrustPolicy | None = None,
+    force_release_current: bool = False,
+    trace: list[dict[str, Any]] | None = None,
+) -> dict[int, SequenceItem]:
+    if reacquisition_policy is None:
+        return selected
+    out = dict(selected)
+    candidate_frames = sorted(set(frame_items) | set(selected))
+    for frame in candidate_frames:
+        current_item = out.get(frame)
+        current_payload: CandidatePayload | None = None if current_item is None else current_item.payload
+        current_seed_score: float | None = None
+        current_trust_score: float | None = None
+        current_trusted = False
+        if current_payload is not None and current_item is not None:
+            current_seed_score, current_seed_trusted = score_identity_seed(
+                seed_policy,
+                current_payload,
+                source_reappearance_count_5=1,
+            )
+            current_trusted = (
+                current_item.score >= min_emit_score
+                and current_payload.mux_source != "target_local_path_prediction"
+                and (seed_policy is None or current_seed_trusted)
+            )
+            current_trust_score, current_trusted_by_model = score_current_trust(
+                current_trust_policy,
+                current_payload,
+                fallback_trusted=current_trusted,
+            )
+            current_trusted = current_item.score >= min_emit_score and current_trusted_by_model
+            if force_release_current:
+                current_trusted = False
+        if current_trusted:
+            append_reacquisition_trace(
+                trace,
+                clip=current_payload.clip if current_payload else "",
+                frame=frame,
+                current=current_payload,
+                candidate=None,
+                switch_score=None,
+                threshold=reacquisition_policy.threshold,
+                action="keep_current",
+                reason="trusted_current",
+                current_trust_score=current_trust_score,
+                current_trust_threshold=None if current_trust_policy is None else current_trust_policy.threshold,
+            )
+            continue
+
+        candidates = []
+        for item in dedupe_items(frame_items.get(frame, []))[: max(1, int(top_k))]:
+            payload: CandidatePayload = item.payload
+            if payload.mux_source == "target_local_path_prediction":
+                continue
+            if current_payload is not None and center_distance(payload.bbox, current_payload.bbox) < 1e-6:
+                continue
+            candidates.append(item)
+        if not candidates:
+            append_reacquisition_trace(
+                trace,
+                clip=current_payload.clip if current_payload else "",
+                frame=frame,
+                current=current_payload,
+                candidate=None,
+                switch_score=None,
+                threshold=reacquisition_policy.threshold,
+                action="no_safe_candidate",
+                reason="no_bounded_alternative",
+                current_trust_score=current_trust_score,
+                current_trust_threshold=None if current_trust_policy is None else current_trust_policy.threshold,
+            )
+            continue
+
+        scored: list[tuple[float, SequenceItem, float | None, bool]] = []
+        for slot, item in enumerate(candidates, start=1):
+            score, seed_score, seed_trusted = score_reacquisition_candidate(
+                reacquisition_policy,
+                item.payload,
+                current=current_payload,
+                candidate_slot=slot,
+                seed_policy=seed_policy,
+            )
+            scored.append((score, item, seed_score, seed_trusted))
+        best_score, best_item, _seed_score, _seed_trusted = max(scored, key=lambda row: row[0])
+        current_score = 0.0
+        if not force_release_current and current_item is not None and current_item.score >= min_emit_score:
+            current_score = min(1.0, max(0.0, float(current_item.score) / max(1.0, float(min_emit_score) * 2.0)))
+        if best_score >= reacquisition_policy.threshold and best_score >= current_score + float(margin):
+            payload: CandidatePayload = best_item.payload
+            switch_payload = replace(
+                payload,
+                mux_source=f"{payload.mux_source}+reacquire",
+                mux_score=max(float(best_item.score), float(min_emit_score) + 0.1),
+                reason=f"target_reacquisition_score_{best_score:.3f}",
+            )
+            out[frame] = SequenceItem(frame=frame, bbox=switch_payload.bbox, score=switch_payload.mux_score, payload=switch_payload)
+            append_reacquisition_trace(
+                trace,
+                clip=switch_payload.clip,
+                frame=frame,
+                current=current_payload,
+                candidate=payload,
+                switch_score=best_score,
+                threshold=reacquisition_policy.threshold,
+                action="switch_to_candidate",
+                reason="score_above_threshold",
+                current_trust_score=current_trust_score,
+                current_trust_threshold=None if current_trust_policy is None else current_trust_policy.threshold,
+            )
+        else:
+            append_reacquisition_trace(
+                trace,
+                clip=(current_payload.clip if current_payload else best_item.payload.clip),
+                frame=frame,
+                current=current_payload,
+                candidate=best_item.payload,
+                switch_score=best_score,
+                threshold=reacquisition_policy.threshold,
+                action="no_safe_candidate",
+                reason="below_threshold_or_margin",
+                current_trust_score=current_trust_score,
+                current_trust_threshold=None if current_trust_policy is None else current_trust_policy.threshold,
+            )
+    return out
+
+
 def predict_next_bbox(prev2: CandidatePayload, prev1: CandidatePayload, frame: int) -> BBox:
     gap = max(1, int(prev1.frame) - int(prev2.frame))
     dt = max(1, int(frame) - int(prev1.frame))
@@ -647,6 +1724,11 @@ def recover_target_local_gaps(
     replace_min_side: float = 0.0,
     replace_top_k: int = 0,
     replace_raw_min: float | None = None,
+    materialize_prediction: bool = False,
+    prediction_score_delta: float = 0.65,
+    seed_policy: IdentitySeedPolicy | None = None,
+    seed_streak: int = 2,
+    identity_trace: list[dict[str, Any]] | None = None,
 ) -> dict[int, SequenceItem]:
     """Causal target-local recovery using recent emitted track motion.
 
@@ -659,11 +1741,35 @@ def recover_target_local_gaps(
         return selected
     out = dict(selected)
     emitted_history: list[CandidatePayload] = []
+    trusted_history: list[bool] = []
+    source_frame_history: dict[str, list[int]] = defaultdict(list)
     missed_since_emit = 0
     all_frames = sorted(set(tubes_by_frame) | set(out))
     for frame in all_frames:
         current = out.get(frame)
         if current is not None and current.score >= min_emit_score:
+            src_key = payload_source_key(current.payload)
+            prior_source_frames = [f for f in source_frame_history[src_key] if int(frame) - int(f) <= 5]
+            seed_score, seed_trusted = score_identity_seed(
+                seed_policy,
+                current.payload,
+                source_reappearance_count_5=len(prior_source_frames),
+            )
+            streak_count = 1 if seed_trusted else 0
+            for prev_trusted in reversed(trusted_history):
+                if not (seed_trusted and prev_trusted):
+                    break
+                streak_count += 1
+            append_identity_trace(
+                identity_trace,
+                current.payload,
+                score=seed_score,
+                threshold=None if seed_policy is None else seed_policy.threshold,
+                trusted=seed_trusted,
+                streak=streak_count,
+                action="seed_observed",
+            )
+            source_frame_history[src_key] = prior_source_frames + [int(frame)]
             frame_gap = (
                 int(frame) - int(emitted_history[-1].frame)
                 if emitted_history
@@ -702,12 +1808,67 @@ def recover_target_local_gaps(
                             )
                             item = candidate_from_payload(best_payload)
                             out[frame] = item
+                            rec_score, rec_trusted = score_identity_seed(
+                                seed_policy,
+                                item.payload,
+                                source_reappearance_count_5=0,
+                            )
+                            append_identity_trace(
+                                identity_trace,
+                                item.payload,
+                                score=rec_score,
+                                threshold=None if seed_policy is None else seed_policy.threshold,
+                                trusted=rec_trusted,
+                                streak=count_trusted_streak(trusted_history + [rec_trusted]),
+                                action="recovered_candidate_observed",
+                            )
                             emitted_history.append(item.payload)
+                            trusted_history.append(rec_trusted)
                             emitted_history = emitted_history[-4:]
+                            trusted_history = trusted_history[-4:]
                             missed_since_emit = 0
                             continue
+                    elif materialize_prediction:
+                        if materialization_allowed(trusted_history, seed_streak, seed_policy):
+                            pred_payload = target_local_prediction_payload(
+                                frame,
+                                pred,
+                                min_emit_score=min_emit_score,
+                                score_delta=prediction_score_delta,
+                                reason=f"replace_materialized_prediction_current_error_{current_err:.3f}",
+                            )
+                            append_identity_trace(
+                                identity_trace,
+                                pred_payload,
+                                score=None,
+                                threshold=None if seed_policy is None else seed_policy.threshold,
+                                trusted=False,
+                                streak=0,
+                                action="materialize_allowed",
+                                reason=pred_payload.reason,
+                            )
+                            item = candidate_from_payload(pred_payload)
+                            out[frame] = item
+                            emitted_history.append(item.payload)
+                            trusted_history.append(False)
+                            emitted_history = emitted_history[-4:]
+                            trusted_history = trusted_history[-4:]
+                            missed_since_emit = 0
+                            continue
+                        append_identity_trace(
+                            identity_trace,
+                            current.payload,
+                            score=seed_score,
+                            threshold=None if seed_policy is None else seed_policy.threshold,
+                            trusted=seed_trusted,
+                            streak=streak_count,
+                            action="materialize_blocked_seed_gate",
+                            reason=f"replace_current_error_{current_err:.3f}",
+                        )
             emitted_history.append(current.payload)
+            trusted_history.append(seed_trusted)
             emitted_history = emitted_history[-4:]
+            trusted_history = trusted_history[-4:]
             missed_since_emit = 0
             continue
         if len(emitted_history) < 2:
@@ -735,10 +1896,109 @@ def recover_target_local_gaps(
         if best_payload is not None:
             item = candidate_from_payload(best_payload)
             out[frame] = item
+            rec_score, rec_trusted = score_identity_seed(
+                seed_policy,
+                item.payload,
+                source_reappearance_count_5=0,
+            )
+            append_identity_trace(
+                identity_trace,
+                item.payload,
+                score=rec_score,
+                threshold=None if seed_policy is None else seed_policy.threshold,
+                trusted=rec_trusted,
+                streak=count_trusted_streak(trusted_history + [rec_trusted]),
+                action="recovered_candidate_observed",
+            )
             emitted_history.append(best_payload)
+            trusted_history.append(rec_trusted)
             emitted_history = emitted_history[-4:]
+            trusted_history = trusted_history[-4:]
             missed_since_emit = 0
+        elif materialize_prediction:
+            if materialization_allowed(trusted_history, seed_streak, seed_policy):
+                best_payload = target_local_prediction_payload(
+                    frame,
+                    pred,
+                    min_emit_score=min_emit_score,
+                    score_delta=prediction_score_delta,
+                    reason="materialized_path_prediction_no_near_candidate",
+                )
+                append_identity_trace(
+                    identity_trace,
+                    best_payload,
+                    score=None,
+                    threshold=None if seed_policy is None else seed_policy.threshold,
+                    trusted=False,
+                    streak=0,
+                    action="materialize_allowed",
+                    reason=best_payload.reason,
+                )
+                item = candidate_from_payload(best_payload)
+                out[frame] = item
+                emitted_history.append(best_payload)
+                trusted_history.append(False)
+                emitted_history = emitted_history[-4:]
+                trusted_history = trusted_history[-4:]
+                missed_since_emit = 0
+            else:
+                append_identity_trace(
+                    identity_trace,
+                    emitted_history[-1],
+                    score=None,
+                    threshold=None if seed_policy is None else seed_policy.threshold,
+                    trusted=trusted_history[-1] if trusted_history else False,
+                    streak=count_trusted_streak(trusted_history),
+                    action="materialize_blocked_seed_gate",
+                    reason="no_near_candidate",
+                )
     return out
+
+
+def count_trusted_streak(trusted_history: list[bool]) -> int:
+    count = 0
+    for trusted in reversed(trusted_history):
+        if not trusted:
+            break
+        count += 1
+    return count
+
+
+def materialization_allowed(
+    trusted_history: list[bool],
+    seed_streak: int,
+    seed_policy: IdentitySeedPolicy | None,
+) -> bool:
+    if seed_policy is None:
+        return True
+    streak = max(1, int(seed_streak))
+    if len(trusted_history) < streak:
+        return False
+    return all(trusted_history[-streak:])
+
+
+def target_local_prediction_payload(
+    frame: int,
+    pred: BBox,
+    *,
+    min_emit_score: float,
+    score_delta: float,
+    reason: str,
+) -> CandidatePayload:
+    return CandidatePayload(
+        clip="",
+        frame=int(frame),
+        bbox=pred,
+        mux_source="target_local_path_prediction",
+        mux_score=min_emit_score + score_delta,
+        rank="",
+        learned_score="",
+        verified_score="",
+        source="target_local_path_prediction",
+        track_id="",
+        reason=reason,
+        source_path="motion_prediction",
+    )
 
 
 def target_local_candidate_near_prediction(
@@ -955,8 +2215,21 @@ def select_streaming_sequence(
     return selected
 
 
-def run_clip(args: argparse.Namespace, clip: str, weights: dict[str, float], fallbacks: list[tuple[str, str]]) -> list[dict[str, Any]]:
+def run_clip(
+    args: argparse.Namespace,
+    clip: str,
+    weights: dict[str, float],
+    fallbacks: list[tuple[str, str]],
+    *,
+    seed_policy: IdentitySeedPolicy | None = None,
+    reacquisition_policy: ReacquisitionPolicy | None = None,
+    current_trust_policy: CurrentTrustPolicy | None = None,
+    source_promoter_policy: SourcePromoterPolicy | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     frame_items: dict[int, list[SequenceItem]] = defaultdict(list)
+    identity_trace: list[dict[str, Any]] = []
+    reacquisition_trace: list[dict[str, Any]] = []
+    source_bridge_trace: list[dict[str, Any]] = []
     cs_trace = ROOT / args.cs_trace_template.format(clip=clip)
     cs_tubes = ROOT / args.cs_tubes_template.format(clip=clip)
     tubes_by_frame = load_tubes_by_frame(cs_tubes)
@@ -1011,6 +2284,51 @@ def run_clip(args: argparse.Namespace, clip: str, weights: dict[str, float], fal
             replace_min_side=args.target_local_recovery_replace_min_side,
             replace_top_k=args.target_local_recovery_replace_top_k,
             replace_raw_min=args.target_local_recovery_replace_raw_min,
+            materialize_prediction=args.target_local_recovery_materialize_prediction,
+            prediction_score_delta=args.target_local_recovery_prediction_score_delta,
+            seed_policy=seed_policy,
+            seed_streak=args.target_local_recovery_seed_streak,
+            identity_trace=identity_trace if (seed_policy is not None or args.target_local_recovery_seed_trace) else None,
+        )
+    if args.target_reacquisition_source_bridge:
+        add_source_bridge_candidates(
+            clip,
+            tubes_by_frame,
+            frame_items,
+            top_k=args.target_reacquisition_source_bridge_top_k,
+            min_seed=args.target_reacquisition_source_bridge_min_seed,
+            trace=source_bridge_trace if args.target_reacquisition_source_bridge_trace else None,
+        )
+    if args.target_reacquisition_external_bridge_csv:
+        add_external_bridge_candidates(
+            clip,
+            resolve_root_path(args.target_reacquisition_external_bridge_csv),
+            frame_items,
+            top_k=args.target_reacquisition_external_bridge_top_k,
+            trace=source_bridge_trace if args.target_reacquisition_source_bridge_trace else None,
+        )
+    if args.target_source_promoter_source_table and source_promoter_policy is not None:
+        add_target_source_promoter_candidates(
+            clip,
+            resolve_root_path(args.target_source_promoter_source_table),
+            frame_items,
+            policy=source_promoter_policy,
+            top_k=args.target_source_promoter_top_k,
+            threshold=source_promoter_policy.threshold,
+            trace=source_bridge_trace if args.target_source_promoter_trace else None,
+        )
+    if reacquisition_policy is not None:
+        selected = apply_target_reacquisition(
+            selected,
+            frame_items,
+            min_emit_score=args.min_emit_score,
+            reacquisition_policy=reacquisition_policy,
+            seed_policy=seed_policy,
+            top_k=args.target_reacquisition_top_k,
+            margin=args.target_reacquisition_margin,
+            current_trust_policy=current_trust_policy,
+            force_release_current=args.target_current_release_all,
+            trace=reacquisition_trace if args.target_reacquisition_trace else None,
         )
     if args.recenter_emitted_boxes:
         allowed_sources = {
@@ -1041,7 +2359,7 @@ def run_clip(args: argparse.Namespace, clip: str, weights: dict[str, float], fal
             preserve_sources=preserve_sources,
             preserve_min_learned=args.recenter_preserve_min_learned,
         )
-    return output_rows_for_clip(clip, selected, min_emit_score=args.min_emit_score)
+    return output_rows_for_clip(clip, selected, min_emit_score=args.min_emit_score), identity_trace, reacquisition_trace, source_bridge_trace
 
 
 def main() -> None:
@@ -1053,12 +2371,59 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     weights = parse_weights(args.source_weight)
     fallbacks = parse_name_templates(args.fallback)
+    seed_policy = load_identity_seed_policy(
+        args.target_local_recovery_seed_arbiter,
+        args.target_local_recovery_seed_threshold,
+    )
+    reacquisition_policy = load_reacquisition_policy(
+        args.target_reacquisition_arbiter,
+        args.target_reacquisition_threshold,
+    )
+    current_trust_policy = load_current_trust_policy(
+        args.target_current_trust_model,
+        args.target_current_trust_threshold,
+    )
+    source_promoter_policy = load_source_promoter_policy(
+        args.target_source_promoter_model,
+        args.target_source_promoter_threshold,
+    )
     all_rows: list[dict[str, Any]] = []
+    all_identity_trace: list[dict[str, Any]] = []
+    all_reacquisition_trace: list[dict[str, Any]] = []
+    all_source_bridge_trace: list[dict[str, Any]] = []
     for clip in clips:
-        rows = run_clip(args, clip, weights, fallbacks)
+        rows, identity_trace, reacquisition_trace, source_bridge_trace = run_clip(
+            args,
+            clip,
+            weights,
+            fallbacks,
+            seed_policy=seed_policy,
+            reacquisition_policy=reacquisition_policy,
+            current_trust_policy=current_trust_policy,
+            source_promoter_policy=source_promoter_policy,
+        )
         write_csv(out_dir / clip / "sequence_selected_tracks.csv", rows)
+        if identity_trace:
+            write_csv(out_dir / clip / "identity_seed_trace.csv", identity_trace)
+        if reacquisition_trace:
+            write_csv(out_dir / clip / "target_reacquisition_trace.csv", reacquisition_trace)
+        if source_bridge_trace:
+            write_csv(out_dir / clip / "target_reacquisition_source_bridge_trace.csv", source_bridge_trace)
+            if args.target_source_promoter_trace:
+                write_csv(out_dir / clip / "target_source_promoter_trace.csv", source_bridge_trace)
         all_rows.extend(rows)
+        all_identity_trace.extend(identity_trace)
+        all_reacquisition_trace.extend(reacquisition_trace)
+        all_source_bridge_trace.extend(source_bridge_trace)
     write_csv(out_dir / "all_sequence_selected_tracks.csv", all_rows)
+    if all_identity_trace:
+        write_csv(out_dir / "identity_seed_trace.csv", all_identity_trace)
+    if all_reacquisition_trace:
+        write_csv(out_dir / "target_reacquisition_trace.csv", all_reacquisition_trace)
+    if all_source_bridge_trace:
+        write_csv(out_dir / "target_reacquisition_source_bridge_trace.csv", all_source_bridge_trace)
+        if args.target_source_promoter_trace:
+            write_csv(out_dir / "target_source_promoter_trace.csv", all_source_bridge_trace)
     metadata = [
         {"key": "clips", "value": ",".join(clips)},
         {"key": "fallbacks", "value": ",".join(name for name, _template in fallbacks)},
@@ -1102,6 +2467,89 @@ def main() -> None:
             "key": "target_local_recovery_replace_raw_min",
             "value": args.target_local_recovery_replace_raw_min,
         },
+        {
+            "key": "target_local_recovery_materialize_prediction",
+            "value": int(args.target_local_recovery_materialize_prediction),
+        },
+        {
+            "key": "target_local_recovery_prediction_score_delta",
+            "value": args.target_local_recovery_prediction_score_delta,
+        },
+        {
+            "key": "target_local_recovery_seed_arbiter",
+            "value": args.target_local_recovery_seed_arbiter,
+        },
+        {
+            "key": "target_local_recovery_seed_threshold",
+            "value": "" if args.target_local_recovery_seed_threshold is None else args.target_local_recovery_seed_threshold,
+        },
+        {
+            "key": "target_local_recovery_seed_streak",
+            "value": args.target_local_recovery_seed_streak,
+        },
+        {
+            "key": "target_local_recovery_seed_policy_model_path",
+            "value": "" if seed_policy is None else seed_policy.model_path,
+        },
+        {
+            "key": "target_local_recovery_seed_policy_threshold",
+            "value": "" if seed_policy is None else seed_policy.threshold,
+        },
+        {
+            "key": "target_reacquisition_arbiter",
+            "value": args.target_reacquisition_arbiter,
+        },
+        {
+            "key": "target_reacquisition_threshold",
+            "value": "" if args.target_reacquisition_threshold is None else args.target_reacquisition_threshold,
+        },
+        {
+            "key": "target_reacquisition_policy_model_path",
+            "value": "" if reacquisition_policy is None else reacquisition_policy.model_path,
+        },
+        {
+            "key": "target_reacquisition_policy_threshold",
+            "value": "" if reacquisition_policy is None else reacquisition_policy.threshold,
+        },
+        {"key": "target_reacquisition_top_k", "value": args.target_reacquisition_top_k},
+        {"key": "target_reacquisition_margin", "value": args.target_reacquisition_margin},
+        {"key": "target_reacquisition_trace", "value": int(args.target_reacquisition_trace)},
+        {"key": "target_current_trust_model", "value": args.target_current_trust_model},
+        {"key": "target_current_release_all", "value": int(args.target_current_release_all)},
+        {
+            "key": "target_current_trust_threshold",
+            "value": "" if args.target_current_trust_threshold is None else args.target_current_trust_threshold,
+        },
+        {
+            "key": "target_current_trust_policy_model_path",
+            "value": "" if current_trust_policy is None else current_trust_policy.model_path,
+        },
+        {
+            "key": "target_current_trust_policy_threshold",
+            "value": "" if current_trust_policy is None else current_trust_policy.threshold,
+        },
+        {"key": "target_source_promoter_model", "value": args.target_source_promoter_model},
+        {
+            "key": "target_source_promoter_threshold",
+            "value": "" if args.target_source_promoter_threshold is None else args.target_source_promoter_threshold,
+        },
+        {
+            "key": "target_source_promoter_policy_model_path",
+            "value": "" if source_promoter_policy is None else source_promoter_policy.model_path,
+        },
+        {
+            "key": "target_source_promoter_policy_threshold",
+            "value": "" if source_promoter_policy is None else source_promoter_policy.threshold,
+        },
+        {"key": "target_source_promoter_source_table", "value": args.target_source_promoter_source_table},
+        {"key": "target_source_promoter_top_k", "value": args.target_source_promoter_top_k},
+        {"key": "target_source_promoter_trace", "value": int(args.target_source_promoter_trace)},
+        {"key": "target_reacquisition_source_bridge", "value": int(args.target_reacquisition_source_bridge)},
+        {"key": "target_reacquisition_source_bridge_top_k", "value": args.target_reacquisition_source_bridge_top_k},
+        {"key": "target_reacquisition_source_bridge_min_seed", "value": args.target_reacquisition_source_bridge_min_seed},
+        {"key": "target_reacquisition_external_bridge_csv", "value": args.target_reacquisition_external_bridge_csv},
+        {"key": "target_reacquisition_external_bridge_top_k", "value": args.target_reacquisition_external_bridge_top_k},
+        {"key": "target_reacquisition_source_bridge_trace", "value": int(args.target_reacquisition_source_bridge_trace)},
         {"key": "recenter_emitted_boxes", "value": int(args.recenter_emitted_boxes)},
         {"key": "recenter_top_k", "value": args.recenter_top_k},
         {"key": "recenter_max_delta_px", "value": args.recenter_max_delta_px},
